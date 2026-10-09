@@ -98,14 +98,14 @@ assert_eq!(decoded, ACSEApdu::Aarq(aarq));
 
 | Document | Module |
 |----------|--------|
-| [X.680 — ASN.1 Types](doc1/x680.md) | `cosempdu::x680` |
-| [X.690 — BER Primitives](doc1/x690.md) | `cosempdu::x690` |
-| [BER Value Codec](doc1/ber.md) | `cosempdu::ber` |
-| [A-XDR Primitives](doc1/axdr.md) | `cosempdu::axdr` |
-| [COSEM APDU](doc1/apdu.md) | `cosempdu::apdu` |
-| [ACSE APDU](doc1/acse.md) | `cosempdu::acse` |
-| [COSEM Data Types](doc1/data.md) | `cosempdu::data` |
-| [Byte Buffer](doc1/buffer.md) | `cosempdu::buffer` |
+| [X.680 — ASN.1 Types](doc/x680.md) | `cosempdu::x680` |
+| [X.690 — BER Primitives](doc/x690.md) | `cosempdu::x690` |
+| [BER Value Codec](doc/ber.md) | `cosempdu::ber` |
+| [A-XDR Primitives](doc/axdr.md) | `cosempdu::axdr` |
+| [COSEM APDU](doc/apdu.md) | `cosempdu::apdu` |
+| [ACSE APDU](doc/acse.md) | `cosempdu::acse` |
+| [COSEM Data Types](doc/data.md) | `cosempdu::data` |
+| [Byte Buffer](doc/buffer.md) | `cosempdu::buffer` |
 
 ## Workspace crates
 
