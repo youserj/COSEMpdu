@@ -1,0 +1,17 @@
+[package]
+name = "dlms1"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "COSEM Interface Classes and OBIS Object Identification System (DLMS UA 1000-1 Ed. 14)"
+
+[dependencies]
+cosempdu = { path = "../cosempdu" }
+
+[features]
+default = ["std"]
+std = ["cosempdu/std"]
+
+[lib]
+name = "dlms1"
+path = "src/lib.rs"

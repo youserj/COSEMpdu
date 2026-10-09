@@ -1,0 +1,13 @@
+[package]
+name = "bytebuffer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = []
+std = []
+
+[lib]
+name = "bytebuffer"
+path = "src/lib.rs"

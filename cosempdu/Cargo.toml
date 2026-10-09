@@ -1,0 +1,16 @@
+[package]
+name = "cosempdu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+bytebuffer = { path = "../bytebuffer" }
+
+[features]
+default = ["std"]
+std = ["bytebuffer/std"]
+
+[lib]
+name = "cosempdu"
+path = "src/lib.rs"
