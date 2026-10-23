@@ -5,5 +5,12 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-cosempdu = { path = "../cosempdu" }
-dlms1 = { path = "../DLMS1" }
+cosempdu = { path = "../cosempdu", default-features = false }
+dlms1 = { path = "../DLMS1", default-features = false }
+
+[features]
+default = ["std"]
+std = ["cosempdu/std", "dlms1/std"]
+optical = []
+tcp = []
+ble = []

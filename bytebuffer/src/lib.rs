@@ -174,6 +174,11 @@ impl<'a> ByteBuffer<'a> {
         Ok(1)
     }
 
+    /// Write a big-endian unsigned 16-bit integer and advance.
+    pub fn put_u16(&mut self, value: u16) -> Result<usize> {
+        self.write(&value.to_be_bytes())
+    }
+
     // -----------------------------------------------------------------------
     // Reading
     // -----------------------------------------------------------------------
@@ -184,6 +189,14 @@ impl<'a> ByteBuffer<'a> {
         let b = self.data[self.pos];
         self.pos += 1;
         Ok(b)
+    }
+
+    /// Read a big-endian unsigned 16-bit integer and advance.
+    pub fn get_u16(&mut self) -> Result<u16> {
+        self.check_space(2, None)?;
+        let b = [self.data[self.pos], self.data[self.pos + 1]];
+        self.pos += 2;
+        Ok(u16::from_be_bytes(b))
     }
 
     /// Read a big-endian unsigned integer of `length` bytes, advancing.
@@ -244,7 +257,7 @@ impl<'a> core::ops::Index<usize> for ByteBuffer<'a> {
 /// holds a shared `&'a [u8]`, every read returns a `&'a [u8]` sub-slice that
 /// borrows the original data for its full lifetime `'a` - enabling zero-copy
 /// decoding where decoded values reference the input buffer directly.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -322,6 +335,14 @@ impl<'a> Reader<'a> {
         Ok(b)
     }
 
+    /// Read a big-endian unsigned 16-bit integer and advance.
+    pub fn get_u16(&mut self) -> Result<u16> {
+        self.check_space(2, None)?;
+        let b = [self.data[self.pos], self.data[self.pos + 1]];
+        self.pos += 2;
+        Ok(u16::from_be_bytes(b))
+    }
+
     /// Read a big-endian unsigned integer of `length` bytes, advancing.
     pub fn get_uint(&mut self, length: usize) -> Result<u64> {
         let pos = self.pos;
@@ -363,9 +384,185 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Owned byte buffer: owns the backing array and tracks a cursor.
+///
+/// Complements [`ByteBuffer`] (a zero-copy view over a caller-owned slice) for
+/// cases where the buffer should own its storage — e.g. per-connection session
+/// buffers. Same cursor API, but no lifetime.
+#[derive(Debug)]
+pub struct ArrayBuffer<const N: usize> {
+    data: [u8; N],
+    pos: usize,
+}
+
+impl<const N: usize> ArrayBuffer<N> {
+    pub const fn new() -> Self {
+        Self { data: [0; N], pos: 0 }
+    }
+
+    pub const fn len(&self) -> usize { N }
+    pub fn is_empty(&self) -> bool { self.pos == 0 }
+
+    /// Current position (bytes written/read so far).
+    pub fn pos(&self) -> usize { self.pos }
+
+    /// Full underlying slice.
+    pub fn as_bytes(&self) -> &[u8] { &self.data }
+
+    /// Full mutable slice (for direct I/O).
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] { &mut self.data }
+
+    /// Bytes written so far (start..pos).
+    pub fn extract(&self) -> &[u8] { &self.data[..self.pos] }
+
+    /// Remaining space from the current position.
+    pub fn remaining(&self) -> usize { N - self.pos }
+
+    /// Reset the cursor.
+    pub fn clear(&mut self) { self.pos = 0; }
+
+    /// Set position (bounds-checked). Returns the delta applied.
+    pub fn set_pos(&mut self, index: usize) -> Result<isize> {
+        if index > N {
+            return Err(Error::PositionOutOfRange { index });
+        }
+        let delta = index as isize - self.pos as isize;
+        self.pos = index;
+        Ok(delta)
+    }
+
+    fn check_space(&self, space: usize) -> Result<()> {
+        if self.remaining() < space {
+            return Err(Error::NotEnoughSpace { needed: space });
+        }
+        Ok(())
+    }
+
+    /// Write bytes at the current position and advance.
+    pub fn write(&mut self, value: &[u8]) -> Result<usize> {
+        self.check_space(value.len())?;
+        self.data[self.pos..self.pos + value.len()].copy_from_slice(value);
+        self.pos += value.len();
+        Ok(value.len())
+    }
+
+    /// Write a single byte and advance.
+    pub fn put_u8(&mut self, value: u8) -> Result<usize> {
+        self.check_space(1)?;
+        self.data[self.pos] = value;
+        self.pos += 1;
+        Ok(1)
+    }
+
+    /// Write a big-endian unsigned 16-bit integer and advance.
+    pub fn put_u16(&mut self, value: u16) -> Result<usize> {
+        self.write(&value.to_be_bytes())
+    }
+
+    /// Read a single unsigned byte and advance.
+    pub fn get_u8(&mut self) -> Result<u8> {
+        self.check_space(1)?;
+        let b = self.data[self.pos];
+        self.pos += 1;
+        Ok(b)
+    }
+
+    /// Read a big-endian unsigned 16-bit integer and advance.
+    pub fn get_u16(&mut self) -> Result<u16> {
+        self.check_space(2)?;
+        let b = [self.data[self.pos], self.data[self.pos + 1]];
+        self.pos += 2;
+        Ok(u16::from_be_bytes(b))
+    }
+
+    /// Read a big-endian unsigned integer of `length` bytes, advancing.
+    pub fn get_uint(&mut self, length: usize) -> Result<u64> {
+        self.check_space(length)?;
+        let mut value: u64 = 0;
+        for i in 0..length {
+            value = (value << 8) | u64::from(self.data[self.pos + i]);
+        }
+        self.pos += length;
+        Ok(value)
+    }
+
+    /// Read `length` bytes at the current position and advance.
+    pub fn read(&mut self, length: usize) -> Result<&[u8]> {
+        self.check_space(length)?;
+        let out = &self.data[self.pos..self.pos + length];
+        self.pos += length;
+        Ok(out)
+    }
+}
+
+/// Sequential read cursor over a byte buffer.
+///
+/// Implemented by [`Reader`], [`ByteBuffer`] and [`ArrayBuffer`].
+///
+/// NOTE: `read` returns a slice tied to `&mut self` (short borrow), not to the
+/// underlying buffer's lifetime. If zero-copy slices that outlive the cursor
+/// are ever required, this trait can be upgraded to use a GAT:
+/// `type Bytes<'a>` + `fn read<'a>(&'a mut self, ..) -> Result<Self::Bytes<'a>>`.
+pub trait ReadBuf {
+    fn pos(&self) -> usize;
+    fn len(&self) -> usize;
+    fn remaining(&self) -> usize { self.len() - self.pos() }
+    fn get_u8(&mut self) -> Result<u8>;
+    fn get_u16(&mut self) -> Result<u16>;
+    fn get_uint(&mut self, length: usize) -> Result<u64>;
+    fn read(&mut self, length: usize) -> Result<&[u8]>;
+}
+
+/// Sequential write cursor over a byte buffer.
+///
+/// Implemented by [`ByteBuffer`] and [`ArrayBuffer`].
+pub trait WriteBuf {
+    fn remaining(&self) -> usize;
+    fn write(&mut self, value: &[u8]) -> Result<usize>;
+    fn put_u8(&mut self, value: u8) -> Result<usize> { self.write(&[value]) }
+    fn put_u16(&mut self, value: u16) -> Result<usize> { self.write(&value.to_be_bytes()) }
+}
+
+impl ReadBuf for Reader<'_> {
+    fn pos(&self) -> usize { self.pos() }
+    fn len(&self) -> usize { self.len() }
+    fn get_u8(&mut self) -> Result<u8> { self.get_u8() }
+    fn get_u16(&mut self) -> Result<u16> { self.get_u16() }
+    fn get_uint(&mut self, length: usize) -> Result<u64> { self.get_uint(length) }
+    fn read(&mut self, length: usize) -> Result<&[u8]> { self.read(length) }
+}
+
+impl ReadBuf for ByteBuffer<'_> {
+    fn pos(&self) -> usize { self.pos() }
+    fn len(&self) -> usize { self.len() }
+    fn get_u8(&mut self) -> Result<u8> { self.get_u8() }
+    fn get_u16(&mut self) -> Result<u16> { self.get_u16() }
+    fn get_uint(&mut self, length: usize) -> Result<u64> { self.get_uint(length) }
+    fn read(&mut self, length: usize) -> Result<&[u8]> { self.read(length) }
+}
+
+impl WriteBuf for ByteBuffer<'_> {
+    fn remaining(&self) -> usize { self.remaining(None) }
+    fn write(&mut self, value: &[u8]) -> Result<usize> { self.write(value) }
+}
+
+impl<const N: usize> ReadBuf for ArrayBuffer<N> {
+    fn pos(&self) -> usize { self.pos() }
+    fn len(&self) -> usize { self.len() }
+    fn get_u8(&mut self) -> Result<u8> { self.get_u8() }
+    fn get_u16(&mut self) -> Result<u16> { self.get_u16() }
+    fn get_uint(&mut self, length: usize) -> Result<u64> { self.get_uint(length) }
+    fn read(&mut self, length: usize) -> Result<&[u8]> { self.read(length) }
+}
+
+impl<const N: usize> WriteBuf for ArrayBuffer<N> {
+    fn remaining(&self) -> usize { self.remaining() }
+    fn write(&mut self, value: &[u8]) -> Result<usize> { self.write(value) }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ByteBuffer, Reader};
+    use super::{ArrayBuffer, ByteBuffer, Reader, ReadBuf, WriteBuf};
 
     #[test]
     fn write_then_read_roundtrip() {
@@ -391,10 +588,10 @@ mod tests {
     #[test]
     fn reader_zero_copy_lifetime() {
         let input = [0xAA, 0xBB, 0xCC, 0xDD];
-        let mut r = Reader::new(&input);
-        let s = r.read(3).unwrap();
-        assert_eq!(s, &[0xAA, 0xBB, 0xCC]);
-        drop(r);
+        let s = {
+            let mut r = Reader::new(&input);
+            r.read(3).unwrap()
+        };
         assert_eq!(s, &[0xAA, 0xBB, 0xCC]);
     }
 
@@ -406,6 +603,41 @@ mod tests {
         assert_eq!(r.get_uint(2).unwrap(), 0x0203);
         assert_eq!(r.peek(1).unwrap(), &[0x04]);
         assert_eq!(r.read(2).unwrap(), &[0x04, 0x05]);
+    }
+
+    #[test]
+    fn u16_roundtrip() {
+        let mut backing = [0u8; 4];
+        {
+            let mut buf = ByteBuffer::new(&mut backing);
+            buf.put_u16(0x1234).unwrap();
+            buf.put_u16(0xABCD).unwrap();
+        }
+        let mut r = Reader::new(&backing);
+        assert_eq!(r.get_u16().unwrap(), 0x1234);
+        assert_eq!(r.get_u16().unwrap(), 0xABCD);
+    }
+
+    #[test]
+    fn readbuf_writebuf_traits() {
+        // ArrayBuffer: оба трейта.
+        let mut ab = ArrayBuffer::<16>::new();
+        WriteBuf::put_u16(&mut ab, 0x1234).unwrap();
+        assert_eq!(ab.extract(), &[0x12, 0x34]);
+        ab.set_pos(0).unwrap();
+        assert_eq!(ReadBuf::get_u16(&mut ab).unwrap(), 0x1234);
+
+        // Reader: только чтение.
+        let input = [0xAB, 0xCD, 0x01];
+        let mut r = Reader::new(&input);
+        assert_eq!(ReadBuf::get_u16(&mut r).unwrap(), 0xABCD);
+        assert_eq!(ReadBuf::read(&mut r, 1).unwrap(), &[0x01]);
+
+        // ByteBuffer: оба трейта.
+        let mut backing = [0u8; 8];
+        let mut b = ByteBuffer::new(&mut backing);
+        WriteBuf::write(&mut b, &[0xDE, 0xAD]).unwrap();
+        assert_eq!(b.extract(), &[0xDE, 0xAD]);
     }
 
     #[test]

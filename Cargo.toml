@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cosempdu", "bytebuffer", "server", "DLMS1"]
+members = ["cosempdu", "bytebuffer", "server", "DLMS1", "tcp-pc-server"]
 
 [workspace.package]
 version = "0.1.0"

@@ -10,6 +10,59 @@ use crate::axdr::{
 };
 use bytebuffer::{ByteBuffer, Reader};
 use crate::error::{Error, Result};
+use crate::stream::StreamSink;
+
+/// Advance `buf` past one A-XDR value (tag + content) without materializing it.
+pub fn skip_value(buf: &mut Reader<'_>) -> Result<()> {
+    let tag = buf.get_u8()?;
+    skip_value_content(buf, tag)
+}
+
+fn skip_value_content(buf: &mut Reader<'_>, tag: u8) -> Result<()> {
+    if let Some(size) = crate::stream::scalar_size(tag) {
+        buf.read(size)?;
+        return Ok(());
+    }
+    match tag {
+        // array / structure: length = element count
+        1 | 2 => {
+            let count = get_length(buf)?;
+            for _ in 0..count {
+                skip_value(buf)?;
+            }
+            Ok(())
+        }
+        // bit-string: length = significant bit count
+        4 => {
+            let bit_len = get_length(buf)?;
+            buf.read(bit_len.div_ceil(8))?;
+            Ok(())
+        }
+        // octet / visible / utf8 string: length = byte count
+        9 | 10 | 12 => {
+            let len = get_length(buf)?;
+            buf.read(len)?;
+            Ok(())
+        }
+        // compact-array: contents-description + octet-string
+        19 => {
+            buf.get_u8()?;
+            let len = get_length(buf)?;
+            buf.read(len)?;
+            Ok(())
+        }
+        _ => Err(Error::UnknownTag { name: "skip_value", tag }),
+    }
+}
+
+/// Read one A-XDR value (advancing `buf`), returning a zero-copy read-only
+/// cursor over its bytes (tag + content).
+pub fn data_value<'a>(buf: &mut Reader<'a>) -> Result<Reader<'a>> {
+    let start = buf.pos();
+    skip_value(buf)?;
+    let end = buf.pos();
+    Ok(Reader::new(buf.read_at(start, end - start)?))
+}
 
 /// COSEM DLMS data value (`Data ::= CHOICE`).
 ///
@@ -159,24 +212,31 @@ pub trait FromStructure<'a>: Sized {
 
 /// Common A-XDR codec: encode to / decode from a buffer.
 ///
-/// `get` borrows the decoded bytes for `'a`. An owned type (e.g. a concrete
-/// structure) can implement `Codec<'a>` for any `'a`, while [`Data`], which
-/// borrows, implements `Codec<'a>` for `Data<'a>`.
-pub trait Codec<'a>: Sized {
+/// Object-safe: a concrete typed value (Register value, `scal-unit-type`, …)
+/// implements this trait and can be used as `dyn Codec`. `get` is `Sized`-only
+/// (it returns an owned `Self`), so it is not callable on `dyn Codec`.
+pub trait Codec: Send + Sync {
     /// Encode into `buf`, returning the number of bytes written.
     fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize>;
 
-    /// Decode from `buf`.
-    fn get(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>) -> Result<Self>;
-}
+    /// Decode and validate `data`, writing the value into `self` (SET / NVM load).
+    fn assign(&mut self, data: &Data<'_>) -> Result<()>;
 
-impl<'a> Codec<'a> for Data<'a> {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        Data::put(self, buf)
+    /// Begin streaming a new value directly into `self`, if this type supports
+    /// streaming decode. Returns `None` otherwise.
+    fn stream_sink(&mut self) -> Option<&mut (dyn StreamSink + '_)> {
+        None
     }
 
-    fn get(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>) -> Result<Self> {
-        Data::get(buf, arena)
+    /// Decode a whole value from bytes into an owned `Self` (`Sized` types only).
+    fn get<'a>(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>) -> Result<Self>
+    where
+        Self: Sized + Default,
+    {
+        let data = Data::get(buf, arena)?;
+        let mut value = Self::default();
+        value.assign(&data)?;
+        Ok(value)
     }
 }
 
@@ -561,7 +621,7 @@ mod tests {
     /// implements [`Codec`] to bridge to/from the generic [`Data::Structure`];
     /// it also implements [`FromStructure`] so it can be obtained via
     /// [`Data::recast`].
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     struct ScalUnitType {
         scaler: i8,
         unit: u8,
@@ -596,17 +656,14 @@ mod tests {
         }
     }
 
-    impl<'a> Codec<'a> for ScalUnitType {
+    impl Codec for ScalUnitType {
         fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
             Data::Structure(&[Data::Integer(self.scaler), Data::Enum(self.unit)]).put(buf)
         }
 
-        fn get(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>) -> Result<Self> {
-            let d = Data::get(buf, arena)?;
-            let fields = d
-                .as_structure()
-                .ok_or_else(|| Error::message("expected a structure"))?;
-            ScalUnitType::from_structure(fields)
+        fn assign(&mut self, data: &Data<'_>) -> Result<()> {
+            *self = data.recast::<ScalUnitType>()?;
+            Ok(())
         }
     }
 

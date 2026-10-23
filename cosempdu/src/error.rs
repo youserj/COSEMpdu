@@ -86,6 +86,33 @@ pub enum Error {
     /// Input bytes were not valid UTF-8.
     InvalidUtf8 { valid_up_to: usize },
 
+    // ---------------------------------------------------------------------
+    // Stream decoding (cosempdu::stream)
+    // ---------------------------------------------------------------------
+    /// The sink did not expect a scalar value.
+    UnexpectedScalar,
+
+    /// The sink did not expect a length-prefixed blob.
+    UnexpectedBlob,
+
+    /// The sink did not expect a composite (array/structure).
+    UnexpectedComposite,
+
+    /// Input bytes remained after the value was already complete.
+    TrailingData,
+
+    /// The stream ended before the value was complete.
+    IncompleteValue,
+
+    /// A variable-length integer had an invalid encoding.
+    InvalidLengthEncoding,
+
+    /// The decoder reached an internal state that should be unreachable.
+    InternalState,
+
+    /// Composite nesting exceeded the maximum supported depth.
+    NestingTooDeep,
+
     /// A message without any dynamic data.
     Message(&'static str),
 }
@@ -158,6 +185,14 @@ impl core::fmt::Display for Error {
             Error::InvalidUtf8 { valid_up_to } => {
                 write!(f, "invalid UTF-8: {valid_up_to} bytes parsed")
             }
+            Error::UnexpectedScalar => write!(f, "scalar not expected"),
+            Error::UnexpectedBlob => write!(f, "blob not expected"),
+            Error::UnexpectedComposite => write!(f, "composite not expected"),
+            Error::TrailingData => write!(f, "trailing data after complete value"),
+            Error::IncompleteValue => write!(f, "incomplete value"),
+            Error::InvalidLengthEncoding => write!(f, "invalid variable-length integer encoding"),
+            Error::InternalState => write!(f, "decoder internal state error"),
+            Error::NestingTooDeep => write!(f, "composite nesting too deep"),
             Error::Message(msg) => write!(f, "{msg}"),
         }
     }

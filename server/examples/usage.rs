@@ -1,30 +1,14 @@
 //! Пример использования `Server`: атрибуты по отдельности + каталог объектов.
 
+use cosempdu::apdu_sn::Conformance;
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::Data;
 
-use dlms1::ic::{Attribute, ClassId, DataObject, InterfaceClass, Register};
+use dlms1::common_data_types::DoubleLongUnsigned;
+use dlms1::ic::{ClassId, DataObject, InterfaceClass, Register};
 use dlms1::obis::ObisCode;
 
 use server::{Access, AccessMask, Server};
-
-/// Конкретный тип: Register value = DoubleLongUnsigned.
-struct RegisterValue(u32);
-
-impl Attribute for RegisterValue {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> dlms1::Result<usize> {
-        Ok(Data::DoubleLongUnsigned(self.0).put(buf)?)
-    }
-    fn assign(&mut self, d: &Data<'_>) -> dlms1::Result<()> {
-        match d {
-            Data::DoubleLongUnsigned(v) => {
-                self.0 = *v;
-                Ok(())
-            }
-            _ => Err(dlms1::Error::TypeMismatch { expected: 6, got: d.tag() }),
-        }
-    }
-}
 
 // Каталог объектов (ROM).
 static SERIAL_OBJ: DataObject = DataObject::new(ObisCode::new(0, 0, 96, 1, 0, 255));
@@ -32,11 +16,11 @@ static REG_OBJ: Register = Register::new(ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL);
 static OBJECTS: &[&dyn InterfaceClass] = &[&SERIAL_OBJ, &REG_OBJ];
 
 fn main() -> Result<(), server::Error> {
-    let mut server = Server::new(OBJECTS);
+    let mut server = Server::new(OBJECTS, Conformance([0x00, 0x7E, 0x1F]));
     let read_all = AccessMask::PUBLIC | AccessMask::READER | AccessMask::CONFIGURATOR;
 
     // read-only (serial): статичное значение
-    static SN: RegisterValue = RegisterValue(123456);
+    static SN: DoubleLongUnsigned = DoubleLongUnsigned(123456);
     server.add_static(
         SERIAL_OBJ.value(),
         &SN,
@@ -44,7 +28,7 @@ fn main() -> Result<(), server::Error> {
     )?;
 
     // writable (persistent): register value
-    let mut register = RegisterValue(230000);
+    let mut register = DoubleLongUnsigned(230000);
     server.add_persistent(
         REG_OBJ.value(),
         &mut register,
@@ -59,8 +43,17 @@ fn main() -> Result<(), server::Error> {
         println!("register value: {:?}", buf.extract());
     }
 
-    // SET (пишет Configurator)
-    server.set(ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR, &Data::DoubleLongUnsigned(231000))?;
+    // SET (пишет Configurator) — потоковый приём.
+    {
+        let mut backing = [0u8; 64];
+        let n = {
+            let mut b = ByteBuffer::new(&mut backing);
+            Data::DoubleLongUnsigned(231000).put(&mut b)?
+        };
+        let mut s = server.stream_set(ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR)?;
+        s.push(&backing[..n])?;
+        s.finish()?;
+    }
     {
         let mut backing = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut backing);

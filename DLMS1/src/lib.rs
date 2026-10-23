@@ -14,13 +14,21 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod common_data_types;
 pub mod error;
 pub mod ic;
 pub mod obis;
 
+pub use common_data_types::{
+    Bcd, BitString, Boolean, CompactArray, Date, DateTime, DeltaDoubleLong,
+    DeltaDoubleLongUnsigned, DeltaInteger, DeltaLong, DeltaLongUnsigned, DeltaUnsigned,
+    DoubleLong, DoubleLongUnsigned, Enum, Float32, Float64, Integer, Long, Long64,
+    Long64Unsigned, LongUnsigned, NullData, OctetString, OctetStringSized, Time, Unsigned,
+    Utf8String, VisibleString,
+};
 pub use error::{Error, Result};
 pub use ic::{
-    Attribute, AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier,
+    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier,
     CommonDataType, InterfaceClass, Validator,
 };
 pub use obis::ObisCode;

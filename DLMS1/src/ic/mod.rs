@@ -12,8 +12,8 @@ pub mod clock;
 pub mod data;
 pub mod extended_register;
 pub mod register;
+pub mod register_activation;
 
-use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::Data;
 
 use crate::error::{Error, Result};
@@ -25,6 +25,11 @@ pub use clock::Clock;
 pub use data::DataObject;
 pub use extended_register::ExtendedRegister;
 pub use register::{Register, ScalUnit, ScalUnitValidator, SCAL_UNIT_VALIDATOR};
+pub use register_activation::{
+    MaskListValidator, ObjectDefinition, RegisterActMask, RegisterActivation,
+    RegisterAssignmentValidator, RegisterAssignmentValue,
+    MASK_LIST_VALIDATOR, REGISTER_ASSIGNMENT_VALIDATOR,
+};
 
 /// COSEM interface class identifiers (clause 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -199,18 +204,6 @@ pub trait Validator: Sync + core::fmt::Debug {
     fn validate(&self, data: &Data<'_>) -> Result<()>;
 }
 
-/// Object-safe interface of a typed attribute value.
-///
-/// A concrete type (Register value, [`ScalUnit`], …) implements this trait,
-/// bridging onto `Codec`/`FromStructure`. `encode`/`assign` do not return `Self`,
-/// so the trait can be used as `dyn Attribute`.
-pub trait Attribute {
-    /// Put the current value's encoding into `buf` (for a client response / NVM write).
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize>;
-    /// Decode and validate `data`, writing the value into `self` (SET / NVM load).
-    fn assign(&mut self, data: &Data<'_>) -> Result<()>;
-}
-
 /// The value type of an attribute (with validation logic).
 #[derive(Debug, Clone, Copy)]
 pub enum AttributeType {
@@ -280,7 +273,7 @@ pub struct AttributeInfo {
 /// ([`attributes`](Self::attributes)). The array starts at attribute 2 because
 /// `logical_name` (attribute 1) is universal. Attribute values live elsewhere
 /// and are stored per-attribute by the server.
-pub trait InterfaceClass: Sync {
+pub trait InterfaceClass: Send + Sync {
     /// The interface class identifier.
     fn class_id(&self) -> ClassId;
 
@@ -348,6 +341,7 @@ mod tests {
         let c = Clock::new("0.0.1.0.0.255".parse().unwrap());
         let sn = AssociationSn::new("0.0.40.0.0.255".parse().unwrap());
         let ln = AssociationLn::new("0.0.40.0.0.255".parse().unwrap());
+        let ra = RegisterActivation::new("0.0.96.1.0.255".parse().unwrap());
 
         assert_eq!((d.class_id(), d.version()), (ClassId::Data, V0));
         assert_eq!((r.class_id(), r.version()), (ClassId::Register, V0));
@@ -355,6 +349,7 @@ mod tests {
         assert_eq!((c.class_id(), c.version()), (ClassId::Clock, V0));
         assert_eq!((sn.class_id(), sn.version()), (ClassId::AssociationSn, V4));
         assert_eq!((ln.class_id(), ln.version()), (ClassId::AssociationLn, V5));
+        assert_eq!((ra.class_id(), ra.version()), (ClassId::RegisterActivation, V0));
 
         assert_eq!(d.obis().to_string(), "0.0.96.1.0.255");
         assert_eq!(r.obis().to_string(), "1.0.1.8.0.255");
@@ -366,6 +361,7 @@ mod tests {
         assert_eq!(c.attributes().len(), 7);
         assert_eq!(sn.attributes().len(), 8);
         assert_eq!(ln.attributes().len(), 8);
+        assert_eq!(ra.attributes().len(), 3);
 
         // attr_key: logical_name + declared attributes only
         assert_eq!(r.attr_key(1).map(|k| k.attribute_id), Some(1));
@@ -383,8 +379,9 @@ mod tests {
         let c = Clock::new("0.0.1.0.0.255".parse().unwrap());
         let sn = AssociationSn::new("0.0.40.0.0.255".parse().unwrap());
         let ln = AssociationLn::new("0.0.40.0.0.255".parse().unwrap());
+        let ra = RegisterActivation::new("0.0.96.1.0.255".parse().unwrap());
 
-        let objects: &[&dyn InterfaceClass] = &[&d, &r, &e, &c, &sn, &ln];
+        let objects: &[&dyn InterfaceClass] = &[&d, &r, &e, &c, &sn, &ln, &ra];
         for obj in objects {
             for info in obj.attributes() {
                 if let Some(v) = info.min {

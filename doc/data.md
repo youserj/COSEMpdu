@@ -212,21 +212,23 @@ assert_eq!(encode(&Data::NullData), vec![0]);
 A generic [`Data::Structure`] can be narrowed to a concrete, typed structure via
 two complementary traits:
 
-- **`Codec`** — the common `put`/`get` encode/decode interface (implemented by
-  [`Data`] itself and by concrete structures).
+- **`Codec`** — the common object-safe encode/decode interface:
+  `put` (encode), `assign` (decode a [`Data`] into `self`), `stream_sink`
+  (streaming decode) and `get` (decode a whole value into an owned `Self`,
+  `Sized`-only, defaulted via `Default + assign`).
 - **`FromStructure`** — reinterpret an already-decoded [`Data::Structure`] into
   a concrete type via `Data::recast::<T>()`.
 
 The `scal-unit-type` structure (`structure { scaler: integer, unit: enum }`) is
-a minimal example. The struct **owns** its scalar fields (so it has a plain
-constructor and setters), while the two traits bridge to/from `Data::Structure`:
+a minimal example. The struct **owns** its scalar fields, while the two traits
+bridge to/from `Data::Structure`:
 
 ```rust
 use cosempdu::buffer::{ByteBuffer, Reader};
 use cosempdu::data::{Arena, Codec, Data, FromStructure};
 use cosempdu::{Error, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ScalUnitType {
     scaler: i8,
     unit: u8,
@@ -243,16 +245,16 @@ impl<'a> FromStructure<'a> for ScalUnitType {
     }
 }
 
-impl<'a> Codec<'a> for ScalUnitType {
+impl Codec for ScalUnitType {
     fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         Data::Structure(&[Data::Integer(self.scaler), Data::Enum(self.unit)]).put(buf)
     }
 
-    fn get(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>) -> Result<Self> {
-        let d = Data::get(buf, arena)?;
-        let fields = d.as_structure().ok_or_else(|| Error::message("expected a structure"))?;
-        ScalUnitType::from_structure(fields)
+    fn assign(&mut self, data: &Data<'_>) -> Result<()> {
+        *self = data.recast::<ScalUnitType>()?;
+        Ok(())
     }
+    // `get` inherited from the default: Data::get + Default + assign.
 }
 ```
 

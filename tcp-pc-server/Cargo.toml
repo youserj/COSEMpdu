@@ -1,0 +1,12 @@
+[package]
+name = "tcp-pc-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+server   = { path = "../server", features = ["tcp"] }
+cosempdu = { path = "../cosempdu" }
+dlms1    = { path = "../DLMS1" }
+tokio    = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+anyhow   = "1"

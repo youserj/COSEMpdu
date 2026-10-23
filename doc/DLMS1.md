@@ -11,6 +11,7 @@
 |--------|---------|
 | `dlms1::obis` | [`ObisCode`] `A.B.C.D.E.F`, logical-name form, value-group enums, SN base-name mapping |
 | `dlms1::ic` | [`ClassId`], [`InterfaceClass`] trait, common value types, concrete classes |
+| `dlms1::common_data_types` | typed values of the DLMS "common data types" (`DoubleLongUnsigned`, `DateTime`, `OctetString`), implementing `cosempdu::Codec` |
 
 ## OBIS (clause 4)
 
@@ -61,11 +62,12 @@ assert_eq!(reg.class_id(), ClassId::Register);
 | `DataObject` | 1 | 0 | 1 logical_name, 2 value | — |
 | `Register` | 3 | 0 | 1 logical_name, 2 value, 3 scaler_unit | 1 reset |
 | `ExtendedRegister` | 4 | 0 | 1 logical_name, 2 value, 3 scaler_unit, 4 status, 5 capture_time | 1 reset |
+| `RegisterActivation` | 6 | 0 | 1 logical_name, 2 register_assignment, 3 mask_list, 4 active_mask | 1 add_register, 2 add_mask, 3 delete_mask (deferred) |
 | `Clock` | 8 | 0 | 1..8 (time, time_zone, status, begin, end, deviation, clock_base) | 1..6 |
 | `AssociationSn` | 12 | 4 | 1..9 (object_list, partners_id, …, security_ref) | 1..4 |
 | `AssociationLn` | 15 | 5 | 1..9 (as SN, LN object_list entries) | 1..4 |
 
-`ClassId` enumerates the full Blue Book class-id table; only the six classes
+`ClassId` enumerates the full Blue Book class-id table; only the seven classes
 above have concrete implementations.
 
 ## Scope / simplifications

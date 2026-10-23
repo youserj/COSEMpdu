@@ -11,9 +11,9 @@
 полезный груз — xDLMS APDU (A-XDR).
 
 Подход к хранению — **типизированные значения** + **права доступа**. Сервер
-хранит ссылки на конкретные типы (реализующие [`Attribute`]), которые сами
-кодируются (`put`) и декодируются (`assign`), а также несут права доступа
-([`Access`]).
+хранит ссылки на конкретные типы (реализующие `cosempdu::Codec`), которые сами
+кодируются (`put`) и декодируются (`assign`/`stream_sink`), а также несут права
+доступа ([`Access`]).
 
 ## Модель данных (реализовано в `server/src/lib.rs`)
 
@@ -31,10 +31,12 @@ pub struct Access {
     pub write: AccessMask,  // уровни, которым разрешена запись (SET; только Persistent)
 }
 
-/// Объектно-безопасный интерфейс типизированного значения.
-pub trait Attribute {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize, Error>;
-    fn assign(&mut self, data: &Data<'_>) -> Result<(), Error>;
+/// Объектно-безопасный кодек типизированного значения (в `cosempdu`).
+pub trait Codec {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize, Error>;           // encode
+    fn assign(&mut self, data: &Data<'_>) -> Result<(), Error>;                // decode из Data (update)
+    fn stream_sink(&mut self) -> Option<&mut dyn StreamSink>;                  // decode из байт (stream_set)
+    fn get<'a>(buf, arena) -> Result<Self, Error> where Self: Sized + Default;  // decode целиком
 }
 
 pub struct AttributeKey {            // ключ = OBIS + attribute_id (class_id не нужен)
@@ -43,9 +45,9 @@ pub struct AttributeKey {            // ключ = OBIS + attribute_id (class_id
 }
 
 pub enum ValueRef<'a> {
-    Static(&'a dyn Attribute, Access),          // read-only
-    Dynamic(&'a mut dyn Attribute, Access),     // меняет только сервер
-    Persistent(&'a mut dyn Attribute, Access),  // SET извне + NVM
+    Static(&'a dyn Codec, Access),          // read-only
+    Dynamic(&'a mut dyn Codec, Access),     // меняет только сервер
+    Persistent(&'a mut dyn Codec, Access),  // SET извне + NVM
 }
 
 pub struct Registry<'a> { /* отсортированный массив (AttributeKey, ValueRef<'a>) + бинарный поиск */ }
@@ -53,11 +55,11 @@ pub struct Registry<'a> { /* отсортированный массив (Attrib
 pub struct Server<'a> { pub attributes: Registry<'a> }
 
 impl<'a> Server<'a> {
-    pub fn add_static(&mut self, key, attr: &'a dyn Attribute, access: Access) -> Result<(), Error>;
-    pub fn add_dynamic(&mut self, key, attr: &'a mut dyn Attribute, access: Access) -> Result<(), Error>;
-    pub fn add_persistent(&mut self, key, attr: &'a mut dyn Attribute, access: Access) -> Result<(), Error>;
+    pub fn add_static(&mut self, key, attr: &'a dyn Codec, access: Access) -> Result<(), Error>;
+    pub fn add_dynamic(&mut self, key, attr: &'a mut dyn Codec, access: Access) -> Result<(), Error>;
+    pub fn add_persistent(&mut self, key, attr: &'a mut dyn Codec, access: Access) -> Result<(), Error>;
     pub fn put(&self, class_id: ClassId, key: AttributeKey, level: AccessMask, buf: &mut ByteBuffer<'_>) -> Result<(), Error>; // put → buf (проверка read)
-    pub fn set(&mut self, class_id: ClassId, key: AttributeKey, level: AccessMask, data: &Data<'_>) -> Result<(), Error>;      // assign → Persistent (проверка write)
+    pub fn stream_set(&mut self, class_id: ClassId, key: AttributeKey, level: AccessMask) -> Result<StreamingSet, Error>;      // stream → Persistent (проверка write)
     pub fn update(&mut self, key: AttributeKey, data: &Data<'_>) -> Result<(), Error>;                                       // assign → Dynamic (внутреннее)
 }
 ```
@@ -66,7 +68,7 @@ impl<'a> Server<'a> {
   отсортирован по ключу, поиск — `binary_search_by` (O(log n)). Вставка нового
   ключа — O(n) сдвиг (редкая операция).
 - Нет байтового пула: тип сам кодирует/декодирует/валидирует.
-- `ValueRef` хранит `&mut dyn Attribute` → не `Copy`; `Server`/`Registry` с lifetime
+- `ValueRef` хранит `&mut dyn Codec` → не `Copy`; `Server`/`Registry` с lifetime
   `'a`; `new()` не `const fn` (инициализация через `from_fn`). Для embedded — объекты
   `static`, сервер создаётся в `main` (`&mut` на static-объекты).
 - Куча не используется (no-heap, готово к `no_std`).
@@ -97,15 +99,18 @@ server.add_persistent(key, &mut register, acc)?;
 
 ## Поток данных
 
-- **Клиент → сервер (SET):** клиент кладёт A-XDR в `ByteBuffer`, сервер декодирует в
-  `Data`, затем `set(key, level, &data)` → проверка `write` → `assign` обновляет `Persistent`.
+- **Клиент → сервер (SET):** клиент подаёт A-XDR байты в `stream_set` → `StreamDecoder`
+  декодирует прямо в атрибут через `StreamSink` (проверка `write`). Буферный путь
+  (`Data` целиком) не используется.
 - **Сервер → клиент (PUT):** `put(key, level, buf)` → проверка `read` → `put` в `ByteBuffer`.
-- `Dynamic` сервер меняет сам (`update`, без уровня), всё значение отдаётся через `put`.
+- `Dynamic` сервер меняет сам (`update` из готового `Data`, без уровня), отдаётся через `put`.
 
 ## Валидация и восстановление
 
 - `assign` — декодирует `Data` в конкретный тип и проверяет его (тег для базы,
   `recast`/`FromStructure` для структур). Не тот тип → `Error::TypeMismatch`.
+  Используется для внутреннего `update` (`Dynamic`); внешний SET валидируется
+  поточно в `StreamSink` (`stream_set`).
 - Заводской дефолт для восстановления при потере/порче NVM — из `AttributeInfo.default`.
 
 ## Энергонезависимая память (NVM)
@@ -121,7 +126,7 @@ pub trait Nvm {
 ```
 
 - Старт: загрузить `Persistent` из NVM → `assign` (декодировать + проверить).
-- `set` на `Persistent`: обновляем значение, помечаем dirty; `flush()`/async-задача →
+- `stream_set` на `Persistent`: обновляем значение, помечаем dirty; `flush()`/async-задача →
   `encode` → `save` (батчем) → один `commit`.
 - **Асинхронность (будущее):** `load`/`save`/`commit` — блокирующие операции с ожиданием;
   в будущем станут `async fn` (Tokio/Embassy).
@@ -130,14 +135,14 @@ pub trait Nvm {
 
 ### 1. Типизированные значения вместо сырых байт
 
-Сервер хранит ссылки на конкретные типы (`Attribute`), а не A-XDR байты. Значение
-кодируется/декодируется по требованию через `encode`/`assign`.
+Сервер хранит ссылки на конкретные типы (`Codec`), а не A-XDR байты. Значение
+кодируется/декодируется по требованию через `put`/`assign`/`stream_sink`.
 
 ### 2. Три класса данных + права доступа
 
-- **Статичные (read-only):** `ValueRef::Static(&'a dyn Attribute, Access)`.
-- **Динамические:** `ValueRef::Dynamic(&'a mut dyn Attribute, Access)` — меняет только сервер.
-- **Настраиваемые (persistent):** `ValueRef::Persistent(&'a mut dyn Attribute, Access)` — SET извне + NVM.
+- **Статичные (read-only):** `ValueRef::Static(&'a dyn Codec, Access)`.
+- **Динамические:** `ValueRef::Dynamic(&'a mut dyn Codec, Access)` — меняет только сервер.
+- **Настраиваемые (persistent):** `ValueRef::Persistent(&'a mut dyn Codec, Access)` — SET извне + NVM.
 - Уровни доступа (Public/Reader/Configurator/…) — битовой маской `Access`.
 
 ## Следующие шаги

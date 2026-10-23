@@ -7,17 +7,8 @@
 
 use crate::axdr::{get_length, put_length};
 use bytebuffer::{ByteBuffer, Reader};
-use crate::data::{decode_data, Arena, Data};
+use crate::data::{data_value, Codec};
 use crate::error::{Error, Result};
-
-/// Bundles the arenas needed to decode an APDU and its nested `Data` values.
-pub struct DecodeContext<'a> {
-    pub data: Arena<'a, Data<'a>>,
-    pub get_data_result: Arena<'a, GetDataResult<'a>>,
-    pub descriptors: Arena<'a, (CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>)>,
-    pub method_descriptors: Arena<'a, CosemMethodDescriptor>,
-    pub action_response: Arena<'a, ActionResponseWithOptionalData<'a>>,
-}
 
 /// Invoke-Id-And-Priority ::= Unsigned8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,23 +96,43 @@ impl CosemMethodDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelectiveAccessDescriptor<'a> {
     pub access_selector: u8,
-    pub access_parameters: Data<'a>,
+    /// Raw A-XDR bytes of the `access-parameters` value (zero-copy).
+    pub access_parameters: Reader<'a>,
 }
 
 impl<'a> SelectiveAccessDescriptor<'a> {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        let mut written = buf.put_u8(self.access_selector)?;
-        written += self.access_parameters.put(buf)?;
+    /// Encode a selective-access descriptor from *typed* values (asymmetric
+    /// write side): `access_parameters` is a [`Codec`], not pre-encoded bytes.
+    pub fn put(
+        access_selector: u8,
+        access_parameters: &dyn Codec,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(access_selector)?;
+        written += access_parameters.put(buf)?;
         Ok(written)
     }
 
-    fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let access_selector = buf.get_u8()?;
-        let access_parameters = Data::get(buf, &mut ctx.data)?;
+        let access_parameters = data_value(buf)?;
         Ok(SelectiveAccessDescriptor {
             access_selector,
             access_parameters,
         })
+    }
+}
+
+/// Write-side view of a [`SelectiveAccessDescriptor`] for encoding.
+#[derive(Clone, Copy)]
+pub struct SelectiveAccessDescriptorWrite<'a> {
+    pub access_selector: u8,
+    pub access_parameters: &'a dyn Codec,
+}
+
+impl SelectiveAccessDescriptorWrite<'_> {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        SelectiveAccessDescriptor::put(self.access_selector, self.access_parameters, buf)
     }
 }
 
@@ -140,6 +151,207 @@ fn get_presence(buf: &mut Reader<'_>) -> Result<bool> {
     Ok(buf.get_u8()? != 0)
 }
 
+/// Lazily-decoded list of attribute descriptors (zero allocation: elements are
+/// read from the input buffer on demand).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DescriptorList<'a> {
+    count: usize,
+    buf: Reader<'a>,
+}
+
+impl<'a> DescriptorList<'a> {
+    /// Read a descriptor list from `buf` (advancing it), returning a lazy cursor.
+    pub fn read(buf: &mut Reader<'a>) -> Result<Self> {
+        let count = get_length(buf)?;
+        let start = buf.pos();
+        for _ in 0..count {
+            Self::decode_one(buf)?;
+        }
+        let end = buf.pos();
+        Ok(DescriptorList { count, buf: Reader::new(buf.read_at(start, end - start)?) })
+    }
+
+    fn decode_one(
+        buf: &mut Reader<'a>,
+    ) -> Result<(CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>)> {
+        let descriptor = CosemAttributeDescriptor::get(buf)?;
+        let sel = if get_presence(buf)? {
+            Some(SelectiveAccessDescriptor::get(buf)?)
+        } else {
+            None
+        };
+        Ok((descriptor, sel))
+    }
+
+    /// Number of elements remaining in the list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<'a> Iterator for DescriptorList<'a> {
+    type Item = Result<(CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(Self::decode_one(&mut self.buf))
+    }
+}
+
+/// Lazily-decoded list of `CosemMethodDescriptor` (zero allocation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MethodDescriptorList<'a> {
+    count: usize,
+    buf: Reader<'a>,
+}
+
+impl<'a> MethodDescriptorList<'a> {
+    /// Read a method-descriptor list from `buf`, returning a lazy cursor.
+    pub fn read(buf: &mut Reader<'a>) -> Result<Self> {
+        let count = get_length(buf)?;
+        let start = buf.pos();
+        for _ in 0..count {
+            CosemMethodDescriptor::get(buf)?;
+        }
+        let end = buf.pos();
+        Ok(MethodDescriptorList { count, buf: Reader::new(buf.read_at(start, end - start)?) })
+    }
+
+    /// Number of elements remaining in the list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<'a> Iterator for MethodDescriptorList<'a> {
+    type Item = Result<CosemMethodDescriptor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(CosemMethodDescriptor::get(&mut self.buf))
+    }
+}
+
+/// Lazily-decoded list of A-XDR values (zero allocation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReaderList<'a> {
+    count: usize,
+    buf: Reader<'a>,
+}
+
+impl<'a> ReaderList<'a> {
+    /// Read a value list from `buf` (advancing it), returning a lazy cursor.
+    pub fn read(buf: &mut Reader<'a>) -> Result<Self> {
+        let count = get_length(buf)?;
+        let start = buf.pos();
+        for _ in 0..count {
+            data_value(buf)?;
+        }
+        let end = buf.pos();
+        Ok(ReaderList { count, buf: Reader::new(buf.read_at(start, end - start)?) })
+    }
+
+    /// Number of elements remaining in the list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<'a> Iterator for ReaderList<'a> {
+    type Item = Result<Reader<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(data_value(&mut self.buf))
+    }
+}
+
+/// Lazily-decoded list of `Get-Data-Result` (zero allocation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GetDataResultList<'a> {
+    count: usize,
+    buf: Reader<'a>,
+}
+
+impl<'a> GetDataResultList<'a> {
+    /// Read a `Get-Data-Result` list from `buf`, returning a lazy cursor.
+    pub fn read(buf: &mut Reader<'a>) -> Result<Self> {
+        let count = get_length(buf)?;
+        let start = buf.pos();
+        for _ in 0..count {
+            GetDataResult::get(buf)?;
+        }
+        let end = buf.pos();
+        Ok(GetDataResultList { count, buf: Reader::new(buf.read_at(start, end - start)?) })
+    }
+
+    /// Number of elements remaining in the list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<'a> Iterator for GetDataResultList<'a> {
+    type Item = Result<GetDataResult<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(GetDataResult::get(&mut self.buf))
+    }
+}
+
+/// Lazily-decoded list of `ActionResponseWithOptionalData` (zero allocation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActionResponseWithOptionalDataList<'a> {
+    count: usize,
+    buf: Reader<'a>,
+}
+
+impl<'a> ActionResponseWithOptionalDataList<'a> {
+    /// Read an action-response list from `buf`, returning a lazy cursor.
+    pub fn read(buf: &mut Reader<'a>) -> Result<Self> {
+        let count = get_length(buf)?;
+        let start = buf.pos();
+        for _ in 0..count {
+            ActionResponseWithOptionalData::get(buf)?;
+        }
+        let end = buf.pos();
+        Ok(ActionResponseWithOptionalDataList {
+            count,
+            buf: Reader::new(buf.read_at(start, end - start)?),
+        })
+    }
+
+    /// Number of elements remaining in the list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<'a> Iterator for ActionResponseWithOptionalDataList<'a> {
+    type Item = Result<ActionResponseWithOptionalData<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(ActionResponseWithOptionalData::get(&mut self.buf))
+    }
+}
+
 /// Get-Request ::= [192] IMPLICIT CHOICE.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GetRequest<'a> {
@@ -154,59 +366,65 @@ pub enum GetRequest<'a> {
     },
     WithList {
         invoke: InvokeIdAndPriority,
-        descriptors: &'a [(CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>)],
+        descriptors: DescriptorList<'a>,
     },
 }
 
 impl<'a> GetRequest<'a> {
     const TAG: u8 = 192;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode the `normal` alternative from typed values.
+    pub fn put_normal(
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemAttributeDescriptor,
+        access_selection: Option<SelectiveAccessDescriptorWrite<'_>>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += self.put_lc(buf)?;
+        written += buf.put_u8(1)?;
+        written += invoke.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += put_presence(buf, access_selection.is_some())?;
+        if let Some(sel) = access_selection {
+            written += sel.put(buf)?;
+        }
         Ok(written)
     }
 
-
-    fn put_lc(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            GetRequest::Normal {
-                invoke,
-                descriptor,
-                access_selection,
-            } => {
-                let mut written = buf.put_u8(1)?;
-                written += invoke.put(buf)?;
-                written += descriptor.put(buf)?;
-                written += put_presence(buf, access_selection.is_some())?;
-                if let Some(sel) = access_selection {
-                    written += sel.put(buf)?;
-                }
-                Ok(written)
-            }
-            GetRequest::Next { invoke, block_number } => {
-                let mut written = buf.put_u8(2)?;
-                written += invoke.put(buf)?;
-                written += buf.write(&block_number.to_be_bytes())?;
-                Ok(written)
-            }
-            GetRequest::WithList { invoke, descriptors } => {
-                let mut written = buf.put_u8(3)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, descriptors.len())?;
-                for (desc, sel) in *descriptors {
-                    written += desc.put(buf)?;
-                    written += put_presence(buf, sel.is_some())?;
-                    if let Some(s) = sel {
-                        written += s.put(buf)?;
-                    }
-                }
-                Ok(written)
-            }
-        }
+    /// Encode the `next` alternative.
+    pub fn put_next(
+        invoke: InvokeIdAndPriority,
+        block_number: u32,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(2)?;
+        written += invoke.put(buf)?;
+        written += buf.write(&block_number.to_be_bytes())?;
+        Ok(written)
     }
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `with-list` alternative from typed values.
+    pub fn put_with_list(
+        invoke: InvokeIdAndPriority,
+        descriptors: &[(CosemAttributeDescriptor, Option<SelectiveAccessDescriptorWrite<'_>>)],
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(3)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, descriptors.len())?;
+        for (desc, sel) in descriptors {
+            written += desc.put(buf)?;
+            written += put_presence(buf, sel.is_some())?;
+            if let Some(s) = sel {
+                written += s.put(buf)?;
+            }
+        }
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Get-Request [192]", actual: tag });
@@ -216,7 +434,7 @@ impl<'a> GetRequest<'a> {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let descriptor = CosemAttributeDescriptor::get(buf)?;
                 let access_selection = if get_presence(buf)? {
-                    Some(SelectiveAccessDescriptor::get(buf, ctx)?)
+                    Some(SelectiveAccessDescriptor::get(buf)?)
                 } else {
                     None
                 };
@@ -236,19 +454,7 @@ impl<'a> GetRequest<'a> {
             }
             3 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.descriptors.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut (CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>);
-                for i in 0..n {
-                    let descriptor = CosemAttributeDescriptor::get(buf)?;
-                    let sel = if get_presence(buf)? {
-                        Some(SelectiveAccessDescriptor::get(buf, ctx)?)
-                    } else {
-                        None
-                    };
-                    unsafe { ptr.add(i).write((descriptor, sel)) };
-                }
-                let descriptors = unsafe { core::slice::from_raw_parts(ptr, n) };
+                let descriptors = DescriptorList::read(buf)?;
                 GetRequest::WithList { invoke, descriptors }
             }
             other => return Err(Error::UnknownChoice { name: "Get-Request", choice: other }),
@@ -257,33 +463,64 @@ impl<'a> GetRequest<'a> {
 }
 
 /// Get-Data-Result ::= CHOICE { data [0], data-access-error [1] }.
+///
+/// # Read/write asymmetry — when is a `put_data` helper necessary?
+///
+/// `get` returns `Data(Reader)`, the raw value bytes (zero-copy). Encoding is
+/// *asymmetric*: instead of a `put(&self)` that would re-emit those bytes, use
+/// [`GetDataResult::put_data`] / [`GetDataResult::put_access_error`] with the
+/// *typed* value. That avoids a pre-encode round-trip (`encode → scratch →
+/// Reader`) on the write side.
+///
+/// Rule of thumb to check whether a field needs the asymmetric helper: if the
+/// field carries a semantic *value* (a [`Codec`]), use a `put_*` helper taking
+/// `&dyn Codec`; if it carries *already-encoded bytes* (e.g. a datablock's
+/// `raw-data: &[u8]`), a plain byte field with a symmetric `put` is fine.
+/// Concretely, every field of type `Data` needs the helper — grep for `Data<'`
+/// in the message definitions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GetDataResult<'a> {
-    Data(Data<'a>),
+    /// Raw A-XDR bytes of the `data` value (zero-copy).
+    Data(Reader<'a>),
     DataAccessError(u8),
 }
 
 impl<'a> GetDataResult<'a> {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            GetDataResult::Data(d) => {
-                let mut written = buf.put_u8(0)?;
-                written += d.put(buf)?;
-                Ok(written)
-            }
-            GetDataResult::DataAccessError(code) => {
-                let mut written = buf.put_u8(1)?;
-                written += buf.put_u8(*code)?;
-                Ok(written)
-            }
-        }
+    /// Encode the `data` alternative: CHOICE tag `0` + the typed value.
+    pub fn put_data(data: &dyn Codec, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        let mut written = buf.put_u8(0)?;
+        written += data.put(buf)?;
+        Ok(written)
     }
 
-    fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `data-access-error` alternative: CHOICE tag `1` + error code.
+    pub fn put_access_error(code: u8, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        let mut written = buf.put_u8(1)?;
+        written += buf.put_u8(code)?;
+        Ok(written)
+    }
+
+    fn get(buf: &mut Reader<'a>) -> Result<Self> {
         match buf.get_u8()? {
-            0 => Ok(GetDataResult::Data(Data::get(buf, &mut ctx.data)?)),
+            0 => Ok(GetDataResult::Data(data_value(buf)?)),
             1 => Ok(GetDataResult::DataAccessError(buf.get_u8()?)),
             t => Err(Error::UnknownChoice { name: "Get-Data-Result", choice: t }),
+        }
+    }
+}
+
+/// Write-side view of the `Get-Data-Result` CHOICE for encoding.
+#[derive(Clone, Copy)]
+pub enum GetDataResultWrite<'a> {
+    Data(&'a dyn Codec),
+    DataAccessError(u8),
+}
+
+impl GetDataResultWrite<'_> {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        match *self {
+            GetDataResultWrite::Data(codec) => GetDataResult::put_data(codec, buf),
+            GetDataResultWrite::DataAccessError(code) => GetDataResult::put_access_error(code, buf),
         }
     }
 }
@@ -311,7 +548,7 @@ impl<'a> DataBlockGResult<'a> {
         }
     }
 
-    fn get(buf: &mut Reader<'a>, _ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    fn get(buf: &mut Reader<'a>) -> Result<Self> {
         match buf.get_u8()? {
             0 => Ok(DataBlockGResult::RawData(crate::axdr::get_octet_string(buf)?)),
             1 => Ok(DataBlockGResult::DataAccessError(buf.get_u8()?)),
@@ -336,11 +573,11 @@ impl<'a> DataBlockG<'a> {
         Ok(written)
     }
 
-    fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    fn get(buf: &mut Reader<'a>) -> Result<Self> {
         Ok(DataBlockG {
             last_block: get_presence(buf)?,
             block_number: u32::from_be_bytes(read_n::<4>(buf)?),
-            result: DataBlockGResult::get(buf, ctx)?,
+            result: DataBlockGResult::get(buf)?,
         })
     }
 }
@@ -361,7 +598,7 @@ impl<'a> DataBlockSA<'a> {
         Ok(written)
     }
 
-    fn get(buf: &mut Reader<'a>, _ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    fn get(buf: &mut Reader<'a>) -> Result<Self> {
         Ok(DataBlockSA {
             last_block: get_presence(buf)?,
             block_number: u32::from_be_bytes(read_n::<4>(buf)?),
@@ -378,19 +615,25 @@ pub struct ActionResponseWithOptionalData<'a> {
 }
 
 impl<'a> ActionResponseWithOptionalData<'a> {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        let mut written = buf.put_u8(self.result)?;
-        written += put_presence(buf, self.return_parameters.is_some())?;
-        if let Some(rp) = &self.return_parameters {
+    /// Encode from typed values: `return_parameters` is a `Get-Data-Result`
+    /// (data or error), written via the asymmetric helper.
+    pub fn put(
+        result: u8,
+        return_parameters: Option<GetDataResultWrite<'_>>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(result)?;
+        written += put_presence(buf, return_parameters.is_some())?;
+        if let Some(rp) = return_parameters {
             written += rp.put(buf)?;
         }
         Ok(written)
     }
 
-    fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let result = buf.get_u8()?;
         let return_parameters = if get_presence(buf)? {
-            Some(GetDataResult::get(buf, ctx)?)
+            Some(GetDataResult::get(buf)?)
         } else {
             None
         };
@@ -398,6 +641,19 @@ impl<'a> ActionResponseWithOptionalData<'a> {
             result,
             return_parameters,
         })
+    }
+}
+
+/// Write-side view of an [`ActionResponseWithOptionalData`] for encoding.
+#[derive(Clone, Copy)]
+pub struct ActionResponseWithOptionalDataWrite<'a> {
+    pub result: u8,
+    pub return_parameters: Option<GetDataResultWrite<'a>>,
+}
+
+impl ActionResponseWithOptionalDataWrite<'_> {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        ActionResponseWithOptionalData::put(self.result, self.return_parameters, buf)
     }
 }
 
@@ -414,47 +670,56 @@ pub enum GetResponse<'a> {
     },
     WithList {
         invoke: InvokeIdAndPriority,
-        results: &'a [GetDataResult<'a>],
+        results: GetDataResultList<'a>,
     },
 }
 
 impl<'a> GetResponse<'a> {
     const TAG: u8 = 196;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode the `normal` alternative from typed values.
+    pub fn put_normal(
+        invoke: InvokeIdAndPriority,
+        result: GetDataResultWrite<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += self.put_lc(buf)?;
+        written += buf.put_u8(1)?;
+        written += invoke.put(buf)?;
+        written += result.put(buf)?;
         Ok(written)
     }
 
-
-    fn put_lc(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            GetResponse::Normal { invoke, result } => {
-                let mut written = buf.put_u8(1)?;
-                written += invoke.put(buf)?;
-                written += result.put(buf)?;
-                Ok(written)
-            }
-            GetResponse::WithDatablock { invoke, result } => {
-                let mut written = buf.put_u8(2)?;
-                written += invoke.put(buf)?;
-                written += result.put(buf)?;
-                Ok(written)
-            }
-            GetResponse::WithList { invoke, results } => {
-                let mut written = buf.put_u8(3)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, results.len())?;
-                for r in *results {
-                    written += r.put(buf)?;
-                }
-                Ok(written)
-            }
-        }
+    /// Encode the `with-datablock` alternative.
+    pub fn put_with_datablock(
+        invoke: InvokeIdAndPriority,
+        result: &DataBlockG<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(2)?;
+        written += invoke.put(buf)?;
+        written += result.put(buf)?;
+        Ok(written)
     }
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `with-list` alternative from typed values.
+    pub fn put_with_list(
+        invoke: InvokeIdAndPriority,
+        results: &[GetDataResultWrite<'_>],
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(3)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, results.len())?;
+        for r in results {
+            written += r.put(buf)?;
+        }
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Get-Response [196]", actual: tag });
@@ -462,23 +727,17 @@ impl<'a> GetResponse<'a> {
         Ok(match buf.get_u8()? {
             1 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let result = GetDataResult::get(buf, ctx)?;
+                let result = GetDataResult::get(buf)?;
                 GetResponse::Normal { invoke, result }
             }
             2 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let result = DataBlockG::get(buf, ctx)?;
+                let result = DataBlockG::get(buf)?;
                 GetResponse::WithDatablock { invoke, result }
             }
             3 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.get_data_result.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut GetDataResult<'a>;
-                for i in 0..n {
-                    unsafe { ptr.add(i).write(GetDataResult::get(buf, ctx)?) };
-                }
-                let results = unsafe { core::slice::from_raw_parts(ptr, n) };
+                let results = GetDataResultList::read(buf)?;
                 GetResponse::WithList { invoke, results }
             }
             other => return Err(Error::UnknownChoice { name: "Get-Response", choice: other }),
@@ -493,7 +752,7 @@ pub enum SetRequest<'a> {
         invoke: InvokeIdAndPriority,
         descriptor: CosemAttributeDescriptor,
         access_selection: Option<SelectiveAccessDescriptor<'a>>,
-        value: Data<'a>,
+        value: Reader<'a>,
     },
     WithFirstDatablock {
         invoke: InvokeIdAndPriority,
@@ -509,12 +768,12 @@ pub enum SetRequest<'a> {
     },
     WithList {
         invoke: InvokeIdAndPriority,
-        descriptors: &'a [(CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>)],
-        values: &'a [Data<'a>],
+        descriptors: DescriptorList<'a>,
+        values: ReaderList<'a>,
     },
     WithListAndFirstDatablock {
         invoke: InvokeIdAndPriority,
-        descriptors: &'a [(CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>)],
+        descriptors: DescriptorList<'a>,
         datablock: DataBlockSA<'a>,
     },
 }
@@ -522,106 +781,114 @@ pub enum SetRequest<'a> {
 impl<'a> SetRequest<'a> {
     const TAG: u8 = 193;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode the `normal` alternative from typed values.
+    pub fn put_normal(
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemAttributeDescriptor,
+        access_selection: Option<SelectiveAccessDescriptorWrite<'_>>,
+        value: &dyn Codec,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += self.put_lc(buf)?;
+        written += buf.put_u8(1)?;
+        written += invoke.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += put_presence(buf, access_selection.is_some())?;
+        if let Some(sel) = access_selection {
+            written += sel.put(buf)?;
+        }
+        written += value.put(buf)?;
         Ok(written)
     }
 
-
-    fn put_lc(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            SetRequest::Normal {
-                invoke,
-                descriptor,
-                access_selection,
-                value,
-            } => {
-                let mut written = buf.put_u8(1)?;
-                written += invoke.put(buf)?;
-                written += descriptor.put(buf)?;
-                written += put_presence(buf, access_selection.is_some())?;
-                if let Some(sel) = access_selection {
-                    written += sel.put(buf)?;
-                }
-                written += value.put(buf)?;
-                Ok(written)
-            }
-            SetRequest::WithFirstDatablock {
-                invoke,
-                descriptor,
-                access_selection,
-                datablock,
-            } => {
-                let mut written = buf.put_u8(2)?;
-                written += invoke.put(buf)?;
-                written += descriptor.put(buf)?;
-                written += put_presence(buf, access_selection.is_some())?;
-                if let Some(sel) = access_selection {
-                    written += sel.put(buf)?;
-                }
-                written += datablock.put(buf)?;
-                Ok(written)
-            }
-            SetRequest::WithDatablock {
-                invoke,
-                descriptor,
-                access_selection,
-                datablock,
-            } => {
-                let mut written = buf.put_u8(3)?;
-                written += invoke.put(buf)?;
-                written += descriptor.put(buf)?;
-                written += put_presence(buf, access_selection.is_some())?;
-                if let Some(sel) = access_selection {
-                    written += sel.put(buf)?;
-                }
-                written += datablock.put(buf)?;
-                Ok(written)
-            }
-            SetRequest::WithList {
-                invoke,
-                descriptors,
-                values,
-            } => {
-                let mut written = buf.put_u8(4)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, descriptors.len())?;
-                for (desc, sel) in *descriptors {
-                    written += desc.put(buf)?;
-                    written += put_presence(buf, sel.is_some())?;
-                    if let Some(s) = sel {
-                        written += s.put(buf)?;
-                    }
-                }
-                written += put_length(buf, values.len())?;
-                for v in *values {
-                    written += v.put(buf)?;
-                }
-                Ok(written)
-            }
-            SetRequest::WithListAndFirstDatablock {
-                invoke,
-                descriptors,
-                datablock,
-            } => {
-                let mut written = buf.put_u8(5)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, descriptors.len())?;
-                for (desc, sel) in *descriptors {
-                    written += desc.put(buf)?;
-                    written += put_presence(buf, sel.is_some())?;
-                    if let Some(s) = sel {
-                        written += s.put(buf)?;
-                    }
-                }
-                written += datablock.put(buf)?;
-                Ok(written)
-            }
+    /// Encode the `with-first-datablock` alternative.
+    pub fn put_with_first_datablock(
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemAttributeDescriptor,
+        access_selection: Option<SelectiveAccessDescriptorWrite<'_>>,
+        datablock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(2)?;
+        written += invoke.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += put_presence(buf, access_selection.is_some())?;
+        if let Some(sel) = access_selection {
+            written += sel.put(buf)?;
         }
+        written += datablock.put(buf)?;
+        Ok(written)
     }
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `with-datablock` alternative.
+    pub fn put_with_datablock(
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemAttributeDescriptor,
+        access_selection: Option<SelectiveAccessDescriptorWrite<'_>>,
+        datablock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(3)?;
+        written += invoke.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += put_presence(buf, access_selection.is_some())?;
+        if let Some(sel) = access_selection {
+            written += sel.put(buf)?;
+        }
+        written += datablock.put(buf)?;
+        Ok(written)
+    }
+
+    /// Encode the `with-list` alternative from typed values.
+    pub fn put_with_list(
+        invoke: InvokeIdAndPriority,
+        descriptors: &[(CosemAttributeDescriptor, Option<SelectiveAccessDescriptorWrite<'_>>)],
+        values: &[&dyn Codec],
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(4)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, descriptors.len())?;
+        for (desc, sel) in descriptors {
+            written += desc.put(buf)?;
+            written += put_presence(buf, sel.is_some())?;
+            if let Some(s) = sel {
+                written += s.put(buf)?;
+            }
+        }
+        written += put_length(buf, values.len())?;
+        for v in values {
+            written += v.put(buf)?;
+        }
+        Ok(written)
+    }
+
+    /// Encode the `with-list-and-first-datablock` alternative.
+    pub fn put_with_list_and_first_datablock(
+        invoke: InvokeIdAndPriority,
+        descriptors: &[(CosemAttributeDescriptor, Option<SelectiveAccessDescriptorWrite<'_>>)],
+        datablock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(5)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, descriptors.len())?;
+        for (desc, sel) in descriptors {
+            written += desc.put(buf)?;
+            written += put_presence(buf, sel.is_some())?;
+            if let Some(s) = sel {
+                written += s.put(buf)?;
+            }
+        }
+        written += datablock.put(buf)?;
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Set-Request [193]", actual: tag });
@@ -631,11 +898,11 @@ impl<'a> SetRequest<'a> {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let descriptor = CosemAttributeDescriptor::get(buf)?;
                 let access_selection = if get_presence(buf)? {
-                    Some(SelectiveAccessDescriptor::get(buf, ctx)?)
+                    Some(SelectiveAccessDescriptor::get(buf)?)
                 } else {
                     None
                 };
-                let value = Data::get(buf, &mut ctx.data)?;
+                let value = data_value(buf)?;
                 SetRequest::Normal {
                     invoke,
                     descriptor,
@@ -647,11 +914,11 @@ impl<'a> SetRequest<'a> {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let descriptor = CosemAttributeDescriptor::get(buf)?;
                 let access_selection = if get_presence(buf)? {
-                    Some(SelectiveAccessDescriptor::get(buf, ctx)?)
+                    Some(SelectiveAccessDescriptor::get(buf)?)
                 } else {
                     None
                 };
-                let datablock = DataBlockSA::get(buf, ctx)?;
+                let datablock = DataBlockSA::get(buf)?;
                 SetRequest::WithFirstDatablock {
                     invoke,
                     descriptor,
@@ -663,11 +930,11 @@ impl<'a> SetRequest<'a> {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let descriptor = CosemAttributeDescriptor::get(buf)?;
                 let access_selection = if get_presence(buf)? {
-                    Some(SelectiveAccessDescriptor::get(buf, ctx)?)
+                    Some(SelectiveAccessDescriptor::get(buf)?)
                 } else {
                     None
                 };
-                let datablock = DataBlockSA::get(buf, ctx)?;
+                let datablock = DataBlockSA::get(buf)?;
                 SetRequest::WithDatablock {
                     invoke,
                     descriptor,
@@ -677,21 +944,8 @@ impl<'a> SetRequest<'a> {
             }
             4 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.descriptors.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut (CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>);
-                for i in 0..n {
-                    let descriptor = CosemAttributeDescriptor::get(buf)?;
-                    let sel = if get_presence(buf)? {
-                        Some(SelectiveAccessDescriptor::get(buf, ctx)?)
-                    } else {
-                        None
-                    };
-                    unsafe { ptr.add(i).write((descriptor, sel)) };
-                }
-                let descriptors = unsafe { core::slice::from_raw_parts(ptr, n) };
-                let n = get_length(buf)?;
-                let values = decode_data(buf, &mut ctx.data, n)?;
+                let descriptors = DescriptorList::read(buf)?;
+                let values = ReaderList::read(buf)?;
                 SetRequest::WithList {
                     invoke,
                     descriptors,
@@ -700,20 +954,8 @@ impl<'a> SetRequest<'a> {
             }
             5 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.descriptors.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut (CosemAttributeDescriptor, Option<SelectiveAccessDescriptor<'a>>);
-                for i in 0..n {
-                    let descriptor = CosemAttributeDescriptor::get(buf)?;
-                    let sel = if get_presence(buf)? {
-                        Some(SelectiveAccessDescriptor::get(buf, ctx)?)
-                    } else {
-                        None
-                    };
-                    unsafe { ptr.add(i).write((descriptor, sel)) };
-                }
-                let descriptors = unsafe { core::slice::from_raw_parts(ptr, n) };
-                let datablock = DataBlockSA::get(buf, ctx)?;
+                let descriptors = DescriptorList::read(buf)?;
+                let datablock = DataBlockSA::get(buf)?;
                 SetRequest::WithListAndFirstDatablock {
                     invoke,
                     descriptors,
@@ -755,64 +997,78 @@ pub enum SetResponse<'a> {
 impl<'a> SetResponse<'a> {
     const TAG: u8 = 197;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode the `normal` alternative from typed values.
+    pub fn put_normal(
+        invoke: InvokeIdAndPriority,
+        result: GetDataResultWrite<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += self.put_lc(buf)?;
+        written += buf.put_u8(1)?;
+        written += invoke.put(buf)?;
+        written += result.put(buf)?;
         Ok(written)
     }
 
-
-    fn put_lc(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            SetResponse::Normal { invoke, result } => {
-                let mut written = buf.put_u8(1)?;
-                written += invoke.put(buf)?;
-                written += result.put(buf)?;
-                Ok(written)
-            }
-            SetResponse::Datablock {
-                invoke,
-                block_number,
-            } => {
-                let mut written = buf.put_u8(2)?;
-                written += invoke.put(buf)?;
-                written += buf.write(&block_number.to_be_bytes())?;
-                Ok(written)
-            }
-            SetResponse::LastDatablock {
-                invoke,
-                result,
-                block_number,
-            } => {
-                let mut written = buf.put_u8(3)?;
-                written += invoke.put(buf)?;
-                written += buf.put_u8(*result)?;
-                written += buf.write(&block_number.to_be_bytes())?;
-                Ok(written)
-            }
-            SetResponse::LastDatablockWithList {
-                invoke,
-                results,
-                block_number,
-            } => {
-                let mut written = buf.put_u8(4)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, results.len())?;
-                written += buf.write(*results)?;
-                written += buf.write(&block_number.to_be_bytes())?;
-                Ok(written)
-            }
-            SetResponse::WithList { invoke, results } => {
-                let mut written = buf.put_u8(5)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, results.len())?;
-                written += buf.write(*results)?;
-                Ok(written)
-            }
-        }
+    /// Encode the `datablock` alternative.
+    pub fn put_datablock(
+        invoke: InvokeIdAndPriority,
+        block_number: u32,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(2)?;
+        written += invoke.put(buf)?;
+        written += buf.write(&block_number.to_be_bytes())?;
+        Ok(written)
     }
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `last-datablock` alternative.
+    pub fn put_last_datablock(
+        invoke: InvokeIdAndPriority,
+        result: u8,
+        block_number: u32,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(3)?;
+        written += invoke.put(buf)?;
+        written += buf.put_u8(result)?;
+        written += buf.write(&block_number.to_be_bytes())?;
+        Ok(written)
+    }
+
+    /// Encode the `last-datablock-with-list` alternative.
+    pub fn put_last_datablock_with_list(
+        invoke: InvokeIdAndPriority,
+        results: &[u8],
+        block_number: u32,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(4)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, results.len())?;
+        written += buf.write(results)?;
+        written += buf.write(&block_number.to_be_bytes())?;
+        Ok(written)
+    }
+
+    /// Encode the `with-list` alternative.
+    pub fn put_with_list(
+        invoke: InvokeIdAndPriority,
+        results: &[u8],
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(5)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, results.len())?;
+        written += buf.write(results)?;
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Set-Response [197]", actual: tag });
@@ -820,7 +1076,7 @@ impl<'a> SetResponse<'a> {
         Ok(match buf.get_u8()? {
             1 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let result = GetDataResult::get(buf, ctx)?;
+                let result = GetDataResult::get(buf)?;
                 SetResponse::Normal { invoke, result }
             }
             2 => {
@@ -869,7 +1125,7 @@ pub enum ActionRequest<'a> {
     Normal {
         invoke: InvokeIdAndPriority,
         descriptor: CosemMethodDescriptor,
-        method_invocation_parameters: Option<Data<'a>>,
+        method_invocation_parameters: Option<Reader<'a>>,
     },
     NextPblock {
         invoke: InvokeIdAndPriority,
@@ -877,8 +1133,8 @@ pub enum ActionRequest<'a> {
     },
     WithList {
         invoke: InvokeIdAndPriority,
-        descriptors: &'a [CosemMethodDescriptor],
-        method_invocation_parameters: &'a [Data<'a>],
+        descriptors: MethodDescriptorList<'a>,
+        method_invocation_parameters: ReaderList<'a>,
     },
     WithFirstPblock {
         invoke: InvokeIdAndPriority,
@@ -887,7 +1143,7 @@ pub enum ActionRequest<'a> {
     },
     WithListAndFirstPblock {
         invoke: InvokeIdAndPriority,
-        descriptors: &'a [CosemMethodDescriptor],
+        descriptors: MethodDescriptorList<'a>,
         pblock: DataBlockSA<'a>,
     },
     WithPblock {
@@ -899,90 +1155,105 @@ pub enum ActionRequest<'a> {
 impl<'a> ActionRequest<'a> {
     const TAG: u8 = 195;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode the `normal` alternative from typed values.
+    pub fn put_normal(
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemMethodDescriptor,
+        method_invocation_parameters: Option<&dyn Codec>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += self.put_lc(buf)?;
+        written += buf.put_u8(1)?;
+        written += invoke.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += put_presence(buf, method_invocation_parameters.is_some())?;
+        if let Some(d) = method_invocation_parameters {
+            written += d.put(buf)?;
+        }
         Ok(written)
     }
 
-
-    fn put_lc(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            ActionRequest::Normal {
-                invoke,
-                descriptor,
-                method_invocation_parameters,
-            } => {
-                let mut written = buf.put_u8(1)?;
-                written += invoke.put(buf)?;
-                written += descriptor.put(buf)?;
-                written += put_presence(buf, method_invocation_parameters.is_some())?;
-                if let Some(d) = method_invocation_parameters {
-                    written += d.put(buf)?;
-                }
-                Ok(written)
-            }
-            ActionRequest::NextPblock {
-                invoke,
-                block_number,
-            } => {
-                let mut written = buf.put_u8(2)?;
-                written += invoke.put(buf)?;
-                written += buf.write(&block_number.to_be_bytes())?;
-                Ok(written)
-            }
-            ActionRequest::WithList {
-                invoke,
-                descriptors,
-                method_invocation_parameters,
-            } => {
-                let mut written = buf.put_u8(3)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, descriptors.len())?;
-                for desc in *descriptors {
-                    written += desc.put(buf)?;
-                }
-                written += put_length(buf, method_invocation_parameters.len())?;
-                for d in *method_invocation_parameters {
-                    written += d.put(buf)?;
-                }
-                Ok(written)
-            }
-            ActionRequest::WithFirstPblock {
-                invoke,
-                descriptor,
-                pblock,
-            } => {
-                let mut written = buf.put_u8(4)?;
-                written += invoke.put(buf)?;
-                written += descriptor.put(buf)?;
-                written += pblock.put(buf)?;
-                Ok(written)
-            }
-            ActionRequest::WithListAndFirstPblock {
-                invoke,
-                descriptors,
-                pblock,
-            } => {
-                let mut written = buf.put_u8(5)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, descriptors.len())?;
-                for desc in *descriptors {
-                    written += desc.put(buf)?;
-                }
-                written += pblock.put(buf)?;
-                Ok(written)
-            }
-            ActionRequest::WithPblock { invoke, pblock } => {
-                let mut written = buf.put_u8(6)?;
-                written += invoke.put(buf)?;
-                written += pblock.put(buf)?;
-                Ok(written)
-            }
-        }
+    /// Encode the `next-pblock` alternative.
+    pub fn put_next_pblock(
+        invoke: InvokeIdAndPriority,
+        block_number: u32,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(2)?;
+        written += invoke.put(buf)?;
+        written += buf.write(&block_number.to_be_bytes())?;
+        Ok(written)
     }
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `with-list` alternative from typed values.
+    pub fn put_with_list(
+        invoke: InvokeIdAndPriority,
+        descriptors: &[CosemMethodDescriptor],
+        method_invocation_parameters: &[&dyn Codec],
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(3)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, descriptors.len())?;
+        for desc in descriptors {
+            written += desc.put(buf)?;
+        }
+        written += put_length(buf, method_invocation_parameters.len())?;
+        for d in method_invocation_parameters {
+            written += d.put(buf)?;
+        }
+        Ok(written)
+    }
+
+    /// Encode the `with-first-pblock` alternative.
+    pub fn put_with_first_pblock(
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemMethodDescriptor,
+        pblock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(4)?;
+        written += invoke.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += pblock.put(buf)?;
+        Ok(written)
+    }
+
+    /// Encode the `with-list-and-first-pblock` alternative.
+    pub fn put_with_list_and_first_pblock(
+        invoke: InvokeIdAndPriority,
+        descriptors: &[CosemMethodDescriptor],
+        pblock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(5)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, descriptors.len())?;
+        for desc in descriptors {
+            written += desc.put(buf)?;
+        }
+        written += pblock.put(buf)?;
+        Ok(written)
+    }
+
+    /// Encode the `with-pblock` alternative.
+    pub fn put_with_pblock(
+        invoke: InvokeIdAndPriority,
+        pblock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(6)?;
+        written += invoke.put(buf)?;
+        written += pblock.put(buf)?;
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Action-Request [195]", actual: tag });
@@ -992,7 +1263,7 @@ impl<'a> ActionRequest<'a> {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let descriptor = CosemMethodDescriptor::get(buf)?;
                 let method_invocation_parameters = if get_presence(buf)? {
-                    Some(Data::get(buf, &mut ctx.data)?)
+                    Some(data_value(buf)?)
                 } else {
                     None
                 };
@@ -1012,15 +1283,8 @@ impl<'a> ActionRequest<'a> {
             }
             3 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.method_descriptors.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut CosemMethodDescriptor;
-                for i in 0..n {
-                    unsafe { ptr.add(i).write(CosemMethodDescriptor::get(buf)?) };
-                }
-                let descriptors = unsafe { core::slice::from_raw_parts(ptr, n) };
-                let n = get_length(buf)?;
-                let method_invocation_parameters = decode_data(buf, &mut ctx.data, n)?;
+                let descriptors = MethodDescriptorList::read(buf)?;
+                let method_invocation_parameters = ReaderList::read(buf)?;
                 ActionRequest::WithList {
                     invoke,
                     descriptors,
@@ -1030,7 +1294,7 @@ impl<'a> ActionRequest<'a> {
             4 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let descriptor = CosemMethodDescriptor::get(buf)?;
-                let pblock = DataBlockSA::get(buf, ctx)?;
+                let pblock = DataBlockSA::get(buf)?;
                 ActionRequest::WithFirstPblock {
                     invoke,
                     descriptor,
@@ -1039,14 +1303,8 @@ impl<'a> ActionRequest<'a> {
             }
             5 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.method_descriptors.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut CosemMethodDescriptor;
-                for i in 0..n {
-                    unsafe { ptr.add(i).write(CosemMethodDescriptor::get(buf)?) };
-                }
-                let descriptors = unsafe { core::slice::from_raw_parts(ptr, n) };
-                let pblock = DataBlockSA::get(buf, ctx)?;
+                let descriptors = MethodDescriptorList::read(buf)?;
+                let pblock = DataBlockSA::get(buf)?;
                 ActionRequest::WithListAndFirstPblock {
                     invoke,
                     descriptors,
@@ -1055,7 +1313,7 @@ impl<'a> ActionRequest<'a> {
             }
             6 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let pblock = DataBlockSA::get(buf, ctx)?;
+                let pblock = DataBlockSA::get(buf)?;
                 ActionRequest::WithPblock { invoke, pblock }
             }
             other => return Err(Error::UnknownChoice { name: "Action-Request", choice: other }),
@@ -1076,7 +1334,7 @@ pub enum ActionResponse<'a> {
     },
     WithList {
         invoke: InvokeIdAndPriority,
-        list_of_responses: &'a [ActionResponseWithOptionalData<'a>],
+        list_of_responses: ActionResponseWithOptionalDataList<'a>,
     },
     NextPblock {
         invoke: InvokeIdAndPriority,
@@ -1087,55 +1345,62 @@ pub enum ActionResponse<'a> {
 impl<'a> ActionResponse<'a> {
     const TAG: u8 = 199;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode the `normal` alternative from typed values.
+    pub fn put_normal(
+        invoke: InvokeIdAndPriority,
+        single_response: ActionResponseWithOptionalDataWrite<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += self.put_lc(buf)?;
+        written += buf.put_u8(1)?;
+        written += invoke.put(buf)?;
+        written += single_response.put(buf)?;
         Ok(written)
     }
 
-
-    fn put_lc(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            ActionResponse::Normal {
-                invoke,
-                single_response,
-            } => {
-                let mut written = buf.put_u8(1)?;
-                written += invoke.put(buf)?;
-                written += single_response.put(buf)?;
-                Ok(written)
-            }
-            ActionResponse::WithPblock { invoke, pblock } => {
-                let mut written = buf.put_u8(2)?;
-                written += invoke.put(buf)?;
-                written += pblock.put(buf)?;
-                Ok(written)
-            }
-            ActionResponse::WithList {
-                invoke,
-                list_of_responses,
-            } => {
-                let mut written = buf.put_u8(3)?;
-                written += invoke.put(buf)?;
-                written += put_length(buf, list_of_responses.len())?;
-                for r in *list_of_responses {
-                    written += r.put(buf)?;
-                }
-                Ok(written)
-            }
-            ActionResponse::NextPblock {
-                invoke,
-                block_number,
-            } => {
-                let mut written = buf.put_u8(4)?;
-                written += invoke.put(buf)?;
-                written += buf.write(&block_number.to_be_bytes())?;
-                Ok(written)
-            }
-        }
+    /// Encode the `with-pblock` alternative.
+    pub fn put_with_pblock(
+        invoke: InvokeIdAndPriority,
+        pblock: &DataBlockSA<'_>,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(2)?;
+        written += invoke.put(buf)?;
+        written += pblock.put(buf)?;
+        Ok(written)
     }
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    /// Encode the `with-list` alternative from typed values.
+    pub fn put_with_list(
+        invoke: InvokeIdAndPriority,
+        list_of_responses: &[ActionResponseWithOptionalDataWrite<'_>],
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(3)?;
+        written += invoke.put(buf)?;
+        written += put_length(buf, list_of_responses.len())?;
+        for r in list_of_responses {
+            written += r.put(buf)?;
+        }
+        Ok(written)
+    }
+
+    /// Encode the `next-pblock` alternative.
+    pub fn put_next_pblock(
+        invoke: InvokeIdAndPriority,
+        block_number: u32,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += buf.put_u8(4)?;
+        written += invoke.put(buf)?;
+        written += buf.write(&block_number.to_be_bytes())?;
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Action-Response [199]", actual: tag });
@@ -1143,7 +1408,7 @@ impl<'a> ActionResponse<'a> {
         Ok(match buf.get_u8()? {
             1 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let single_response = ActionResponseWithOptionalData::get(buf, ctx)?;
+                let single_response = ActionResponseWithOptionalData::get(buf)?;
                 ActionResponse::Normal {
                     invoke,
                     single_response,
@@ -1151,18 +1416,12 @@ impl<'a> ActionResponse<'a> {
             }
             2 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let pblock = DataBlockSA::get(buf, ctx)?;
+                let pblock = DataBlockSA::get(buf)?;
                 ActionResponse::WithPblock { invoke, pblock }
             }
             3 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let slice = ctx.action_response.alloc(n)?;
-                let ptr = slice.as_mut_ptr() as *mut ActionResponseWithOptionalData<'a>;
-                for i in 0..n {
-                    unsafe { ptr.add(i).write(ActionResponseWithOptionalData::get(buf, ctx)?) };
-                }
-                let list_of_responses = unsafe { core::slice::from_raw_parts(ptr, n) };
+                let list_of_responses = ActionResponseWithOptionalDataList::read(buf)?;
                 ActionResponse::WithList {
                     invoke,
                     list_of_responses,
@@ -1186,25 +1445,31 @@ impl<'a> ActionResponse<'a> {
 pub struct EventNotificationRequest<'a> {
     pub time: Option<&'a [u8]>,
     pub descriptor: CosemAttributeDescriptor,
-    pub attribute_value: Data<'a>,
+    pub attribute_value: Reader<'a>,
 }
 
 impl<'a> EventNotificationRequest<'a> {
     const TAG: u8 = 194;
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    /// Encode an event-notification request from typed values.
+    pub fn put(
+        time: Option<&[u8]>,
+        descriptor: CosemAttributeDescriptor,
+        attribute_value: &dyn Codec,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
-        written += put_presence(buf, self.time.is_some())?;
-        if let Some(t) = &self.time {
+        written += put_presence(buf, time.is_some())?;
+        if let Some(t) = time {
             written += crate::axdr::put_octet_string(buf, t)?;
         }
-        written += self.descriptor.put(buf)?;
-        written += self.attribute_value.put(buf)?;
+        written += descriptor.put(buf)?;
+        written += attribute_value.put(buf)?;
         Ok(written)
     }
 
 
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
             return Err(Error::UnexpectedTag { name: "Event-Notification-Request [194]", actual: tag });
@@ -1215,7 +1480,7 @@ impl<'a> EventNotificationRequest<'a> {
             None
         };
         let descriptor = CosemAttributeDescriptor::get(buf)?;
-        let attribute_value = Data::get(buf, &mut ctx.data)?;
+        let attribute_value = data_value(buf)?;
         Ok(EventNotificationRequest {
             time,
             descriptor,
@@ -1228,6 +1493,17 @@ impl<'a> EventNotificationRequest<'a> {
 /// event notification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum XDLMSApdu<'a> {
+    InitiateRequest(crate::apdu_sn::InitiateRequest<'a>),
+    ReadRequest(crate::apdu_sn::ReadRequest<'a>),
+    WriteRequest(crate::apdu_sn::WriteRequest<'a>),
+    InitiateResponse(crate::apdu_sn::InitiateResponse),
+    ReadResponse(crate::apdu_sn::ReadResponse<'a>),
+    WriteResponse(crate::apdu_sn::WriteResponse<'a>),
+    ConfirmedServiceError(crate::apdu_sn::ConfirmedServiceError),
+    DataNotification(crate::apdu_sn::DataNotification<'a>),
+    DataNotificationConfirm(crate::apdu_sn::DataNotificationConfirm<'a>),
+    UnconfirmedWriteRequest(crate::apdu_sn::UnconfirmedWriteRequest<'a>),
+    InformationReportRequest(crate::apdu_sn::InformationReportRequest<'a>),
     GetRequest(GetRequest<'a>),
     GetResponse(GetResponse<'a>),
     SetRequest(SetRequest<'a>),
@@ -1238,30 +1514,48 @@ pub enum XDLMSApdu<'a> {
 }
 
 impl<'a> XDLMSApdu<'a> {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        match self {
-            XDLMSApdu::GetRequest(g) => g.put(buf),
-            XDLMSApdu::GetResponse(g) => g.put(buf),
-            XDLMSApdu::SetRequest(g) => g.put(buf),
-            XDLMSApdu::SetResponse(g) => g.put(buf),
-            XDLMSApdu::ActionRequest(g) => g.put(buf),
-            XDLMSApdu::ActionResponse(g) => g.put(buf),
-            XDLMSApdu::EventNotificationRequest(g) => g.put(buf),
-        }
-    }
-
     /// Decode from a buffer; detects the APDU by its leading tag byte.
-    pub fn get(buf: &mut Reader<'a>, ctx: &mut DecodeContext<'a>) -> Result<Self> {
+    pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
+        use crate::apdu_sn::{
+            ConfirmedServiceError, DataNotification, DataNotificationConfirm,
+            InformationReportRequest, InitiateRequest, InitiateResponse, ReadRequest, ReadResponse,
+            UnconfirmedWriteRequest, WriteRequest, WriteResponse,
+        };
         match buf.peek(1)?.first().copied() {
-            Some(GetRequest::TAG) => Ok(XDLMSApdu::GetRequest(GetRequest::get(buf, ctx)?)),
-            Some(GetResponse::TAG) => Ok(XDLMSApdu::GetResponse(GetResponse::get(buf, ctx)?)),
-            Some(SetRequest::TAG) => Ok(XDLMSApdu::SetRequest(SetRequest::get(buf, ctx)?)),
-            Some(EventNotificationRequest::TAG) => Ok(XDLMSApdu::EventNotificationRequest(
-                EventNotificationRequest::get(buf, ctx)?,
+            Some(InitiateRequest::TAG) => {
+                Ok(XDLMSApdu::InitiateRequest(InitiateRequest::get(buf)?))
+            }
+            Some(ReadRequest::TAG) => Ok(XDLMSApdu::ReadRequest(ReadRequest::get(buf)?)),
+            Some(WriteRequest::TAG) => Ok(XDLMSApdu::WriteRequest(WriteRequest::get(buf)?)),
+            Some(InitiateResponse::TAG) => {
+                Ok(XDLMSApdu::InitiateResponse(InitiateResponse::get(buf)?))
+            }
+            Some(ReadResponse::TAG) => Ok(XDLMSApdu::ReadResponse(ReadResponse::get(buf)?)),
+            Some(WriteResponse::TAG) => Ok(XDLMSApdu::WriteResponse(WriteResponse::get(buf)?)),
+            Some(ConfirmedServiceError::TAG) => Ok(XDLMSApdu::ConfirmedServiceError(
+                ConfirmedServiceError::get(buf)?,
             )),
-            Some(ActionRequest::TAG) => Ok(XDLMSApdu::ActionRequest(ActionRequest::get(buf, ctx)?)),
-            Some(SetResponse::TAG) => Ok(XDLMSApdu::SetResponse(SetResponse::get(buf, ctx)?)),
-            Some(ActionResponse::TAG) => Ok(XDLMSApdu::ActionResponse(ActionResponse::get(buf, ctx)?)),
+            Some(DataNotification::TAG) => {
+                Ok(XDLMSApdu::DataNotification(DataNotification::get(buf)?))
+            }
+            Some(DataNotificationConfirm::TAG) => Ok(XDLMSApdu::DataNotificationConfirm(
+                DataNotificationConfirm::get(buf)?,
+            )),
+            Some(UnconfirmedWriteRequest::TAG) => Ok(XDLMSApdu::UnconfirmedWriteRequest(
+                UnconfirmedWriteRequest::get(buf)?,
+            )),
+            Some(InformationReportRequest::TAG) => Ok(XDLMSApdu::InformationReportRequest(
+                InformationReportRequest::get(buf)?,
+            )),
+            Some(GetRequest::TAG) => Ok(XDLMSApdu::GetRequest(GetRequest::get(buf)?)),
+            Some(GetResponse::TAG) => Ok(XDLMSApdu::GetResponse(GetResponse::get(buf)?)),
+            Some(SetRequest::TAG) => Ok(XDLMSApdu::SetRequest(SetRequest::get(buf)?)),
+            Some(EventNotificationRequest::TAG) => Ok(XDLMSApdu::EventNotificationRequest(
+                EventNotificationRequest::get(buf)?,
+            )),
+            Some(ActionRequest::TAG) => Ok(XDLMSApdu::ActionRequest(ActionRequest::get(buf)?)),
+            Some(SetResponse::TAG) => Ok(XDLMSApdu::SetResponse(SetResponse::get(buf)?)),
+            Some(ActionResponse::TAG) => Ok(XDLMSApdu::ActionResponse(ActionResponse::get(buf)?)),
             Some(t) => Err(Error::UnknownTag { name: "xDLMS-APDU", tag: t }),
             None => Err(Error::Message("empty xDLMS-APDU")),
         }
@@ -1272,38 +1566,46 @@ impl<'a> XDLMSApdu<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use crate::data::Data;
+
+    /// Encode a typed [`Codec`] value into a fresh byte vector (test helper).
+    fn enc(codec: &dyn Codec) -> Vec<u8> {
+        let mut backing = [0u8; 64];
+        let n = {
+            let mut buf = ByteBuffer::new(&mut backing);
+            codec.put(&mut buf).unwrap()
+        };
+        backing[..n].to_vec()
+    }
+
+    /// Minimal typed value for exercising the asymmetric write helpers: wraps a
+    /// [`Data`] so it can be passed as `&dyn Codec`.
+    struct TestCodec(Data<'static>);
+
+    impl Codec for TestCodec {
+        fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+            self.0.put(buf)
+        }
+
+        fn assign(&mut self, _data: &Data<'_>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Encode via a write helper, decode via `get`, then run `$assert` on the
+    /// decoded value.
     macro_rules! roundtrip {
-        ($value:expr, $get:path) => {{
-            let value = $value;
+        ($put:expr, $get:path, $assert:expr) => {{
             let mut backing = [0u8; 4096];
             let n = {
                 let mut buf = ByteBuffer::new(&mut backing);
-                value.put(&mut buf).unwrap();
-                buf.pos()
+                $put(&mut buf).unwrap()
             };
-            let expected = backing[..n].to_vec();
-            let mut r = Reader::new(&backing[..n]);
-            let mut data_storage = [core::mem::MaybeUninit::uninit(); 256];
-            let mut gdr_storage = [core::mem::MaybeUninit::uninit(); 64];
-            let mut desc_storage = [core::mem::MaybeUninit::uninit(); 64];
-            let mut md_storage = [core::mem::MaybeUninit::uninit(); 64];
-            let mut ar_storage = [core::mem::MaybeUninit::uninit(); 64];
-            let mut ctx = DecodeContext {
-                data: Arena::new(&mut data_storage),
-                get_data_result: Arena::new(&mut gdr_storage),
-                descriptors: Arena::new(&mut desc_storage),
-                method_descriptors: Arena::new(&mut md_storage),
-                action_response: Arena::new(&mut ar_storage),
-            };
-            let decoded = $get(&mut r, &mut ctx).unwrap();
-            let mut backing2 = [0u8; 4096];
-            let m = {
-                let mut buf = ByteBuffer::new(&mut backing2);
-                decoded.put(&mut buf).unwrap();
-                buf.pos()
-            };
-            assert_eq!(&backing2[..m], &expected[..]);
+            let bytes = &backing[..n];
+            let mut r = Reader::new(bytes);
+            let decoded = $get(&mut r).unwrap();
+            assert_eq!(r.pos(), bytes.len(), "message not fully consumed");
+            $assert(decoded);
         }};
     }
 
@@ -1325,52 +1627,98 @@ mod tests {
 
     #[test]
     fn get_request_normal_roundtrip() {
-        let req = GetRequest::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptor: descriptor(),
-            access_selection: None,
-        };
-        roundtrip!(req, GetRequest::get);
+        roundtrip!(
+            |buf| GetRequest::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                descriptor(),
+                None,
+                buf,
+            ),
+            GetRequest::get,
+            |d| match d {
+                GetRequest::Normal { invoke, descriptor: desc, access_selection: None } => {
+                    assert_eq!(invoke, InvokeIdAndPriority::from_bits(1, true, false));
+                    assert_eq!(desc, descriptor());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn get_request_normal_with_selection_roundtrip() {
-        let req = GetRequest::Normal {
-            invoke: InvokeIdAndPriority::from_bits(2, true, false),
-            descriptor: descriptor(),
-            access_selection: Some(SelectiveAccessDescriptor {
-                access_selector: 1,
-                access_parameters: Data::Unsigned(5),
-            }),
-        };
-        roundtrip!(req, GetRequest::get);
+        let value = TestCodec(Data::Unsigned(5));
+        let sel = SelectiveAccessDescriptorWrite { access_selector: 1, access_parameters: &value };
+        roundtrip!(
+            |buf| GetRequest::put_normal(
+                InvokeIdAndPriority::from_bits(2, true, false),
+                descriptor(),
+                Some(sel),
+                buf,
+            ),
+            GetRequest::get,
+            |d| match d {
+                GetRequest::Normal { access_selection: Some(s), .. } => {
+                    assert_eq!(s.access_selector, 1);
+                    assert_eq!(s.access_parameters.as_bytes(), enc(&TestCodec(Data::Unsigned(5))).as_slice());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn get_request_with_list_roundtrip() {
-        let req = GetRequest::WithList {
-            invoke: InvokeIdAndPriority::from_bits(3, true, false),
-            descriptors: &[(descriptor(), None), (descriptor(), None)],
-        };
-        roundtrip!(req, GetRequest::get);
+        roundtrip!(
+            |buf| GetRequest::put_with_list(
+                InvokeIdAndPriority::from_bits(3, true, false),
+                &[(descriptor(), None), (descriptor(), None)],
+                buf,
+            ),
+            GetRequest::get,
+            |d| match d {
+                GetRequest::WithList { descriptors, .. } => assert_eq!(descriptors.len(), 2),
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn get_response_normal_roundtrip() {
-        let resp = GetResponse::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            result: GetDataResult::Data(Data::Long64(123456789)),
-        };
-        roundtrip!(resp, GetResponse::get);
+        let value = TestCodec(Data::Long64(123456789));
+        roundtrip!(
+            |buf| GetResponse::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                GetDataResultWrite::Data(&value),
+                buf,
+            ),
+            GetResponse::get,
+            |d| match d {
+                GetResponse::Normal { result: GetDataResult::Data(reader), .. } => {
+                    assert_eq!(reader.as_bytes(), enc(&TestCodec(Data::Long64(123456789))).as_slice());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn xdlms_apdu_dispatch_roundtrip() {
-        let apdu = XDLMSApdu::GetResponse(GetResponse::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            result: GetDataResult::DataAccessError(11),
-        });
-        roundtrip!(apdu, XDLMSApdu::get);
+        roundtrip!(
+            |buf| GetResponse::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                GetDataResultWrite::DataAccessError(11),
+                buf,
+            ),
+            XDLMSApdu::get,
+            |d| match d {
+                XDLMSApdu::GetResponse(GetResponse::Normal {
+                    result: GetDataResult::DataAccessError(11),
+                    ..
+                }) => {}
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     fn method_descriptor() -> CosemMethodDescriptor {
@@ -1383,108 +1731,202 @@ mod tests {
 
     #[test]
     fn set_request_normal_roundtrip() {
-        let req = SetRequest::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptor: descriptor(),
-            access_selection: None,
-            value: Data::Unsigned(42),
-        };
-        roundtrip!(req, SetRequest::get);
+        let value = TestCodec(Data::Unsigned(42));
+        roundtrip!(
+            |buf| SetRequest::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                descriptor(),
+                None,
+                &value,
+                buf,
+            ),
+            SetRequest::get,
+            |d| match d {
+                SetRequest::Normal { value: v, .. } => {
+                    assert_eq!(v.as_bytes(), enc(&TestCodec(Data::Unsigned(42))).as_slice());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn set_request_with_first_datablock_roundtrip() {
-        let req = SetRequest::WithFirstDatablock {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptor: descriptor(),
-            access_selection: None,
-            datablock: DataBlockSA {
-                last_block: false,
-                block_number: 0,
-                raw_data: b"\xDE\xAD",
-            },
+        let datablock = DataBlockSA {
+            last_block: false,
+            block_number: 0,
+            raw_data: b"\xDE\xAD",
         };
-        roundtrip!(req, SetRequest::get);
+        roundtrip!(
+            |buf| SetRequest::put_with_first_datablock(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                descriptor(),
+                None,
+                &datablock,
+                buf,
+            ),
+            SetRequest::get,
+            |d| match d {
+                SetRequest::WithFirstDatablock { datablock: db, .. } => {
+                    assert_eq!(db.raw_data, b"\xDE\xAD");
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn set_request_with_list_roundtrip() {
-        let req = SetRequest::WithList {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptors: &[(descriptor(), None), (descriptor(), None)],
-            values: &[Data::Unsigned(1), Data::Unsigned(2)],
-        };
-        roundtrip!(req, SetRequest::get);
+        let v1 = TestCodec(Data::Unsigned(1));
+        let v2 = TestCodec(Data::Unsigned(2));
+        roundtrip!(
+            |buf| SetRequest::put_with_list(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                &[(descriptor(), None), (descriptor(), None)],
+                &[&v1, &v2],
+                buf,
+            ),
+            SetRequest::get,
+            |d| match d {
+                SetRequest::WithList { mut values, .. } => {
+                    assert_eq!(values.len(), 2);
+                    assert_eq!(values.next().unwrap().unwrap().as_bytes(), enc(&TestCodec(Data::Unsigned(1))).as_slice());
+                    assert_eq!(values.next().unwrap().unwrap().as_bytes(), enc(&TestCodec(Data::Unsigned(2))).as_slice());
+                    assert!(values.next().is_none());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn set_response_normal_roundtrip() {
-        let resp = SetResponse::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            result: GetDataResult::DataAccessError(0),
-        };
-        roundtrip!(resp, SetResponse::get);
+        roundtrip!(
+            |buf| SetResponse::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                GetDataResultWrite::DataAccessError(0),
+                buf,
+            ),
+            SetResponse::get,
+            |d| match d {
+                SetResponse::Normal { result: GetDataResult::DataAccessError(0), .. } => {}
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn set_response_with_list_roundtrip() {
-        let resp = SetResponse::WithList {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            results: &[0, 0],
-        };
-        roundtrip!(resp, SetResponse::get);
+        roundtrip!(
+            |buf| SetResponse::put_with_list(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                &[0, 0],
+                buf,
+            ),
+            SetResponse::get,
+            |d| match d {
+                SetResponse::WithList { results, .. } => assert_eq!(results.len(), 2),
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn action_request_normal_roundtrip() {
-        let req = ActionRequest::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptor: method_descriptor(),
-            method_invocation_parameters: Some(Data::Unsigned(7)),
-        };
-        roundtrip!(req, ActionRequest::get);
+        let params = TestCodec(Data::Unsigned(7));
+        roundtrip!(
+            |buf| ActionRequest::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                method_descriptor(),
+                Some(&params),
+                buf,
+            ),
+            ActionRequest::get,
+            |d| match d {
+                ActionRequest::Normal { method_invocation_parameters: Some(p), .. } => {
+                    assert_eq!(p.as_bytes(), enc(&TestCodec(Data::Unsigned(7))).as_slice());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn action_request_with_list_roundtrip() {
-        let req = ActionRequest::WithList {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptors: &[method_descriptor()],
-            method_invocation_parameters: &[Data::Unsigned(1), Data::Unsigned(2)],
-        };
-        roundtrip!(req, ActionRequest::get);
+        let p1 = TestCodec(Data::Unsigned(1));
+        let p2 = TestCodec(Data::Unsigned(2));
+        roundtrip!(
+            |buf| ActionRequest::put_with_list(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                &[method_descriptor()],
+                &[&p1, &p2],
+                buf,
+            ),
+            ActionRequest::get,
+            |d| match d {
+                ActionRequest::WithList { method_invocation_parameters, .. } => {
+                    assert_eq!(method_invocation_parameters.len(), 2);
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn action_response_normal_roundtrip() {
-        let resp = ActionResponse::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            single_response: ActionResponseWithOptionalData {
-                result: 0,
-                return_parameters: None,
-            },
-        };
-        roundtrip!(resp, ActionResponse::get);
+        roundtrip!(
+            |buf| ActionResponse::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                ActionResponseWithOptionalDataWrite { result: 0, return_parameters: None },
+                buf,
+            ),
+            ActionResponse::get,
+            |d| match d {
+                ActionResponse::Normal { single_response, .. } => {
+                    assert_eq!(single_response.result, 0);
+                    assert!(single_response.return_parameters.is_none());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 
     #[test]
     fn event_notification_roundtrip() {
-        let req = EventNotificationRequest {
-            time: Some(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c"),
-            descriptor: descriptor(),
-            attribute_value: Data::Unsigned(1),
-        };
-        roundtrip!(req, EventNotificationRequest::get);
+        let value = TestCodec(Data::Unsigned(1));
+        roundtrip!(
+            |buf| EventNotificationRequest::put(
+                Some(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c"),
+                descriptor(),
+                &value,
+                buf,
+            ),
+            EventNotificationRequest::get,
+            |d: EventNotificationRequest| {
+                assert_eq!(d.time, Some(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c".as_slice()));
+                assert_eq!(d.attribute_value.as_bytes(), enc(&TestCodec(Data::Unsigned(1))).as_slice());
+            }
+        );
     }
 
     #[test]
     fn xdlms_apdu_set_action_dispatch_roundtrip() {
-        let apdu = XDLMSApdu::SetRequest(SetRequest::Normal {
-            invoke: InvokeIdAndPriority::from_bits(1, true, false),
-            descriptor: descriptor(),
-            access_selection: None,
-            value: Data::Unsigned(9),
-        });
-        roundtrip!(apdu, XDLMSApdu::get);
+        let value = TestCodec(Data::Unsigned(9));
+        roundtrip!(
+            |buf| SetRequest::put_normal(
+                InvokeIdAndPriority::from_bits(1, true, false),
+                descriptor(),
+                None,
+                &value,
+                buf,
+            ),
+            XDLMSApdu::get,
+            |d| match d {
+                XDLMSApdu::SetRequest(SetRequest::Normal { value: v, .. }) => {
+                    assert_eq!(v.as_bytes(), enc(&TestCodec(Data::Unsigned(9))).as_slice());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
     }
 }

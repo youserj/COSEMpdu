@@ -1,11 +1,12 @@
 //! COSEM interface class "Register" (class_id 3, version 0).
 
 use cosempdu::buffer::ByteBuffer;
-use cosempdu::data::{Data, FromStructure};
+use cosempdu::data::{Codec, Data, FromStructure};
+use cosempdu::stream::StreamSink;
 
 use crate::error::{Error, Result};
 use crate::ic::{
-    Attribute, AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier,
+    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier,
     InterfaceClass, Validator, V0,
 };
 use crate::obis::ObisCode;
@@ -58,13 +59,41 @@ impl<'a> FromStructure<'a> for ScalUnit {
     }
 }
 
-impl Attribute for ScalUnit {
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        Ok(Data::Structure(&[Data::Integer(self.scaler), Data::Enum(self.unit)]).put(buf)?)
+impl Default for ScalUnit {
+    fn default() -> Self {
+        ScalUnit::UNITLESS
+    }
+}
+
+impl Codec for ScalUnit {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        Data::Structure(&[Data::Integer(self.scaler), Data::Enum(self.unit)]).put(buf)
     }
 
-    fn assign(&mut self, data: &Data<'_>) -> Result<()> {
+    fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
         *self = data.recast::<ScalUnit>()?;
+        Ok(())
+    }
+
+    fn stream_sink(&mut self) -> Option<&mut (dyn StreamSink + '_)> {
+        Some(self)
+    }
+}
+
+impl StreamSink for ScalUnit {
+    fn scalar(&mut self, tag: u8, bytes: &[u8], _index: usize) -> cosempdu::Result<()> {
+        match tag {
+            15 => self.scaler = bytes[0] as i8,
+            22 => self.unit = bytes[0],
+            _ => return Err(cosempdu::Error::Message("unexpected scalar in ScalUnit")),
+        }
+        Ok(())
+    }
+
+    fn composite_begin(&mut self, tag: u8, count: usize) -> cosempdu::Result<()> {
+        if tag != 2 || count != 2 {
+            return Err(cosempdu::Error::Message("ScalUnit expects a structure of two fields"));
+        }
         Ok(())
     }
 }
