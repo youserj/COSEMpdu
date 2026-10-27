@@ -1,10 +1,10 @@
-//! COSEM interface class "Association LN" (class_id 15, version 5).
+//! COSEM interface class "Association LN" (class_id 15, version 1).
 
 use cosempdu::data::Data;
 
 use crate::ic::{
     AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, CommonDataType,
-    InterfaceClass, V5,
+    InterfaceClass, ASSOCIATED_PARTNERS_VALIDATOR, V1,
 };
 use crate::obis::ObisCode;
 
@@ -12,7 +12,7 @@ use crate::obis::ObisCode;
 pub const ATTR_LOGICAL_NAME: u8 = 1;
 /// Attribute 2 — `object_list`.
 pub const ATTR_OBJECT_LIST: u8 = 2;
-/// Attribute 3 — `associated_partners_id` (visible-string).
+/// Attribute 3 — `associated_partners_id` (associated_partners_type).
 pub const ATTR_ASSOCIATED_PARTNERS_ID: u8 = 3;
 /// Attribute 4 — `application_context_name` (octet-string).
 pub const ATTR_APPLICATION_CONTEXT_NAME: u8 = 4;
@@ -24,8 +24,6 @@ pub const ATTR_AUTHENTICATION_MECHANISM_NAME: u8 = 6;
 pub const ATTR_LLS_SECRET: u8 = 7;
 /// Attribute 8 — `association_status` (enum).
 pub const ATTR_ASSOCIATION_STATUS: u8 = 8;
-/// Attribute 9 — `security_setup_reference` (octet-string).
-pub const ATTR_SECURITY_SETUP_REFERENCE: u8 = 9;
 
 /// COSEM interface class "Association LN" (class_id 15): a static object descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,11 +70,6 @@ impl AssociationLn {
     pub fn association_status(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_ASSOCIATION_STATUS)
     }
-
-    /// Key of the `security_setup_reference` attribute.
-    pub fn security_setup_reference(&self) -> AttributeKey {
-        AttributeKey::new(self.obis, ATTR_SECURITY_SETUP_REFERENCE)
-    }
 }
 
 impl InterfaceClass for AssociationLn {
@@ -85,7 +78,7 @@ impl InterfaceClass for AssociationLn {
     }
 
     fn version(&self) -> u8 {
-        V5
+        V1
     }
 
     fn obis(&self) -> ObisCode {
@@ -102,7 +95,7 @@ impl InterfaceClass for AssociationLn {
                 classifier: Classifier::Dynamic,
             },
             AttributeInfo {
-                data_type: AttributeType::Common(CommonDataType::VisibleString),
+                data_type: AttributeType::Validator(ASSOCIATED_PARTNERS_VALIDATOR),
                 min: None,
                 max: None,
                 default: None,
@@ -142,13 +135,6 @@ impl InterfaceClass for AssociationLn {
                 max: None,
                 default: Some(Data::Enum(0)),
                 classifier: Classifier::Dynamic,
-            },
-            AttributeInfo {
-                data_type: AttributeType::Common(CommonDataType::OctetString),
-                min: None,
-                max: None,
-                default: None,
-                classifier: Classifier::Static,
             },
         ]
     }

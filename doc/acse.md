@@ -39,9 +39,23 @@ All ACSE types use BER encoding (X.690) with explicit/implicit context tagging, 
 |-------|-----|------|
 | `protocol_version` | `[0]` IMPLICIT BIT STRING | `Option<Vec<u8>>` |
 | `application_context_name` | `[1]` EXPLICIT OID | `Vec<u64>` |
-| `result` | `[2]` Association-result | `i64` (0 = accepted) |
-| `result_source_diagnostic` | `[3]` Associate-source-diagnostic | `i64` |
+| `result` | `[2]` Association-result | `AssociationResult` |
+| `result_source_diagnostic` | `[3]` Associate-source-diagnostic | `AssociateSourceDiagnostic` (CHOICE) |
 | `user_information` | `[30]` EXPLICIT OCTET STRING | `Option<Vec<u8>>` |
+
+### Associate-source-diagnostic
+
+`result_source_diagnostic` is an ASN.1 CHOICE of two INTEGER alternatives:
+
+| Enum | Tag | Values |
+|------|-----|--------|
+| `AcseServiceUser` | `[1]` INTEGER | 0 = null, 1 = no-reason-given, 2 = application-context-name-not-supported, 3 = calling-AP-title-not-recognized, 4 = calling-AP-invocation-identifier-not-recognized, 5 = calling-AE-qualifier-not-recognized, 6 = calling-AE-invocation-identifier-not-recognized, 7 = called-AP-title-not-recognized, 8 = called-AP-invocation-identifier-not-recognized, 9 = called-AE-qualifier-not-recognized, 10 = called-AE-invocation-identifier-not-recognized, 11 = authentication-mechanism-name-not-recognised, 12 = authentication-mechanism-name-required, 13 = authentication-failure, 14 = authentication-required |
+| `AcseServiceProvider` | `[2]` INTEGER | 0 = null, 1 = no-reason-given, 2 = no-common-acse-version |
+
+`AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::...)` selects the `[1]`
+alternative and `AssociateSourceDiagnostic::ServiceProvider(AcseServiceProvider::...)`
+selects the `[2]` alternative. Both are `#[repr(u8)]` enums; unknown values are rejected
+during decoding.
 
 ### RLRQ / RLRE Fields
 

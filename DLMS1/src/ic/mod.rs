@@ -14,7 +14,9 @@ pub mod extended_register;
 pub mod register;
 pub mod register_activation;
 
-use cosempdu::data::Data;
+use cosempdu::buffer::ByteBuffer;
+use cosempdu::data::{Codec, Data, FromStructure};
+use cosempdu::stream::StreamSink;
 
 use crate::error::{Error, Result};
 use crate::obis::ObisCode;
@@ -329,6 +331,89 @@ pub struct XdlmsContextInfo {
     pub max_send_pdu_size: u16,
 }
 
+/// `associated_partners_type ::= structure { client_SAP: integer, server_SAP: long-unsigned }`
+/// (association attribute 3, shared by Association SN and LN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssociatedPartners {
+    /// The client SAP (range 0…0x7F).
+    pub client_sap: i8,
+    /// The server SAP (range 0x0000…0x3FFF).
+    pub server_sap: u16,
+}
+
+impl AssociatedPartners {
+    pub const fn new(client_sap: i8, server_sap: u16) -> Self {
+        AssociatedPartners { client_sap, server_sap }
+    }
+}
+
+impl Default for AssociatedPartners {
+    fn default() -> Self {
+        AssociatedPartners::new(0, 0)
+    }
+}
+
+impl<'a> FromStructure<'a> for AssociatedPartners {
+    fn from_structure(fields: &'a [Data<'a>]) -> cosempdu::Result<Self> {
+        if fields.len() != 2 {
+            return Err(cosempdu::Error::Message("expected structure { integer, long-unsigned }"));
+        }
+        let client_sap = fields[0]
+            .as_integer()
+            .ok_or(cosempdu::Error::Message("field 0 must be integer"))?;
+        let server_sap = fields[1]
+            .as_long_unsigned()
+            .ok_or(cosempdu::Error::Message("field 1 must be long-unsigned"))?;
+        Ok(AssociatedPartners { client_sap, server_sap })
+    }
+}
+
+impl Codec for AssociatedPartners {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        Data::Structure(&[Data::Integer(self.client_sap), Data::LongUnsigned(self.server_sap)]).put(buf)
+    }
+
+    fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
+        *self = data.recast::<AssociatedPartners>()?;
+        Ok(())
+    }
+
+    fn stream_sink(&mut self) -> Option<&mut (dyn StreamSink + '_)> {
+        Some(self)
+    }
+}
+
+impl StreamSink for AssociatedPartners {
+    fn scalar(&mut self, tag: u8, bytes: &[u8], _index: usize) -> cosempdu::Result<()> {
+        match tag {
+            15 => self.client_sap = bytes[0] as i8,
+            18 => self.server_sap = u16::from_be_bytes([bytes[0], bytes[1]]),
+            _ => return Err(cosempdu::Error::Message("unexpected scalar in AssociatedPartners")),
+        }
+        Ok(())
+    }
+
+    fn composite_begin(&mut self, tag: u8, count: usize) -> cosempdu::Result<()> {
+        if tag != 2 || count != 2 {
+            return Err(cosempdu::Error::Message("AssociatedPartners expects a structure of two fields"));
+        }
+        Ok(())
+    }
+}
+
+/// Validates an `associated_partners_type` value.
+#[derive(Debug)]
+pub struct AssociatedPartnersValidator;
+
+impl Validator for AssociatedPartnersValidator {
+    fn validate(&self, data: &Data<'_>) -> Result<()> {
+        data.recast::<AssociatedPartners>().map(|_| ()).map_err(Error::from)
+    }
+}
+
+/// Static `associated_partners_type` validator (as a trait object).
+pub const ASSOCIATED_PARTNERS_VALIDATOR: &dyn Validator = &AssociatedPartnersValidator;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +433,7 @@ mod tests {
         assert_eq!((e.class_id(), e.version()), (ClassId::ExtendedRegister, V0));
         assert_eq!((c.class_id(), c.version()), (ClassId::Clock, V0));
         assert_eq!((sn.class_id(), sn.version()), (ClassId::AssociationSn, V4));
-        assert_eq!((ln.class_id(), ln.version()), (ClassId::AssociationLn, V5));
+        assert_eq!((ln.class_id(), ln.version()), (ClassId::AssociationLn, V1));
         assert_eq!((ra.class_id(), ra.version()), (ClassId::RegisterActivation, V0));
 
         assert_eq!(d.obis().to_string(), "0.0.96.1.0.255");
@@ -360,7 +445,7 @@ mod tests {
         assert_eq!(e.attributes().len(), 4);
         assert_eq!(c.attributes().len(), 7);
         assert_eq!(sn.attributes().len(), 8);
-        assert_eq!(ln.attributes().len(), 8);
+        assert_eq!(ln.attributes().len(), 7);
         assert_eq!(ra.attributes().len(), 3);
 
         // attr_key: logical_name + declared attributes only
@@ -399,6 +484,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn associated_partners_type() {
+        use cosempdu::buffer::{ByteBuffer, Reader};
+        use cosempdu::data::{Arena, Codec, Data};
+        use cosempdu::stream::StreamDecoder;
+
+        let ap = Data::Structure(&[Data::Integer(0x10), Data::LongUnsigned(0x1234)])
+            .recast::<AssociatedPartners>()
+            .unwrap();
+        assert_eq!(ap.client_sap, 0x10);
+        assert_eq!(ap.server_sap, 0x1234);
+
+        assert!(Data::Structure(&[Data::Integer(1)])
+            .recast::<AssociatedPartners>()
+            .is_err());
+        assert!(Data::Structure(&[Data::Integer(1), Data::Integer(2)])
+            .recast::<AssociatedPartners>()
+            .is_err());
+
+        let mut backing = [0u8; 16];
+        let n = {
+            let mut buf = ByteBuffer::new(&mut backing);
+            ap.put(&mut buf).unwrap()
+        };
+        assert_eq!(&backing[..n], &[0x02, 0x02, 0x0F, 0x10, 0x12, 0x12, 0x34]);
+
+        // Decode (get) roundtrip.
+        let mut arena_storage = [core::mem::MaybeUninit::uninit(); 8];
+        let mut arena = Arena::new(&mut arena_storage);
+        let mut reader = Reader::new(&backing[..n]);
+        let decoded = AssociatedPartners::get(&mut reader, &mut arena).unwrap();
+        assert_eq!(decoded, ap);
+
+        // Streaming decode (stream_sink).
+        let mut streamed = AssociatedPartners::default();
+        {
+            let mut dec = StreamDecoder::new(&mut streamed);
+            for chunk in backing[..n].chunks(2) {
+                dec.push(chunk).unwrap();
+            }
+            dec.finish().unwrap();
+        }
+        assert_eq!(streamed, ap);
     }
 }
 

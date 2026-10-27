@@ -101,13 +101,13 @@ pub fn get_tag(buf: &mut Reader<'_>) -> Result<Tag> {
     let first = buf.get_u8()?;
     let class = Class::from_bits(first);
     let constructed = first & 0x20 != 0;
-    let mut tag_number = u64::from(first & 0x1F);
+    let mut tag_number = first & 0x1F;
     if tag_number == 0x1F {
         // High-tag-number form (X.690 §8.1.2.4)
         tag_number = 0;
         loop {
             let byte = buf.get_u8()?;
-            tag_number = (tag_number << 7) | u64::from(byte & 0x7F);
+            tag_number = (tag_number << 7) | (byte & 0x7F);
             if byte & 0x80 == 0 {
                 break;
             }

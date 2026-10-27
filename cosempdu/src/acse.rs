@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::x680::{Class, Tag, UniversalTag};
 use crate::x690::{get_tag, Length};
 
-fn ctx(number: u64, constructed: bool) -> Tag {
+fn ctx(number: u8, constructed: bool) -> Tag {
     Tag {
         class: Class::Context,
         number,
@@ -18,7 +18,7 @@ fn ctx(number: u64, constructed: bool) -> Tag {
     }
 }
 
-fn app(number: u64) -> Tag {
+fn app(number: u8) -> Tag {
     Tag {
         class: Class::Application,
         number,
@@ -46,19 +46,19 @@ fn unwrap_explicit<'a>(content: &'a [u8]) -> Result<(Tag, &'a [u8])> {
 
 fn put_explicit_oid(
     buf: &mut ByteBuffer<'_>,
-    number: u64,
+    number: u8,
     value: &ApplicationContextName,
 ) -> Result<usize> {
     with_content(buf, &ctx(number, true), |b| {
         with_content(b, &Tag::universal(UniversalTag::ObjectIdentifier), |ib| {
-            value.put_content(ib)
+            value.put(ib)
         })
     })
 }
 
 fn put_explicit_octet_string(
     buf: &mut ByteBuffer<'_>,
-    number: u64,
+    number: u8,
     bytes: &[u8],
 ) -> Result<usize> {
     with_content(buf, &ctx(number, true), |b| {
@@ -66,7 +66,7 @@ fn put_explicit_octet_string(
     })
 }
 
-fn put_explicit_integer(buf: &mut ByteBuffer<'_>, number: u64, value: i64) -> Result<usize> {
+fn put_explicit_integer(buf: &mut ByteBuffer<'_>, number: u8, value: i64) -> Result<usize> {
     with_content(buf, &ctx(number, true), |b| {
         with_content(b, &Tag::universal(UniversalTag::Integer), |ib| {
             put_signed(ib, value)
@@ -74,13 +74,22 @@ fn put_explicit_integer(buf: &mut ByteBuffer<'_>, number: u64, value: i64) -> Re
     })
 }
 
-fn put_implicit_integer(buf: &mut ByteBuffer<'_>, number: u64, value: i64) -> Result<usize> {
+fn put_explicit_u8(buf: &mut ByteBuffer<'_>, number: u8, value: u8) -> Result<usize> {
+    with_content(buf, &ctx(number, true), |b| {
+        with_content(b, &Tag::universal(UniversalTag::Integer), |ib| {
+            Ok(ib.put_u8(value)?)
+        })
+    })
+}
+
+
+fn put_implicit_integer(buf: &mut ByteBuffer<'_>, number: u8, value: i64) -> Result<usize> {
     with_content(buf, &ctx(number, false), |b| put_signed(b, value))
 }
 
 fn put_implicit_bit_string(
     buf: &mut ByteBuffer<'_>,
-    number: u64,
+    number: u8,
     content: &[u8],
 ) -> Result<usize> {
     put_tlv(buf, &ctx(number, false), content)
@@ -90,7 +99,7 @@ fn put_implicit_bit_string(
 /// `charstring [0] IMPLICIT GraphicString`: `<ctx(n,true)><len> 80 <len> <bytes>`.
 fn put_explicit_charstring(
     buf: &mut ByteBuffer<'_>,
-    number: u64,
+    number: u8,
     bytes: &[u8],
 ) -> Result<usize> {
     with_content(buf, &ctx(number, true), |b| {
@@ -133,56 +142,42 @@ const MECHANISM_DISCRIMINATOR: u8 = 2;
 /// Encode a `mechanism-name` as an IMPLICIT-tagged OBJECT IDENTIFIER: the
 /// context tag replaces the universal tag and the content is the raw base-128
 /// subidentifiers (no inner tag 0x06).
-fn put_implicit_oid(buf: &mut ByteBuffer<'_>, number: u64, value: &MechanismName) -> Result<usize> {
+fn put_implicit_oid(buf: &mut ByteBuffer<'_>, number: u8, value: &MechanismName) -> Result<usize> {
     with_content(buf, &ctx(number, false), |b| value.put_content(b))
 }
 
 /// DLMS/COSEM `application-context-name` (`{ 2 16 756 5 8 1 X }`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ApplicationContextName {
     /// Logical-name referencing, no ciphering (`{ 2 16 756 5 8 1 1 }`).
-    LogicalNameNoCiphering,
+    LogicalNameNoCiphering = 1,
     /// Short-name referencing, no ciphering (`{ 2 16 756 5 8 1 2 }`).
-    ShortNameNoCiphering,
+    ShortNameNoCiphering = 2,
     /// Logical-name referencing, with ciphering (`{ 2 16 756 5 8 1 3 }`).
-    LogicalNameCiphering,
+    LogicalNameCiphering = 3,
     /// Short-name referencing, with ciphering (`{ 2 16 756 5 8 1 4 }`).
-    ShortNameCiphering,
-    /// An unrecognized application-context (trailing arc), preserved for
-    /// forward compatibility. The trailing arc is at most 127 (a single
-    /// base-128 octet); larger values are rejected when decoding.
-    Unknown(u8),
+    ShortNameCiphering = 4,
 }
 
 impl ApplicationContextName {
-    /// The trailing arc value (`X` in `{ 2 16 756 5 8 1 X }`).
-    pub fn value(self) -> u8 {
-        match self {
-            ApplicationContextName::LogicalNameNoCiphering => 1,
-            ApplicationContextName::ShortNameNoCiphering => 2,
-            ApplicationContextName::LogicalNameCiphering => 3,
-            ApplicationContextName::ShortNameCiphering => 4,
-            ApplicationContextName::Unknown(v) => v,
-        }
-    }
-
     /// The full seven arcs `{ 2 16 756 5 8 1 X }`.
     pub fn to_arcs(self) -> [u64; 7] {
         let mut arcs = [0u64; 7];
         arcs[..5].copy_from_slice(&ACSE_OID_PREFIX);
         arcs[5] = 1;
-        arcs[6] = self.value() as u64;
+        arcs[6] = self as u8 as u64;
         arcs
     }
 
-    /// Map a trailing arc (`X`, already known to be `<= 127`) to the variant.
-    fn from_trailing(x: u8) -> Self {
+    /// Map a trailing arc to the variant, rejecting unknown values.
+    fn from_trailing(x: u8) -> Result<Self> {
         match x {
-            1 => ApplicationContextName::LogicalNameNoCiphering,
-            2 => ApplicationContextName::ShortNameNoCiphering,
-            3 => ApplicationContextName::LogicalNameCiphering,
-            4 => ApplicationContextName::ShortNameCiphering,
-            v => ApplicationContextName::Unknown(v),
+            1 => Ok(ApplicationContextName::LogicalNameNoCiphering),
+            2 => Ok(ApplicationContextName::ShortNameNoCiphering),
+            3 => Ok(ApplicationContextName::LogicalNameCiphering),
+            4 => Ok(ApplicationContextName::ShortNameCiphering),
+            _ => Err(Error::InvalidAcseOid),
         }
     }
 
@@ -194,7 +189,7 @@ impl ApplicationContextName {
         if arcs[6] > 127 {
             return Err(Error::InvalidAcseOid);
         }
-        Ok(Self::from_trailing(arcs[6] as u8))
+        Self::from_trailing(arcs[6] as u8)
     }
 
     /// Write the raw base-128 OBJECT IDENTIFIER content (no tag) into `buf`.
@@ -202,16 +197,16 @@ impl ApplicationContextName {
     /// The content is always exactly seven octets: the fixed prefix
     /// `{ 2 16 756 5 8 }`, the context discriminator `1`, and the trailing arc
     /// `X` (a single octet since `X <= 127`).
-    pub fn put_content(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         buf.write(&ACSE_OID_PREFIX_CONTENT)?;
         buf.put_u8(CONTEXT_DISCRIMINATOR)?;
-        buf.put_u8(self.value())?;
+        buf.put_u8(*self as u8)?;
         Ok(7)
     }
 
     /// Decode the raw base-128 OBJECT IDENTIFIER content (no tag) directly,
     /// without materializing an intermediate arc array.
-    pub fn from_content(content: &[u8]) -> Result<Self> {
+    pub fn get(content: &[u8]) -> Result<Self> {
         if content.len() != 7
             || content[..5] != ACSE_OID_PREFIX_CONTENT[..]
             || content[5] != CONTEXT_DISCRIMINATOR
@@ -219,72 +214,54 @@ impl ApplicationContextName {
         {
             return Err(Error::InvalidAcseOid);
         }
-        Ok(Self::from_trailing(content[6]))
+        Self::from_trailing(content[6])
     }
 }
 
 /// DLMS/COSEM `mechanism-name` (`{ 2 16 756 5 8 2 X }`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MechanismName {
     /// Lowest level security, no authentication (`{ 2 16 756 5 8 2 0 }`).
-    LowestLevelSecurity,
+    LowestLevelSecurity = 0,
     /// Low-level security, LLS (`{ 2 16 756 5 8 2 1 }`).
-    LowLevelSecurity,
+    LowLevelSecurity = 1,
     /// High-level security (`{ 2 16 756 5 8 2 2 }`).
-    HighLevelSecurity,
+    HighLevelSecurity = 2,
     /// High-level security, MD5 (`{ 2 16 756 5 8 2 3 }`).
-    HighLevelSecurityMd5,
+    HighLevelSecurityMd5 = 3,
     /// High-level security, SHA-1 (`{ 2 16 756 5 8 2 4 }`).
-    HighLevelSecuritySha1,
+    HighLevelSecuritySha1 = 4,
     /// High-level security, GMAC (`{ 2 16 756 5 8 2 5 }`).
-    HighLevelSecurityGmac,
+    HighLevelSecurityGmac = 5,
     /// High-level security, SHA-256 (`{ 2 16 756 5 8 2 6 }`).
-    HighLevelSecuritySha256,
+    HighLevelSecuritySha256 = 6,
     /// High-level security, ECDSA (`{ 2 16 756 5 8 2 7 }`).
-    HighLevelSecurityEcdsa,
-    /// An unrecognized mechanism (trailing arc), preserved for forward
-    /// compatibility. The trailing arc is at most 127 (a single base-128
-    /// octet); larger values are rejected when decoding.
-    Unknown(u8),
+    HighLevelSecurityEcdsa = 7,
 }
 
 impl MechanismName {
-    /// The trailing arc value (`X` in `{ 2 16 756 5 8 2 X }`).
-    pub fn value(self) -> u8 {
-        match self {
-            MechanismName::LowestLevelSecurity => 0,
-            MechanismName::LowLevelSecurity => 1,
-            MechanismName::HighLevelSecurity => 2,
-            MechanismName::HighLevelSecurityMd5 => 3,
-            MechanismName::HighLevelSecuritySha1 => 4,
-            MechanismName::HighLevelSecurityGmac => 5,
-            MechanismName::HighLevelSecuritySha256 => 6,
-            MechanismName::HighLevelSecurityEcdsa => 7,
-            MechanismName::Unknown(v) => v,
-        }
-    }
-
     /// The full seven arcs `{ 2 16 756 5 8 2 X }`.
     pub fn to_arcs(self) -> [u64; 7] {
         let mut arcs = [0u64; 7];
         arcs[..5].copy_from_slice(&ACSE_OID_PREFIX);
         arcs[5] = 2;
-        arcs[6] = self.value() as u64;
+        arcs[6] = self as u8 as u64;
         arcs
     }
 
-    /// Map a trailing arc (`X`, already known to be `<= 127`) to the variant.
-    fn from_trailing(x: u8) -> Self {
+    /// Map a trailing arc to the variant, rejecting unknown values.
+    fn from_trailing(x: u8) -> Result<Self> {
         match x {
-            0 => MechanismName::LowestLevelSecurity,
-            1 => MechanismName::LowLevelSecurity,
-            2 => MechanismName::HighLevelSecurity,
-            3 => MechanismName::HighLevelSecurityMd5,
-            4 => MechanismName::HighLevelSecuritySha1,
-            5 => MechanismName::HighLevelSecurityGmac,
-            6 => MechanismName::HighLevelSecuritySha256,
-            7 => MechanismName::HighLevelSecurityEcdsa,
-            v => MechanismName::Unknown(v),
+            0 => Ok(MechanismName::LowestLevelSecurity),
+            1 => Ok(MechanismName::LowLevelSecurity),
+            2 => Ok(MechanismName::HighLevelSecurity),
+            3 => Ok(MechanismName::HighLevelSecurityMd5),
+            4 => Ok(MechanismName::HighLevelSecuritySha1),
+            5 => Ok(MechanismName::HighLevelSecurityGmac),
+            6 => Ok(MechanismName::HighLevelSecuritySha256),
+            7 => Ok(MechanismName::HighLevelSecurityEcdsa),
+            _ => Err(Error::InvalidAcseOid),
         }
     }
 
@@ -296,7 +273,7 @@ impl MechanismName {
         if arcs[6] > 127 {
             return Err(Error::InvalidAcseOid);
         }
-        Ok(Self::from_trailing(arcs[6] as u8))
+        Self::from_trailing(arcs[6] as u8)
     }
 
     /// Write the raw base-128 OBJECT IDENTIFIER content (no tag) into `buf`.
@@ -307,7 +284,7 @@ impl MechanismName {
     pub fn put_content(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         buf.write(&ACSE_OID_PREFIX_CONTENT)?;
         buf.put_u8(MECHANISM_DISCRIMINATOR)?;
-        buf.put_u8(self.value())?;
+        buf.put_u8(*self as u8)?;
         Ok(7)
     }
 
@@ -321,9 +298,155 @@ impl MechanismName {
         {
             return Err(Error::InvalidAcseOid);
         }
-        Ok(Self::from_trailing(content[6]))
+        Self::from_trailing(content[6])
     }
 }
+
+/// `Association-result ::= INTEGER { accepted (0), rejected-permanent (1), rejected-transient (2) }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AssociationResult {
+    /// accepted (0).
+    Accepted = 0,
+    /// rejected-permanent (1).
+    RejectedPermanent = 1,
+    /// rejected-transient (2).
+    RejectedTransient = 2,
+}
+
+impl AssociationResult {
+    /// Encode as `result [2] Association-result` (EXPLICIT INTEGER).
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        put_explicit_u8(buf, 2, *self as u8)
+    }
+
+    /// Decode the `result [2] Association-result` field content.
+    pub fn get(content: &[u8]) -> Result<Self> {
+        let (_itag, ocontent) = unwrap_explicit(content)?;
+        match decode_signed(ocontent)? {
+            0 => Ok(AssociationResult::Accepted),
+            1 => Ok(AssociationResult::RejectedPermanent),
+            2 => Ok(AssociationResult::RejectedTransient),
+            _ => Err(Error::Message("unknown association result")),
+        }
+    }
+}
+
+/// `acse-service-user [1] INTEGER` — one alternative of `Associate-source-diagnostic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AcseServiceUser {
+    /// null (0).
+    Null = 0,
+    /// no-reason-given (1).
+    NoReasonGiven = 1,
+    /// application-context-name-not-supported (2).
+    ApplicationContextNameNotSupported = 2,
+    /// calling-AP-title-not-recognized (3).
+    CallingApTitleNotRecognized = 3,
+    /// calling-AP-invocation-identifier-not-recognized (4).
+    CallingApInvocationIdentifierNotRecognized = 4,
+    /// calling-AE-qualifier-not-recognized (5).
+    CallingAeQualifierNotRecognized = 5,
+    /// calling-AE-invocation-identifier-not-recognized (6).
+    CallingAeInvocationIdentifierNotRecognized = 6,
+    /// called-AP-title-not-recognized (7).
+    CalledApTitleNotRecognized = 7,
+    /// called-AP-invocation-identifier-not-recognized (8).
+    CalledApInvocationIdentifierNotRecognized = 8,
+    /// called-AE-qualifier-not-recognized (9).
+    CalledAeQualifierNotRecognized = 9,
+    /// called-AE-invocation-identifier-not-recognized (10).
+    CalledAeInvocationIdentifierNotRecognized = 10,
+    /// authentication-mechanism-name-not-recognised (11).
+    AuthenticationMechanismNameNotRecognised = 11,
+    /// authentication-mechanism-name-required (12).
+    AuthenticationMechanismNameRequired = 12,
+    /// authentication-failure (13).
+    AuthenticationFailure = 13,
+    /// authentication-required (14).
+    AuthenticationRequired = 14,
+}
+
+impl AcseServiceUser {
+    fn from_i64(v: i64) -> Result<Self> {
+        match v {
+            0 => Ok(AcseServiceUser::Null),
+            1 => Ok(AcseServiceUser::NoReasonGiven),
+            2 => Ok(AcseServiceUser::ApplicationContextNameNotSupported),
+            3 => Ok(AcseServiceUser::CallingApTitleNotRecognized),
+            4 => Ok(AcseServiceUser::CallingApInvocationIdentifierNotRecognized),
+            5 => Ok(AcseServiceUser::CallingAeQualifierNotRecognized),
+            6 => Ok(AcseServiceUser::CallingAeInvocationIdentifierNotRecognized),
+            7 => Ok(AcseServiceUser::CalledApTitleNotRecognized),
+            8 => Ok(AcseServiceUser::CalledApInvocationIdentifierNotRecognized),
+            9 => Ok(AcseServiceUser::CalledAeQualifierNotRecognized),
+            10 => Ok(AcseServiceUser::CalledAeInvocationIdentifierNotRecognized),
+            11 => Ok(AcseServiceUser::AuthenticationMechanismNameNotRecognised),
+            12 => Ok(AcseServiceUser::AuthenticationMechanismNameRequired),
+            13 => Ok(AcseServiceUser::AuthenticationFailure),
+            14 => Ok(AcseServiceUser::AuthenticationRequired),
+            _ => Err(Error::Message("unknown acse-service-user diagnostic")),
+        }
+    }
+}
+
+/// `acse-service-provider [2] INTEGER` — one alternative of `Associate-source-diagnostic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AcseServiceProvider {
+    /// null (0).
+    Null = 0,
+    /// no-reason-given (1).
+    NoReasonGiven = 1,
+    /// no-common-acse-version (2).
+    NoCommonAcseVersion = 2,
+}
+
+impl AcseServiceProvider {
+    fn from_i64(v: i64) -> Result<Self> {
+        match v {
+            0 => Ok(AcseServiceProvider::Null),
+            1 => Ok(AcseServiceProvider::NoReasonGiven),
+            2 => Ok(AcseServiceProvider::NoCommonAcseVersion),
+            _ => Err(Error::Message("unknown acse-service-provider diagnostic")),
+        }
+    }
+}
+
+/// `Associate-source-diagnostic ::= CHOICE { acse-service-user [1], acse-service-provider [2] }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociateSourceDiagnostic {
+    ServiceUser(AcseServiceUser),
+    ServiceProvider(AcseServiceProvider),
+}
+
+impl AssociateSourceDiagnostic {
+    /// Encode as `result-source-diagnostic [3] EXPLICIT` CHOICE.
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        with_content(buf, &ctx(3, true), |b| match self {
+            AssociateSourceDiagnostic::ServiceUser(v) => put_explicit_u8(b, 1, *v as u8),
+            AssociateSourceDiagnostic::ServiceProvider(v) => put_explicit_u8(b, 2, *v as u8)
+        })
+    }
+
+    /// Decode the `result-source-diagnostic [3]` field content.
+    pub fn get(content: &[u8]) -> Result<Self> {
+        let (alt, inner) = unwrap_explicit(content)?;
+        let (_int, int_content) = unwrap_explicit(inner)?;
+        let value = decode_signed(int_content)?;
+        match alt.number {
+            1 => Ok(AssociateSourceDiagnostic::ServiceUser(
+                AcseServiceUser::from_i64(value)?,
+            )),
+            2 => Ok(AssociateSourceDiagnostic::ServiceProvider(
+                AcseServiceProvider::from_i64(value)?,
+            )),
+            _ => Err(Error::Message("unknown Associate-source-diagnostic alternative")),
+        }
+    }
+}
+
 
 /// AARQ-apdu ::= [APPLICATION 0] IMPLICIT SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,7 +569,7 @@ impl<'a> AARQapdu<'a> {
                 1 => {
                     let (_itag, ocontent) = unwrap_explicit(fcontent)?;
                     application_context_name =
-                        Some(ApplicationContextName::from_content(ocontent)?);
+                        Some(ApplicationContextName::get(ocontent)?);
                 }
                 2 => {
                     let (_itag, ocontent) = unwrap_explicit(fcontent)?;
@@ -494,9 +617,9 @@ pub struct AAREapdu<'a> {
     pub protocol_version: Option<&'a [u8]>,
     pub application_context_name: ApplicationContextName,
     /// `result [2] Association-result` (INTEGER).
-    pub result: i64,
-    /// `result-source-diagnostic [3] Associate-source-diagnostic` (INTEGER).
-    pub result_source_diagnostic: i64,
+    pub result: AssociationResult,
+    /// `result-source-diagnostic [3] Associate-source-diagnostic` (CHOICE).
+    pub result_source_diagnostic: AssociateSourceDiagnostic,
     /// `responding-AP-title [4]` (OCTET STRING).
     pub responding_ap_title: Option<&'a [u8]>,
     /// `responding-AE-qualifier [5]` (OCTET STRING).
@@ -524,16 +647,9 @@ impl<'a> AAREapdu<'a> {
                 written += put_implicit_bit_string(b, 0, pv)?;
             }
             written += put_explicit_oid(b, 1, &self.application_context_name)?;
-            written += put_explicit_integer(b, 2, self.result)?;
-            // result-source-diagnostic [3] EXPLICIT Associate-source-diagnostic,
-            // acse-service-user [1] EXPLICIT INTEGER.
-            written += with_content(b, &ctx(3, true), |ob| {
-                with_content(ob, &ctx(1, true), |ib| {
-                    with_content(ib, &Tag::universal(UniversalTag::Integer), |jb| {
-                        put_signed(jb, self.result_source_diagnostic)
-                    })
-                })
-            })?;
+            written += self.result.put(b)?;
+            // result-source-diagnostic [3] EXPLICIT Associate-source-diagnostic.
+            written += self.result_source_diagnostic.put(b)?;
             if let Some(v) = &self.responding_ap_title {
                 written += put_explicit_octet_string(b, 4, v)?;
             }
@@ -573,8 +689,9 @@ impl<'a> AAREapdu<'a> {
         let mut inner = Reader::new(content);
         let mut protocol_version = None;
         let mut application_context_name = None;
-        let mut result = 0;
-        let mut result_source_diagnostic = 0;
+        let mut result = AssociationResult::Accepted;
+        let mut result_source_diagnostic =
+            AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null);
         let mut responding_ap_title = None;
         let mut responding_ae_qualifier = None;
         let mut responding_ap_invocation_id = None;
@@ -591,16 +708,13 @@ impl<'a> AAREapdu<'a> {
                 1 => {
                     let (_itag, ocontent) = unwrap_explicit(fcontent)?;
                     application_context_name =
-                        Some(ApplicationContextName::from_content(ocontent)?);
+                        Some(ApplicationContextName::get(ocontent)?);
                 }
                 2 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    result = decode_signed(ocontent)?;
+                    result = AssociationResult::get(fcontent)?;
                 }
                 3 => {
-                    let (_a3, inner1) = unwrap_explicit(fcontent)?;
-                    let (_a1, ocontent) = unwrap_explicit(inner1)?;
-                    result_source_diagnostic = decode_signed(ocontent)?;
+                    result_source_diagnostic = AssociateSourceDiagnostic::get(fcontent)?;
                 }
                 4 => {
                     let (_itag, ocontent) = unwrap_explicit(fcontent)?;
@@ -821,8 +935,8 @@ mod tests {
         let aare = AAREapdu {
             protocol_version: None,
             application_context_name: ApplicationContextName::LogicalNameNoCiphering,
-            result: 0,
-            result_source_diagnostic: 1,
+            result: AssociationResult::Accepted,
+            result_source_diagnostic: AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::NoReasonGiven),
             responding_ap_title: None,
             responding_ae_qualifier: None,
             responding_ap_invocation_id: None,
@@ -858,8 +972,8 @@ mod tests {
         assert_eq!(ctx.to_arcs(), [2u64, 16, 756, 5, 8, 1, 1]);
         assert_eq!(ApplicationContextName::from_arcs(&ctx.to_arcs()).unwrap(), ctx);
 
-        let unknown = ApplicationContextName::from_arcs(&[2u64, 16, 756, 5, 8, 1, 99]).unwrap();
-        assert_eq!(unknown, ApplicationContextName::Unknown(99));
+        // Unknown trailing arc rejected.
+        assert!(ApplicationContextName::from_arcs(&[2u64, 16, 756, 5, 8, 1, 99]).is_err());
 
         // Trailing arc must fit in a single base-128 octet (<= 127).
         assert!(ApplicationContextName::from_arcs(&[2u64, 16, 756, 5, 8, 1, 128]).is_err());
@@ -879,38 +993,31 @@ mod tests {
     }
 
     #[test]
-    fn acse_unknown_roundtrip() {
-        let mut aarq = AARQapdu::new(ApplicationContextName::Unknown(99));
-        aarq.mechanism_name = Some(MechanismName::Unknown(100));
-        roundtrip!(aarq, AARQapdu::get);
-    }
-
-    #[test]
     fn acse_oid_content_bytes() {
         // { 2 16 756 5 8 1 1 } encodes as 60 85 74 05 08 01 01.
         let mut backing = [0u8; 16];
         let n = {
             let mut buf = ByteBuffer::new(&mut backing);
             ApplicationContextName::LogicalNameNoCiphering
-                .put_content(&mut buf)
+                .put(&mut buf)
                 .unwrap()
         };
         assert_eq!(n, 7);
         assert_eq!(&backing[..7], &[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01]);
 
         let decoded =
-            ApplicationContextName::from_content(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01])
+            ApplicationContextName::get(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01])
                 .unwrap();
         assert_eq!(decoded, ApplicationContextName::LogicalNameNoCiphering);
 
         // Trailing arc > 127 rejected.
         assert!(
-            ApplicationContextName::from_content(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x80])
+            ApplicationContextName::get(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x80])
                 .is_err()
         );
         // Wrong discriminator rejected.
         assert!(
-            ApplicationContextName::from_content(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x02, 0x01])
+            ApplicationContextName::get(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x02, 0x01])
                 .is_err()
         );
     }
@@ -985,8 +1092,8 @@ mod tests {
 
     fn make_aare<'a>(
         context: ApplicationContextName,
-        result: i64,
-        result_source_diagnostic: i64,
+        result: AssociationResult,
+        result_source_diagnostic: AssociateSourceDiagnostic,
         mechanism: Option<MechanismName>,
         auth: Option<&'a [u8]>,
         user_info: Option<&'a [u8]>,
@@ -1147,8 +1254,8 @@ mod tests {
         let aare = AAREapdu {
             protocol_version: None,
             application_context_name: ApplicationContextName::LogicalNameNoCiphering,
-            result: 0,
-            result_source_diagnostic: 0,
+            result: AssociationResult::Accepted,
+            result_source_diagnostic: AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null),
             responding_ap_title: None,
             responding_ae_qualifier: None,
             responding_ap_invocation_id: None,
@@ -1175,14 +1282,46 @@ mod tests {
     }
 
     #[test]
+    fn associate_source_diagnostic_service_provider() {
+        // result-source-diagnostic CHOICE with the acse-service-provider [2]
+        // alternative: no-common-acse-version (2).
+        let diag =
+            AssociateSourceDiagnostic::ServiceProvider(AcseServiceProvider::NoCommonAcseVersion);
+        let mut backing = [0u8; 32];
+        let n = {
+            let mut buf = ByteBuffer::new(&mut backing);
+            diag.put(&mut buf).unwrap()
+        };
+        assert_eq!(&backing[..n], &[0xA3, 0x05, 0xA2, 0x03, 0x02, 0x01, 0x02]);
+
+        let decoded = AssociateSourceDiagnostic::get(&backing[2..n]).unwrap();
+        assert_eq!(decoded, diag);
+    }
+
+    #[test]
+    fn associate_source_diagnostic_unknown() {
+        // Unknown acse-service-user value rejected.
+        let bytes = [0xA1, 0x03, 0x02, 0x01, 0x0F]; // acse-service-user [1] 15
+        assert!(AssociateSourceDiagnostic::get(&bytes).is_err());
+
+        // Unknown acse-service-provider value rejected.
+        let bytes = [0xA2, 0x03, 0x02, 0x01, 0x03]; // acse-service-provider [2] 3
+        assert!(AssociateSourceDiagnostic::get(&bytes).is_err());
+
+        // Unknown CHOICE alternative tag rejected.
+        let bytes = [0xA5, 0x03, 0x02, 0x01, 0x00]; // [5] EXPLICIT INTEGER
+        assert!(AssociateSourceDiagnostic::get(&bytes).is_err());
+    }
+
+    #[test]
     fn aare_table120() {
         let hls = MechanismName::HighLevelSecurityGmac; // { ... 2 5 }
 
         let cases: &[(
             &[u8],
             ApplicationContextName,
-            i64,
-            i64,
+            AssociationResult,
+            AssociateSourceDiagnostic,
             Option<MechanismName>,
             Option<&[u8]>,
             Option<&[u8]>,
@@ -1196,8 +1335,8 @@ mod tests {
                     0x01, 0xF4, 0x00, 0x07,
                 ],
                 ApplicationContextName::LogicalNameNoCiphering,
-                0,
-                0,
+                AssociationResult::Accepted,
+                AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null),
                 None,
                 None,
                 Some(LN_INITIATE_RESPONSE),
@@ -1211,8 +1350,8 @@ mod tests {
                     0x01, 0xF4, 0x00, 0x07,
                 ],
                 ApplicationContextName::LogicalNameNoCiphering,
-                1,
-                2,
+                AssociationResult::RejectedPermanent,
+                AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::ApplicationContextNameNotSupported),
                 None,
                 None,
                 Some(LN_INITIATE_RESPONSE),
@@ -1225,8 +1364,8 @@ mod tests {
                     0x06, 0x04, 0x04, 0x0E, 0x01, 0x06, 0x01,
                 ],
                 ApplicationContextName::LogicalNameNoCiphering,
-                1,
-                1,
+                AssociationResult::RejectedPermanent,
+                AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::NoReasonGiven),
                 None,
                 None,
                 Some(CONFIRMED_SERVICE_ERROR),
@@ -1242,8 +1381,8 @@ mod tests {
                     0xF4, 0x00, 0x07,
                 ],
                 ApplicationContextName::LogicalNameNoCiphering,
-                0,
-                14,
+                AssociationResult::Accepted,
+                AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::AuthenticationRequired),
                 Some(hls),
                 Some(HLS_CHALLENGE_RESPONSE),
                 Some(LN_INITIATE_RESPONSE),
@@ -1257,8 +1396,8 @@ mod tests {
                     0x01, 0xF4, 0xFA, 0x00,
                 ],
                 ApplicationContextName::ShortNameNoCiphering,
-                0,
-                0,
+                AssociationResult::Accepted,
+                AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null),
                 None,
                 None,
                 Some(SN_INITIATE_RESPONSE),
@@ -1273,8 +1412,8 @@ mod tests {
                     0x04, 0x0E, 0x08, 0x00, 0x06, 0x5F, 0x1F, 0x04, 0x00, 0x1C, 0x03, 0x20, 0x01, 0xF4, 0xFA, 0x00,
                 ],
                 ApplicationContextName::ShortNameNoCiphering,
-                0,
-                14,
+                AssociationResult::Accepted,
+                AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::AuthenticationRequired),
                 Some(hls),
                 Some(HLS_CHALLENGE_RESPONSE),
                 Some(SN_INITIATE_RESPONSE),

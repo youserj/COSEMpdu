@@ -16,23 +16,12 @@ pub enum Error {
     // ---------------------------------------------------------------------
     // Buffer / input size
     // ---------------------------------------------------------------------
-    /// Cursor moved past the end of the buffer.
-    PositionOutOfRange { index: usize },
-
-    /// Cursor shift moved outside the buffer bounds.
-    ShiftOutOfRange { shift: isize },
-
-    /// Not enough bytes remaining to satisfy a read or write.
-    NotEnoughSpace { needed: usize },
-
-    /// Input larger than the fixed-size decode buffer.
-    InputTooLarge { len: usize, max: usize },
-
+    ByteBufferError(bytebuffer::Error),
     // ---------------------------------------------------------------------
     // Tag / class mismatches
     // ---------------------------------------------------------------------
     /// Decoded tag number does not match the expected one.
-    TagNumber { expected: u64, actual: u64 },
+    TagNumber { expected: u8, actual: u8 },
 
     /// Decoded tag class does not match the expected one.
     TagClass { expected: Class, actual: Class },
@@ -130,18 +119,7 @@ impl Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::PositionOutOfRange { index } => {
-                write!(f, "buffer position {index} out of range")
-            }
-            Error::ShiftOutOfRange { shift } => {
-                write!(f, "buffer shift {shift} out of range")
-            }
-            Error::NotEnoughSpace { needed } => {
-                write!(f, "not enough space: {needed} bytes needed")
-            }
-            Error::InputTooLarge { len, max } => {
-                write!(f, "input too large: {len} bytes (maximum {max})")
-            }
+            Error::ByteBufferError(e) => write!(f, "{}", e),            
             Error::TagNumber { expected, actual } => {
                 write!(f, "tag mismatch: expected number {expected}, got {actual}")
             }
@@ -203,19 +181,6 @@ impl std::error::Error for Error {}
 
 impl From<bytebuffer::Error> for Error {
     fn from(err: bytebuffer::Error) -> Self {
-        match err {
-            bytebuffer::Error::PositionOutOfRange { index } => {
-                Error::PositionOutOfRange { index }
-            }
-            bytebuffer::Error::ShiftOutOfRange { shift } => {
-                Error::ShiftOutOfRange { shift }
-            }
-            bytebuffer::Error::NotEnoughSpace { needed } => {
-                Error::NotEnoughSpace { needed }
-            }
-            bytebuffer::Error::InputTooLarge { len, max } => {
-                Error::InputTooLarge { len, max }
-            }
-        }
+        Error::ByteBufferError(err)
     }
 }

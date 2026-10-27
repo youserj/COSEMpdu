@@ -14,7 +14,9 @@ extern crate std;
 
 use core::fmt;
 
-use cosempdu::apdu::{GetDataResultWrite, GetRequest, GetResponse};
+use cosempdu::apdu::{CosemAttributeDescriptor, GetDataResultWrite, GetResponse, InvokeIdAndPriority};
+#[cfg(any(feature = "tcp", feature = "ble"))]
+use cosempdu::apdu::GetRequest;
 use cosempdu::apdu_sn::Conformance;
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::{Codec, Data};
@@ -23,7 +25,7 @@ use dlms1::ic::{AttributeKey, ClassId, InterfaceClass};
 use dlms1::obis::ObisCode;
 
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::acse::{AAREapdu, ACSEApdu};
+use cosempdu::acse::{AAREapdu, ACSEApdu, AcseServiceUser, ApplicationContextName, AssociateSourceDiagnostic, AssociationResult};
 #[cfg(any(feature = "tcp", feature = "ble"))]
 use cosempdu::apdu_sn::{InitiateRequest, InitiateResponse, ObjectName};
 #[cfg(any(feature = "tcp", feature = "ble"))]
@@ -351,6 +353,30 @@ impl<'a, const N: usize> Server<'a, N> {
         Ok(())
     }
 
+    /// Обработать `Get-Request` (только `Normal` без `access_selection`) и
+    /// записать `Get-Response` в `buf`.
+    ///
+    /// `invoke` + `descriptor` — уже декодированные owned-поля (`Copy`), чтобы
+    /// вызывающий код не держал borrow на буфер приёма. Возвращает число
+    /// записанных байт.
+    // TODO: поддержка `Next` / `WithList` и `access_selection`.
+    // TODO: маппинг `Error` → `GetDataResultWrite::DataAccessError(...)` (пока — `Err`).
+    // TODO: уровень доступа — из ассоциации, а не жёсткий `AccessMask::PUBLIC`.
+    pub fn handle_get(
+        &self,
+        invoke: InvokeIdAndPriority,
+        descriptor: CosemAttributeDescriptor,
+        buf: &mut ByteBuffer<'_>,
+    ) -> Result<usize, Error> {
+        let class_id = ClassId::from_u16(descriptor.class_id).ok_or(Error::NotFound)?;
+        let obis = ObisCode::from_bytes(descriptor.instance_id);
+        let key = AttributeKey::new(obis, descriptor.attribute_id as u8);
+        let codec = self.get_codec(class_id, key, AccessMask::PUBLIC)?;
+        let start = buf.pos();
+        GetResponse::put_normal(invoke, GetDataResultWrite::Data(codec), buf)?;
+        Ok(buf.pos() - start)
+    }
+
     /// SET (внешний) поточно: начать приём сегментированного значения, которое
     /// декодируется прямо в атрибут. Возвращает дескриптор для подачи блоков.
     pub fn stream_set<'s>(
@@ -517,23 +543,24 @@ impl<'a, const N: usize> Server<'a, N> {
             }
         };
 
-        // 1. Извлечь AARQ (payload после 8-байтного заголовка) и собрать AARE.
-        let (aare_apdu, aare_len) = {
+        // 1. Декодировать AARQ (payload после 8-байтного заголовка) из session.rx.
+        let (negotiated, ctx) = {
             let apdu = &session.rx()
                 [TRANSPORT_OVERHEAD..TRANSPORT_OVERHEAD + received.apdu_len() as usize];
-            aarq_to_aare(apdu, conf)?
+            decode_aarq(apdu, conf)?
         };
 
-        // 2. Обернуть AARE в WPDU и записать в session.tx.
+        // 2. Закодировать AARE WPDU прямо в session.tx.
         let n = {
             let mut tx = session.tx_buffer();
-            setting.put(&aare_apdu[..aare_len], &mut tx).map_err(Error::Codec)?
+            encode_aare(negotiated, ctx, &setting, &mut tx)?
         };
         session.set_tx_len(n);
         Ok(())
     }
 
-    /// Обслужить одно соединение: read → associate → write (embedded/один клиент).
+    /// Обслужить одно соединение: on_connect → ассоциация → цикл
+    /// Get-запросов → on_disconnect.
     #[cfg(any(feature = "tcp", feature = "ble"))]
     pub async fn serve<C: Channel<Frame = WrapperSetting>>(
         &mut self,
@@ -541,15 +568,115 @@ impl<'a, const N: usize> Server<'a, N> {
         mut channel: C,
     ) -> Result<(), Error> {
         let idx = self.on_connect(media)?;
-        let result = self.serve_loop(idx, &mut channel).await;
+
+        // Разовая ассоциация (AARQ → AARE).
+        if let Err(e) = self.associate(idx, &mut channel).await {
+            self.on_disconnect(idx);
+            return Err(e);
+        }
+
+        // Цикл обслуживания xDLMS-запросов; выходим по таймауту/закрытию/ошибке.
+        let result = loop {
+            if let Err(e) = self.handle_request(idx, &mut channel).await {
+                break Err(e);
+            }
+        };
+
         // Всегда освобождаем сессию (сброс в Idle): и при успехе, и при таймауте/ошибке.
         self.on_disconnect(idx);
         result
     }
 
-    /// Обработать один кадр соединения: read → validate → accept → write.
+    /// Обработать один уже прочитанный WPDU (Get-Request) и сформировать ответный
+    /// WPDU в `response`. Сетевого I/O не делает: `request` — байты запроса
+    /// (заголовок + APDU), `received` — метаданные кадра из `Channel::read`.
+    /// Возвращает число записанных в `response` байт.
     #[cfg(any(feature = "tcp", feature = "ble"))]
-    pub async fn handle_frame<C: Channel<Frame = WrapperSetting>>(
+    pub fn process_request(
+        &mut self,
+        idx: usize,
+        received: WrapperSetting,
+        request: &[u8],
+        response: &mut ByteBuffer<'_>,
+    ) -> Result<usize, Error> {
+        // 1) Валидация Wrapper (обновляет порты в session).
+        self.validate_wrapper(idx, received)?;
+
+        // 2) Декодируем Get-Request в owned-поля (borrow на request гаснет здесь).
+        let (invoke, descriptor) = {
+            let mut r = Reader::new(
+                &request[TRANSPORT_OVERHEAD..TRANSPORT_OVERHEAD + received.apdu_len() as usize],
+            );
+            match GetRequest::get(&mut r).map_err(Error::Codec)? {
+                GetRequest::Normal {
+                    invoke,
+                    descriptor,
+                    access_selection: None,
+                } => (invoke, descriptor),
+                _ => return Err(Error::NotFound),
+            }
+        };
+
+        // 3) Серверный взгляд на порты (Copy) для WPDU-заголовка.
+        let srv = match self.session(idx).ok_or(Error::InvalidSession)?.transport_ref() {
+            TransportRef::Wrapper(s) => s,
+            #[cfg(feature = "optical")]
+            TransportRef::Hdlc(_) => {
+                return Err(Error::Codec(cosempdu::Error::Message(
+                    "request handling requires Wrapper channel (tcp/ble)",
+                )))
+            }
+        };
+
+        // 4) WPDU-заголовок с длиной-заглушкой.
+        let start = response.pos();
+        response.put_u16(WRAPPER_VERSION).map_err(|e| Error::Codec(e.into()))?;
+        response.put_u16(srv.source_port()).map_err(|e| Error::Codec(e.into()))?;
+        response.put_u16(srv.destination_port()).map_err(|e| Error::Codec(e.into()))?;
+        let len_pos = response.pos();
+        response.put_u16(0).map_err(|e| Error::Codec(e.into()))?;
+
+        // 5) Get-Response APDU прямо в response.
+        let apdu_n = self.handle_get(invoke, descriptor, response)?;
+
+        // 6) Дописать длину APDU в заголовок.
+        response
+            .write_at(&(apdu_n as u16).to_be_bytes(), len_pos)
+            .map_err(|e| Error::Codec(e.into()))?;
+
+        Ok(response.pos() - start)
+    }
+
+    /// Обслужить один xDLMS-запрос после ассоциации: прочитать WPDU в локальный
+    /// буфер, обработать ([`Server::process_request`]) и отправить ответ. Ошибка —
+    /// сигнал завершить цикл (таймаут чтения, закрытие соединения, неверный кадр).
+    #[cfg(any(feature = "tcp", feature = "ble"))]
+    async fn handle_request<C: Channel<Frame = WrapperSetting>>(
+        &mut self,
+        idx: usize,
+        channel: &mut C,
+    ) -> Result<(), Error> {
+        // 1) Читаем WPDU в локальный буфер.
+        let mut request = [0u8; RX_BUF];
+        let received = channel.read(&mut request).await.map_err(Error::Codec)?;
+        let request_len = TRANSPORT_OVERHEAD + received.apdu_len() as usize;
+
+        // 2) Обрабатываем (validate + decode + encode) в локальный буфер ответа.
+        let mut response = [0u8; RX_BUF];
+        let n = {
+            let mut b = ByteBuffer::new(&mut response);
+            self.process_request(idx, received, &request[..request_len], &mut b)?
+        };
+
+        // 3) Отправляем ответ.
+        channel.write(&response[..n]).await.map_err(Error::Codec)?;
+        Ok(())
+    }
+
+    /// Выполнить ассоциацию (AARQ → AARE): прочитать WPDU, валидировать заголовок,
+    /// принять AARQ и отправить AARE. Разовый обмен — вне цикла.
+    #[cfg(any(feature = "tcp", feature = "ble"))]
+    pub async fn associate<C: Channel<Frame = WrapperSetting>>(
         &mut self,
         idx: usize,
         channel: &mut C,
@@ -571,17 +698,6 @@ impl<'a, const N: usize> Server<'a, N> {
             session.clear_rx();
         }
         Ok(())
-    }
-
-    #[cfg(any(feature = "tcp", feature = "ble"))]
-    async fn serve_loop<C: Channel<Frame = WrapperSetting>>(
-        &mut self,
-        idx: usize,
-        channel: &mut C,
-    ) -> Result<(), Error> {
-        loop {
-            self.handle_frame(idx, channel).await?;
-        }
     }
 
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
@@ -607,9 +723,12 @@ impl<'a> Server<'a, 3> {
     }
 }
 
-/// AARQ APDU → AARE APDU (байты). Транспортно-независимо.
+/// AARQ APDU → согласованный conformance и application-context-name.
 #[cfg(any(feature = "tcp", feature = "ble"))]
-fn aarq_to_aare(apdu: &[u8], server_conf: Conformance) -> Result<([u8; 256], usize), Error> {
+fn decode_aarq(
+    apdu: &[u8],
+    server_conf: Conformance,
+) -> Result<(Conformance, ApplicationContextName), Error> {
     let acse = ACSEApdu::get(&mut Reader::new(apdu)).map_err(Error::Codec)?;
     let aarq = match acse {
         ACSEApdu::Aarq(a) => a,
@@ -623,7 +742,17 @@ fn aarq_to_aare(apdu: &[u8], server_conf: Conformance) -> Result<([u8; 256], usi
     // Согласование: пересечение возможностей клиента и сервера.
     let (c, s) = (req.proposed_conformance.0, server_conf.0);
     let negotiated = Conformance([c[0] & s[0], c[1] & s[1], c[2] & s[2]]);
+    Ok((negotiated, aarq.application_context_name))
+}
 
+/// AARE WPDU (заголовок + APDU) прямо в `out`. Транспортно-независимо.
+#[cfg(any(feature = "tcp", feature = "ble"))]
+fn encode_aare(
+    negotiated: Conformance,
+    ctx: ApplicationContextName,
+    setting: &WrapperSetting,
+    out: &mut ByteBuffer<'_>,
+) -> Result<usize, Error> {
     let resp = InitiateResponse {
         negotiated_quality_of_service: None,
         negotiated_dlms_version_number: 6,
@@ -636,9 +765,9 @@ fn aarq_to_aare(apdu: &[u8], server_conf: Conformance) -> Result<([u8; 256], usi
 
     let aare = AAREapdu {
         protocol_version: None,
-        application_context_name: aarq.application_context_name,
-        result: 0,
-        result_source_diagnostic: 0,
+        application_context_name: ctx,
+        result: AssociationResult::Accepted,
+        result_source_diagnostic: AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null),
         responding_ap_title: None,
         responding_ae_qualifier: None,
         responding_ap_invocation_id: None,
@@ -649,37 +778,25 @@ fn aarq_to_aare(apdu: &[u8], server_conf: Conformance) -> Result<([u8; 256], usi
         implementation_information: None,
         user_information: Some(&ir[..n]),
     };
-    let mut out = [0u8; 256];
-    let m = aare.put(&mut ByteBuffer::new(&mut out)).map_err(Error::Codec)?;
-    Ok((out, m))
+
+    // WPDU-заголовок с длиной-заглушкой.
+    let start = out.pos();
+    out.put_u16(WRAPPER_VERSION).map_err(|e| Error::Codec(e.into()))?;
+    out.put_u16(setting.source_port()).map_err(|e| Error::Codec(e.into()))?;
+    out.put_u16(setting.destination_port()).map_err(|e| Error::Codec(e.into()))?;
+    let len_pos = out.pos();
+    out.put_u16(0).map_err(|e| Error::Codec(e.into()))?;
+
+    // AARE APDU прямо в out.
+    let aare_len = aare.put(out).map_err(Error::Codec)?;
+
+    // Дописать длину APDU в заголовок.
+    out.write_at(&(aare_len as u16).to_be_bytes(), len_pos)
+        .map_err(|e| Error::Codec(e.into()))?;
+
+    Ok(out.pos() - start)
 }
 
-/// Обработка `Get-Request` → `Get-Response` (мост APDU → Server).
-///
-/// Только `GetRequest::Normal` без `access_selection`.
-// TODO: поддержка `Next` / `WithList` и `access_selection`.
-// TODO: маппинг `Error` → `GetDataResultWrite::DataAccessError(...)` (пока — `Err`).
-pub fn handle_get<'a, const N: usize>(
-    server: &Server<'a, N>,
-    req: &GetRequest<'_>,
-    buf: &mut ByteBuffer<'_>,
-) -> Result<(), Error> {
-    match req {
-        GetRequest::Normal {
-            invoke,
-            descriptor,
-            access_selection: None,
-        } => {
-            let class_id = ClassId::from_u16(descriptor.class_id).ok_or(Error::NotFound)?;
-            let obis = ObisCode::from_bytes(descriptor.instance_id);
-            let key = AttributeKey::new(obis, descriptor.attribute_id as u8);
-            let codec = server.get_codec(class_id, key, AccessMask::PUBLIC)?;
-            GetResponse::put_normal(*invoke, GetDataResultWrite::Data(codec), buf)?;
-            Ok(())
-        }
-        _ => Err(Error::NotFound),
-    }
-}
 
 /// Дескриптор потокового SET: держит декодер поверх приёмника атрибута, пока
 /// принимаются блоки значения.
@@ -732,44 +849,26 @@ mod tests {
         let reg = DoubleLongUnsigned(42);
         server.add_static(REG_OBJ.attr_key(2).unwrap(), &reg, reg_access()).unwrap();
 
-        // 2) закодировать GetRequest::Normal в "буфер приёма"
-        let mut rx = [0u8; 128];
-        let rx_n = {
-            let mut b = ByteBuffer::new(&mut rx);
-            GetRequest::put_normal(
-                InvokeIdAndPriority::from_bits(1, true, false),
-                CosemAttributeDescriptor {
-                    class_id: ClassId::Register.as_u16(),
-                    instance_id: REG_OBJ.obis().bytes,
-                    attribute_id: 2,
-                },
-                None,
-                &mut b,
-            )
-            .unwrap()
+        // 2) обработать GetRequest::Normal напрямую (owned invoke + descriptor)
+        let invoke = InvokeIdAndPriority::from_bits(1, true, false);
+        let descriptor = CosemAttributeDescriptor {
+            class_id: ClassId::Register.as_u16(),
+            instance_id: REG_OBJ.obis().bytes,
+            attribute_id: 2,
         };
-
-        // 3) декодировать запрос
-        let req = {
-            let mut r = Reader::new(&rx[..rx_n]);
-            GetRequest::get(&mut r).unwrap()
-        };
-
-        // 4) обработать и записать GetResponse в "буфер передачи"
         let mut tx = [0u8; 128];
         let tx_n = {
             let mut b = ByteBuffer::new(&mut tx);
-            handle_get(&server, &req, &mut b).unwrap();
-            b.pos()
+            server.handle_get(invoke, descriptor, &mut b).unwrap()
         };
 
-        // 5) декодировать ответ
+        // 3) декодировать ответ
         let resp = {
             let mut r = Reader::new(&tx[..tx_n]);
             GetResponse::get(&mut r).unwrap()
         };
 
-        // 6) сверить
+        // 4) сверить
         match resp {
             GetResponse::Normal { invoke, result: GetDataResult::Data(r) } => {
                 assert_eq!(invoke.invoke_id(), 1);

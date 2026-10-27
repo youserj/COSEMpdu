@@ -1,18 +1,20 @@
 //! Desktop DLMS/COSEM сервер поверх TCP (COSEM Wrapper + ACSE + xDLMS).
 //!
 //! Принимает TCP-соединения (по умолчанию `127.0.0.1:4059`), конкурентно
-//! обслуживает каждое через `tokio::spawn`, и выполняет ассоциацию:
-//! приём `AARQ` → согласование conformance → отправка `AARE`.
+//! обслуживает каждое через `tokio::spawn`: ассоциация (`AARQ` → `AARE`),
+//! затем цикл обработки xDLMS-запросов (GET) до закрытия/таймаута.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use cosempdu::apdu_sn::Conformance;
-use cosempdu::buffer::Reader;
+use cosempdu::buffer::{ByteBuffer, Reader};
 use cosempdu::error::Error as CosemError;
-use dlms1::ic::InterfaceClass;
-use server::{Channel, Listener, Media, Server, Wrapper, WrapperSetting};
+use dlms1::common_data_types::{DoubleLongUnsigned, Unsigned};
+use dlms1::ic::{Clock, InterfaceClass, Register, DataObject};
+use dlms1::obis::ObisCode;
+use server::{Access, AccessMask, Channel, Listener, Media, Server, Wrapper, WrapperSetting, RX_BUF};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -26,8 +28,15 @@ const MAX_SESSIONS: usize = 3;
 /// Предлагаемый сервером conformance (LN, без шифрования; базовый набор GET/SET/ACTION).
 const SERVER_CONFORMANCE: Conformance = Conformance([0x00, 0x7E, 0x1F]);
 
-/// Пустой каталог объектов: для демо хендшейка реестр атрибутов не нужен.
-static OBJECTS: &[&dyn InterfaceClass] = &[];
+/// Каталог COSEM-объектов, доступных серверу (Register + Clock).
+static DATA_OBJ: DataObject = DataObject::new(ObisCode::new(0, 0, 96, 1, 0, 255));
+static REG_OBJ: Register = Register::new(ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL);
+static CLOCK_OBJ: Clock = Clock::new(ObisCode::CLOCK);
+static OBJECTS: &[&dyn InterfaceClass] = &[&DATA_OBJ, &REG_OBJ, &CLOCK_OBJ];
+
+/// Значение атрибута `value` регистра (read-only, 100).
+static DATA_VALUE: Unsigned = Unsigned(1);
+static REG_VALUE: DoubleLongUnsigned = DoubleLongUnsigned(100);
 
 /// TCP-канал поверх tokio: читает/пишет полный WPDU (Wrapper-фрейминг).
 ///
@@ -112,6 +121,16 @@ async fn main() -> Result<()> {
     let mut server: Server<'static, MAX_SESSIONS> =
         Server::<'static, MAX_SESSIONS>::with_capacity(OBJECTS, SERVER_CONFORMANCE);
     server.set_wport(1);
+    server.add_static(
+        REG_OBJ.value(),
+        &REG_VALUE,
+        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+    )?;
+    server.add_static(
+        DATA_OBJ.value(),
+        &DATA_VALUE,
+        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+    )?;
     let server = Arc::new(Mutex::new(server));
 
     let mut listener = TcpListener {
@@ -130,37 +149,75 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Обслуживание одного соединения: read → associate → write, до закрытия/таймаута.
+/// Обслуживание одного соединения: ассоциация → цикл GET-запросов, до закрытия/таймаута.
 async fn handle_connection(
     server: Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
     mut channel: TcpChannel,
 ) -> Result<()> {
     let idx = server.lock().await.on_connect(Media::Tcp)?;
-    let result = run_session(&server, idx, &mut channel).await;
+
+    // Ассоциация (разовый обмен AARQ → AARE).
+    if let Err(e) = associate_session(&server, idx, &mut channel).await {
+        server.lock().await.on_disconnect(idx);
+        return Err(e);
+    }
+
+    // Цикл обслуживания xDLMS-запросов; выходим по таймауту/закрытию/ошибке.
+    let result = loop {
+        match request_session(&server, idx, &mut channel).await {
+            Ok(()) => {}
+            Err(e) => break Err(e),
+        }
+    };
+
     // Всегда освобождаем сессию (сброс в Idle): и при успехе, и при таймауте/ошибке.
     server.lock().await.on_disconnect(idx);
     result
 }
 
-/// Цикл обслуживания сессии: по кадру (read → validate → accept → write),
-/// с блокировкой сервера на каждый кадр.
-async fn run_session(
+/// Ассоциация (AARQ → AARE) на выделенной сессии, с блокировкой сервера.
+async fn associate_session(
     server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
     idx: usize,
     channel: &mut TcpChannel,
 ) -> Result<()> {
-    loop {
+    let mut srv = server.lock().await;
+    srv.associate(idx, channel)
+        .await
+        .map_err(|e| anyhow!("associate: {e:?}"))
+}
+
+/// Обработка одного xDLMS-запроса (GET): read без мьютекса → process под
+/// мьютексом (без сетевого I/O) → write без мьютекса.
+async fn request_session(
+    server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
+    idx: usize,
+    channel: &mut TcpChannel,
+) -> Result<()> {
+    // 1) Читаем WPDU, не удерживая мьютекс (блокирующее ожидание).
+    let mut request = [0u8; RX_BUF];
+    let received = channel.read(&mut request).await.map_err(|e| anyhow!("read: {e:?}"))?;
+    let request_len = 8 + received.apdu_len() as usize;
+
+    // 2) Обрабатываем под мьютексом (короткая фаза, без сетевого I/O).
+    let mut response = [0u8; RX_BUF];
+    let n = {
         let mut srv = server.lock().await;
-        srv.handle_frame(idx, channel)
-            .await
-            .map_err(|e| anyhow!("frame: {e:?}"))?;
-    }
+        let mut b = ByteBuffer::new(&mut response);
+        srv.process_request(idx, received, &request[..request_len], &mut b)
+            .map_err(|e| anyhow!("request: {e:?}"))?
+    };
+
+    // 3) Отправляем ответ, не удерживая мьютекс.
+    channel.write(&response[..n]).await.map_err(|e| anyhow!("write: {e:?}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosempdu::acse::{AARQapdu, ACSEApdu, ApplicationContextName};
+    use cosempdu::acse::{AARQapdu, ACSEApdu, ApplicationContextName, AssociationResult};
+    use cosempdu::apdu::{CosemAttributeDescriptor, GetDataResult, GetRequest, GetResponse, InvokeIdAndPriority};
     use cosempdu::apdu_sn::InitiateRequest;
     use cosempdu::buffer::ByteBuffer;
 
@@ -203,6 +260,27 @@ mod tests {
         wpdu
     }
 
+    /// Формирует WPDU с Get-Request (чтение `value` регистра `REG_OBJ`, attr 2).
+    fn make_get_wpdu() -> Vec<u8> {
+        let invoke = InvokeIdAndPriority::from_bits(1, true, false);
+        let descriptor = CosemAttributeDescriptor {
+            class_id: REG_OBJ.class_id().as_u16(),
+            instance_id: REG_OBJ.obis().bytes,
+            attribute_id: 2,
+        };
+        let mut apdu = [0u8; 64];
+        let n = GetRequest::put_normal(invoke, descriptor, None, &mut ByteBuffer::new(&mut apdu))
+            .unwrap();
+
+        // Клиент: source_port = 16, destination_port = 1 (порт сервера).
+        let mut setting = WrapperSetting::new(16);
+        setting.set_destination_port(1);
+        let mut wpdu = vec![0u8; 8 + n];
+        let k = setting.put(&apdu[..n], &mut ByteBuffer::new(&mut wpdu)).unwrap();
+        wpdu.truncate(k);
+        wpdu
+    }
+
     #[tokio::test]
     async fn tcp_handshake_end_to_end() {
         let mut server: Server<'static, MAX_SESSIONS> =
@@ -232,8 +310,72 @@ mod tests {
 
         let acse = ACSEApdu::get(&mut Reader::new(&apdu)).unwrap();
         match acse {
-            ACSEApdu::Aare(a) => assert_eq!(a.result, 0),
+            ACSEApdu::Aare(a) => assert_eq!(a.result, AssociationResult::Accepted),
             other => panic!("expected AARE, got {other:?}"),
+        }
+    }
+
+    /// Полный цикл: AARQ → AARE, затем Get-Request → Get-Response.
+    #[tokio::test]
+    async fn tcp_get_end_to_end() {
+        let mut server: Server<'static, MAX_SESSIONS> =
+            Server::<'static, MAX_SESSIONS>::with_capacity(OBJECTS, SERVER_CONFORMANCE);
+        server.set_wport(1);
+        server
+            .add_static(
+                REG_OBJ.value(),
+                &REG_VALUE,
+                Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+            )
+            .unwrap();
+        let server = Arc::new(Mutex::new(server));
+
+        let mut listener = TcpListener {
+            inner: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        };
+        let addr = listener.inner.local_addr().unwrap();
+        let srv = Arc::clone(&server);
+        tokio::spawn(async move {
+            let channel = listener.accept().await.unwrap();
+            handle_connection(srv, channel).await.unwrap();
+        });
+
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+
+        // 1) Ассоциация: AARQ → AARE.
+        let wpdu = make_aarq_wpdu();
+        socket.write_all(&wpdu).await.unwrap();
+        let mut header = [0u8; 8];
+        socket.read_exact(&mut header).await.unwrap();
+        let setting = WrapperSetting::get(&mut Reader::new(&header)).unwrap();
+        let mut aare = vec![0u8; setting.apdu_len() as usize];
+        socket.read_exact(&mut aare).await.unwrap();
+        let acse = ACSEApdu::get(&mut Reader::new(&aare)).unwrap();
+        match acse {
+            ACSEApdu::Aare(a) => assert_eq!(a.result, AssociationResult::Accepted),
+            other => panic!("expected AARE, got {other:?}"),
+        }
+
+        // 2) GET: Get-Request → Get-Response (value = DoubleLongUnsigned(100)).
+        let get_wpdu = make_get_wpdu();
+        socket.write_all(&get_wpdu).await.unwrap();
+        let mut header = [0u8; 8];
+        socket.read_exact(&mut header).await.unwrap();
+        let setting = WrapperSetting::get(&mut Reader::new(&header)).unwrap();
+        let mut resp = vec![0u8; setting.apdu_len() as usize];
+        socket.read_exact(&mut resp).await.unwrap();
+
+        let response = {
+            let mut r = Reader::new(&resp);
+            GetResponse::get(&mut r).unwrap()
+        };
+        match response {
+            GetResponse::Normal { invoke, result: GetDataResult::Data(r) } => {
+                assert_eq!(invoke.invoke_id(), 1);
+                // DoubleLongUnsigned(100) = [0x06, 0x00, 0x00, 0x00, 0x64].
+                assert_eq!(r.as_bytes(), &[0x06, 0x00, 0x00, 0x00, 0x64]);
+            }
+            _ => panic!("expected GetResponse::Normal with data"),
         }
     }
 
@@ -250,7 +392,7 @@ mod tests {
 
         let acse = ACSEApdu::get(&mut Reader::new(&apdu)).unwrap();
         match acse {
-            ACSEApdu::Aare(a) => assert_eq!(a.result, 0),
+            ACSEApdu::Aare(a) => assert_eq!(a.result, AssociationResult::Accepted),
             other => panic!("expected AARE, got {other:?}"),
         }
     }

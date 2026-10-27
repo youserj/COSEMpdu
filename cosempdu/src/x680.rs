@@ -26,12 +26,12 @@ pub enum UniversalTag {
 
 impl UniversalTag {
     /// Tag number as a raw `u64`.
-    pub fn number(self) -> u64 {
-        self as u64
+    pub fn number(self) -> u8 {
+        self as u8
     }
 
     /// Look up a universal tag by number.
-    pub fn from_number(n: u64) -> Option<Self> {
+    pub fn from_number(n: u8) -> Option<Self> {
         use UniversalTag::*;
         Some(match n {
             1 => Boolean,
@@ -89,7 +89,7 @@ impl Class {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tag {
     pub class: Class,
-    pub number: u64,
+    pub number: u8,
     pub constructed: bool,
 }
 
@@ -104,7 +104,7 @@ impl Tag {
     }
 
     /// Create a context-specific tag.
-    pub fn context(number: u64) -> Self {
+    pub fn context(number: u8) -> Self {
         Tag {
             class: Class::Context,
             number,
@@ -113,7 +113,7 @@ impl Tag {
     }
 
     /// Create an application tag.
-    pub fn application(number: u64) -> Self {
+    pub fn application(number: u8) -> Self {
         Tag {
             class: Class::Application,
             number,

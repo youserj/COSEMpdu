@@ -4,7 +4,7 @@ use cosempdu::data::Data;
 
 use crate::ic::{
     AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, CommonDataType,
-    InterfaceClass, V4,
+    InterfaceClass, ASSOCIATED_PARTNERS_VALIDATOR, V4,
 };
 use crate::obis::ObisCode;
 
@@ -12,7 +12,7 @@ use crate::obis::ObisCode;
 pub const ATTR_LOGICAL_NAME: u8 = 1;
 /// Attribute 2 — `object_list`.
 pub const ATTR_OBJECT_LIST: u8 = 2;
-/// Attribute 3 — `associated_partners_id` (visible-string).
+/// Attribute 3 — `associated_partners_id` (associated_partners_type).
 pub const ATTR_ASSOCIATED_PARTNERS_ID: u8 = 3;
 /// Attribute 4 — `application_context_name` (octet-string).
 pub const ATTR_APPLICATION_CONTEXT_NAME: u8 = 4;
@@ -102,7 +102,7 @@ impl InterfaceClass for AssociationSn {
                 classifier: Classifier::Dynamic,
             },
             AttributeInfo {
-                data_type: AttributeType::Common(CommonDataType::VisibleString),
+                data_type: AttributeType::Validator(ASSOCIATED_PARTNERS_VALIDATOR),
                 min: None,
                 max: None,
                 default: None,
