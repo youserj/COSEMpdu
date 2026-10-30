@@ -6,6 +6,12 @@
 //! Каталог COSEM-объектов ([`InterfaceClass`]) хранится в сервере как
 //! `static`-срез и используется для валидации входящих запросов
 //! (`class_id` + OBIS). Куча не используется (no-heap, готово к `no_std`).
+//!
+//! Соединения обслуживаются [`Session`] — значением с буферами `rx`/`tx`, которое
+//! принадлежит вызывающему (задаче соединения или [`Server::serve`]), а не
+//! серверу. Поэтому I/O канала не требует `&mut Server`: [`Server::on_connect`]
+//! возвращает `Session`, а [`Server::accept_association`] и
+//! [`Server::process_request`] обрабатывают уже прочитанный WPDU из `session.rx`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -14,9 +20,9 @@ extern crate std;
 
 use core::fmt;
 
-use cosempdu::apdu::{CosemAttributeDescriptor, GetDataResultWrite, GetResponse, InvokeIdAndPriority};
+use cosempdu::apdu::{CosemAttributeDescriptor, DataAccessResult, GetDataResultWrite, GetResponse, InvokeIdAndPriority};
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::apdu::GetRequest;
+use cosempdu::apdu::{ExceptionResponse, GetRequest, ServiceError, SetRequest, SetResponse, StateError};
 use cosempdu::apdu_sn::Conformance;
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::{Codec, Data};
@@ -25,11 +31,13 @@ use dlms1::ic::{AttributeKey, ClassId, InterfaceClass};
 use dlms1::obis::ObisCode;
 
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::acse::{AAREapdu, ACSEApdu, AcseServiceUser, ApplicationContextName, AssociateSourceDiagnostic, AssociationResult};
+use cosempdu::acse::{AAREapdu, ACSEApdu, AcseServiceUser, ApplicationContextName, AssociateSourceDiagnostic, AssociationResult, ReleaseResponseReason, RLREapdu};
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::apdu_sn::{InitiateRequest, InitiateResponse, ObjectName};
+use cosempdu::apdu_sn::{confirmed_service_error_tag, ConfirmedServiceError, Definition, InitiateRequest, InitiateResponse, ObjectName, ServiceError as SnServiceError};
 #[cfg(any(feature = "tcp", feature = "ble"))]
 use cosempdu::buffer::Reader;
+#[cfg(any(feature = "tcp", feature = "ble"))]
+use cosempdu::x680::{Class, Tag};
 
 mod channel;
 mod session;
@@ -45,7 +53,7 @@ pub use transport::{Media, TransportRef, MAX_APDU, TRANSPORT_OVERHEAD};
 pub use transport::{HdlcPool, HdlcState};
 
 #[cfg(any(feature = "tcp", feature = "ble"))]
-pub use transport::{Wrapper, WrapperPool, WrapperSetting, WRAPPER_VERSION};
+pub use transport::{Wrapper, WrapperPool, WRAPPER_VERSION};
 
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 pub use channel::{Channel, Listener};
@@ -64,8 +72,8 @@ pub enum Error {
     ReadOnly,
     /// Уровень доступа клиента недостаточен.
     AccessDenied,
-    /// `class_id` в запросе не совпал с классом объекта.
-    UnknownClass { expected: ClassId, got: ClassId },
+    /// Ошибка доступа к данным (DLMS `Data-Access-Result`).
+    DataAccessResult(DataAccessResult),
     /// Ошибка кодера/декодера COSEM PDU.
     Codec(cosempdu::Error),
 
@@ -74,10 +82,6 @@ pub enum Error {
     // ---------------------------------------------------------------------
     /// Нет свободного транспортного слота (пул канала заполнен).
     NoSlot,
-    /// Таблица сессий заполнена.
-    TooManySessions,
-    /// Передан неверный индекс сессии.
-    InvalidSession,
 }
 
 impl fmt::Display for Error {
@@ -87,13 +91,9 @@ impl fmt::Display for Error {
             Error::NotFound => write!(f, "object/attribute not found"),
             Error::ReadOnly => write!(f, "attribute is read-only"),
             Error::AccessDenied => write!(f, "access denied"),
-            Error::UnknownClass { expected, got } => {
-                write!(f, "class mismatch: expected {expected:?}, got {got:?}")
-            }
+            Error::DataAccessResult(r) => write!(f, "data access result: {r:?}"),
             Error::Codec(e) => write!(f, "{e}"),
             Error::NoSlot => write!(f, "no free transport slot"),
-            Error::TooManySessions => write!(f, "too many sessions"),
-            Error::InvalidSession => write!(f, "invalid session slot"),
         }
     }
 }
@@ -104,6 +104,12 @@ impl std::error::Error for Error {}
 impl From<cosempdu::Error> for Error {
     fn from(e: cosempdu::Error) -> Self {
         Error::Codec(e)
+    }
+}
+
+impl From<cosempdu::buffer::Error> for Error {
+    fn from(e: cosempdu::buffer::Error) -> Self {
+        Error::Codec(e.into())
     }
 }
 
@@ -243,9 +249,6 @@ pub struct Server<'a, const N: usize = 3> {
     tcp_pool: WrapperPool<N>,
     #[cfg(feature = "ble")]
     ble_pool: WrapperPool<N>,
-
-    #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-    sessions: [Option<Session>; N],
 }
 
 impl<'a, const N: usize> Server<'a, N> {
@@ -265,8 +268,6 @@ impl<'a, const N: usize> Server<'a, N> {
             tcp_pool: WrapperPool::<N>::new(0), // собственный wPort — через Server::set_wport
             #[cfg(feature = "ble")]
             ble_pool: WrapperPool::<N>::new(0), // собственный wPort — через Server::set_ble_port
-            #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-            sessions: [const { None }; N],
         }
     }
 
@@ -294,12 +295,9 @@ impl<'a, const N: usize> Server<'a, N> {
             .iter()
             .find(|o| o.obis() == *obis)
             .copied()
-            .ok_or(Error::NotFound)?;
+            .ok_or(Error::DataAccessResult(DataAccessResult::ObjectUnavailable))?;
         if obj.class_id() != class_id {
-            return Err(Error::UnknownClass {
-                expected: obj.class_id(),
-                got: class_id,
-            });
+            return Err(Error::DataAccessResult(DataAccessResult::ObjectClassInconsistent));
         }
         Ok(obj)
     }
@@ -358,9 +356,9 @@ impl<'a, const N: usize> Server<'a, N> {
     ///
     /// `invoke` + `descriptor` — уже декодированные owned-поля (`Copy`), чтобы
     /// вызывающий код не держал borrow на буфер приёма. Возвращает число
-    /// записанных байт.
+    /// записанных байт. Ошибка доступа к данным уходит в `Get-Response` как
+    /// `DataAccessError`, а не прерывает обработку.
     // TODO: поддержка `Next` / `WithList` и `access_selection`.
-    // TODO: маппинг `Error` → `GetDataResultWrite::DataAccessError(...)` (пока — `Err`).
     // TODO: уровень доступа — из ассоциации, а не жёсткий `AccessMask::PUBLIC`.
     pub fn handle_get(
         &self,
@@ -368,13 +366,25 @@ impl<'a, const N: usize> Server<'a, N> {
         descriptor: CosemAttributeDescriptor,
         buf: &mut ByteBuffer<'_>,
     ) -> Result<usize, Error> {
-        let class_id = ClassId::from_u16(descriptor.class_id).ok_or(Error::NotFound)?;
+        // Получить значение; Data-Access-Result уходит в Get-Response (DataAccessError).
+        let result = match self.lookup_codec(descriptor) {
+            Ok(codec) => GetDataResultWrite::Data(codec),
+            Err(Error::DataAccessResult(code)) => GetDataResultWrite::DataAccessError(code),
+            Err(e) => return Err(e),
+        };
+
+        let start = buf.pos();
+        GetResponse::put_normal(invoke, result, buf)?;
+        Ok(buf.pos() - start)
+    }
+
+    /// Разобрать дескриптор (class_id + OBIS + attribute_id) и найти значение.
+    fn lookup_codec(&self, descriptor: CosemAttributeDescriptor) -> Result<&dyn Codec, Error> {
+        let class_id = ClassId::from_u16(descriptor.class_id)
+            .ok_or(Error::DataAccessResult(DataAccessResult::ObjectClassInconsistent))?;
         let obis = ObisCode::from_bytes(descriptor.instance_id);
         let key = AttributeKey::new(obis, descriptor.attribute_id as u8);
-        let codec = self.get_codec(class_id, key, AccessMask::PUBLIC)?;
-        let start = buf.pos();
-        GetResponse::put_normal(invoke, GetDataResultWrite::Data(codec), buf)?;
-        Ok(buf.pos() - start)
+        self.get_codec(class_id, key, AccessMask::PUBLIC)
     }
 
     /// SET (внешний) поточно: начать приём сегментированного значения, которое
@@ -388,14 +398,12 @@ impl<'a, const N: usize> Server<'a, N> {
         self.find_object(class_id, &key.obis)?;
         match self.attributes.get_mut(&key) {
             Some(ValueRef::Persistent(a, access)) => {
-                if !access.write.contains(level) { return Err(Error::AccessDenied); }
-                let sink = a.stream_sink().ok_or_else(|| {
-                    Error::Codec(cosempdu::Error::Message("attribute does not support streaming"))
-                })?;
+                if !access.write.contains(level) { return Err(Error::DataAccessResult(DataAccessResult::ScopeOfAccessViolated)); }
+                let sink = a.stream_sink().ok_or_else(|| { Error::DataAccessResult(DataAccessResult::HardwareFault) })?;
                 Ok(StreamingSet { decoder: StreamDecoder::new(sink) })
             }
-            Some(ValueRef::Static(..)) | Some(ValueRef::Dynamic(..)) => return Err(Error::ReadOnly),
-            None => return Err(Error::NotFound),
+            Some(ValueRef::Static(..)) | Some(ValueRef::Dynamic(..)) => return Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied)),
+            None => return Err(Error::DataAccessResult(DataAccessResult::ObjectUndefined)),
         }
     }
 
@@ -413,17 +421,11 @@ impl<'a, const N: usize> Server<'a, N> {
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
     pub const fn capacity(&self) -> usize { N }
 
-    /// Доступ к сессии по индексу (для чтения/записи буферов и состояния).
+    /// Создать сессию для нового соединения: занимает транспортный слот и
+    /// возвращает [`Session`]. Сессия (с буферами `rx`/`tx`) принадлежит
+    /// вызывающему, поэтому I/O канала не требует `&mut Server`.
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-    pub fn session(&mut self, idx: usize) -> Option<&mut Session> {
-        self.sessions.get_mut(idx).and_then(Option::as_mut)
-    }
-
-    /// Вызывается при принятии нового соединения.
-    ///
-    /// Возвращает индекс слота сессии.
-    #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-    pub fn on_connect(&mut self, media: Media) -> Result<usize, Error> {
+    pub fn on_connect(&mut self, media: Media) -> Result<Session, Error> {
         let transport_ref = match media {
             #[cfg(feature = "optical")]
             Media::Optical => {
@@ -433,122 +435,47 @@ impl<'a, const N: usize> Server<'a, N> {
             #[cfg(feature = "tcp")]
             Media::Tcp => {
                 self.tcp_pool.alloc().ok_or(Error::NoSlot)?;
-                TransportRef::Wrapper(WrapperSetting::new(self.tcp_pool.source_port()))
+                TransportRef::Wrapper(Wrapper::new(self.tcp_pool.source_port(), 0))
             }
             #[cfg(feature = "ble")]
             Media::Ble => {
                 self.ble_pool.alloc().ok_or(Error::NoSlot)?;
-                TransportRef::Wrapper(WrapperSetting::new(self.ble_pool.source_port()))
+                TransportRef::Wrapper(Wrapper::new(self.ble_pool.source_port(), 0))
             }
         };
-
-        match self.sessions.iter().position(|s| s.is_none()) {
-            Some(i) => {
-                self.sessions[i] = Some(Session::new(media, transport_ref));
-                Ok(i)
-            }
-            None => {
-                // Сессий нет — откатываем транспортный слот.
-                self.release(media);
-                Err(Error::TooManySessions)
-            }
-        }
+        Ok(Session::new(media, transport_ref))
     }
 
-    /// Вызывается при закрытии соединения.
+    /// Освободить транспортный слот по закрытию соединения.
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-    pub fn on_disconnect(&mut self, session_idx: usize) {
-        if let Some(session) = self.sessions.get_mut(session_idx).and_then(Option::take) {
-            self.release(session.media());
-        }
-    }
-
-    /// Вызывается при поступлении байтов в соединение.
-    #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-    pub fn on_data(&mut self, session_idx: usize, data: &[u8]) -> Result<(), Error> {
-        let session = self
-            .sessions
-            .get_mut(session_idx)
-            .and_then(Option::as_mut)
-            .ok_or(Error::InvalidSession)?;
-
-        let needed = session.rx_len() + data.len();
-        if !session.push_rx(data) {
-            return Err(Error::Codec(cosempdu::Error::InputTooLarge {
-                len: needed,
-                max: RX_BUF,
-            }));
-        }
-
-        // TODO: разбор кадра происходит в `associate` (Wrapper) / HDLC-обработке
-        // (по `TransportRef::Hdlc`); здесь только накопление байт.
-        Ok(())
-    }
-
-    /// Транспортный слой: валидация Wrapper-заголовка (WPDU адресован нашему
-    /// wPort) и сохранение согласованных настроек соединения в сессию.
-    #[cfg(any(feature = "tcp", feature = "ble"))]
-    pub fn validate_wrapper(
-        &mut self,
-        session_idx: usize,
-        received: WrapperSetting,
-    ) -> Result<(), Error> {
-        let session = self.session(session_idx).ok_or(Error::InvalidSession)?;
-
-        // Собственный wPort сервера уже сохранён в TransportRef при on_connect.
-        let server_port = match session.transport_ref() {
-            TransportRef::Wrapper(s) => s.source_port(),
-            #[cfg(feature = "optical")]
-            TransportRef::Hdlc(_) => {
-                return Err(Error::Codec(cosempdu::Error::Message(
-                    "wrapper validation requires tcp/ble channel",
-                )))
-            }
-        };
-
-        // Валидация: клиент должен адресовать WPDU нашему wPort.
-        if received.destination_port() != server_port {
-            return Err(Error::Codec(cosempdu::Error::Message(
-                "wrong destination wPort",
-            )));
-        }
-
-        // Сохранить настройки соединения (взгляд сервера: наш порт → порт клиента).
-        let mut setting = WrapperSetting::new(server_port);
-        setting.set_destination_port(received.source_port());
-        session.set_transport_ref(TransportRef::Wrapper(setting));
-        Ok(())
+    pub fn on_disconnect(&mut self, media: Media) {
+        self.release(media);
     }
 
     /// DLMS-слой: принять ассоциацию — AARQ из session.rx → AARE в session.tx.
     ///
-    /// Вызывается после успешной [`Server::validate_wrapper`].
+    /// Сначала валидирует Wrapper-заголовок и запоминает wPort клиента (это
+    /// первый кадр), затем декодирует AARQ и кодирует AARE.
     #[cfg(any(feature = "tcp", feature = "ble"))]
     pub fn accept_association(
-        &mut self,
-        session_idx: usize,
-        received: WrapperSetting,
+        &self,
+        session: &mut Session,
+        received: Wrapper,
     ) -> Result<(), Error> {
+        // Валидация Wrapper + настройки ответа (взгляд сервера).
+        let setting = validate_wrapper(session, received)?;
+        // Запомнить wPort клиента для последующих запросов.
+        session.set_transport_ref(TransportRef::Wrapper(setting));
+
         let conf = self.proposed_conformance();
-        let session = self.session(session_idx).ok_or(Error::InvalidSession)?;
 
-        // Настройки ответа (взгляд сервера) сохранены в validate_wrapper.
-        let setting = match session.transport_ref() {
-            TransportRef::Wrapper(s) => s,
-            #[cfg(feature = "optical")]
-            TransportRef::Hdlc(_) => {
-                return Err(Error::Codec(cosempdu::Error::Message(
-                    "accept requires Wrapper channel (tcp/ble)",
-                )))
-            }
-        };
-
-        // 1. Декодировать AARQ (payload после 8-байтного заголовка) из session.rx.
+        // 1. Декодировать AARQ (session.rx уже содержит только APDU).
         let (negotiated, ctx) = {
-            let apdu = &session.rx()
-                [TRANSPORT_OVERHEAD..TRANSPORT_OVERHEAD + received.apdu_len() as usize];
-            decode_aarq(apdu, conf)?
+            let mut r = Reader::new(session.rx());
+            decode_aarq(&mut r, conf)?
         };
+        // Запомнить referencing (LN vs SN) для error-response.
+        session.set_application_context(ctx);
 
         // 2. Закодировать AARE WPDU прямо в session.tx.
         let n = {
@@ -556,57 +483,89 @@ impl<'a, const N: usize> Server<'a, N> {
             encode_aare(negotiated, ctx, &setting, &mut tx)?
         };
         session.set_tx_len(n);
+        // Ассоциация установлена.
+        session.set_state(AssociationState::Associated);
         Ok(())
     }
 
     /// Обслужить одно соединение: on_connect → ассоциация → цикл
     /// Get-запросов → on_disconnect.
     #[cfg(any(feature = "tcp", feature = "ble"))]
-    pub async fn serve<C: Channel<Frame = WrapperSetting>>(
+    pub async fn serve<C: Channel<Frame = Wrapper>>(
         &mut self,
         media: Media,
         mut channel: C,
     ) -> Result<(), Error> {
-        let idx = self.on_connect(media)?;
+        let mut session = self.on_connect(media)?;
 
-        // Разовая ассоциация (AARQ → AARE).
-        if let Err(e) = self.associate(idx, &mut channel).await {
-            self.on_disconnect(idx);
-            return Err(e);
-        }
-
-        // Цикл обслуживания xDLMS-запросов; выходим по таймауту/закрытию/ошибке.
+        // Цикл обслуживания: AARQ/AARE, GET/SET, RLRQ — всё через process_request.
+        // Выход по RLRQ/таймауту/закрытию/ошибке.
         let result = loop {
-            if let Err(e) = self.handle_request(idx, &mut channel).await {
-                break Err(e);
+            match self.handle_request(&mut session, &mut channel).await {
+                Ok(true) => {}
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
             }
         };
 
-        // Всегда освобождаем сессию (сброс в Idle): и при успехе, и при таймауте/ошибке.
-        self.on_disconnect(idx);
+        // Всегда освобождаем слот: и при успехе, и при таймауте/ошибке.
+        self.on_disconnect(session.media());
         result
     }
 
-    /// Обработать один уже прочитанный WPDU (Get-Request) и сформировать ответный
-    /// WPDU в `response`. Сетевого I/O не делает: `request` — байты запроса
-    /// (заголовок + APDU), `received` — метаданные кадра из `Channel::read`.
-    /// Возвращает число записанных в `response` байт.
+    /// Обработать один уже прочитанный WPDU (AARQ, xDLMS-запрос или RLRQ) из
+    /// `session.rx` и сформировать ответный WPDU прямо в `session.tx`.
+    /// Сетевого I/O не делает.
+    ///
+    /// Возвращает `Ok(true)`, если соединение следует продолжать, и `Ok(false)`,
+    /// если получен RLRQ (ассоциация освобождается).
     #[cfg(any(feature = "tcp", feature = "ble"))]
     pub fn process_request(
         &mut self,
-        idx: usize,
-        received: WrapperSetting,
-        request: &[u8],
-        response: &mut ByteBuffer<'_>,
-    ) -> Result<usize, Error> {
-        // 1) Валидация Wrapper (обновляет порты в session).
-        self.validate_wrapper(idx, received)?;
+        session: &mut Session,
+        received: Wrapper,
+    ) -> Result<bool, Error> {
+        // Диспетчеризация по тегу APDU (класс, номер, constructed).
+        let tag = {
+            let mut r = Reader::new(session.rx());
+            Tag::get(&mut r).map_err(Error::Codec)?
+        };
 
-        // 2) Декодируем Get-Request в owned-поля (borrow на request гаснет здесь).
+        match (tag.class, tag.number, tag.constructed) {
+            // ACSE: AARQ = [APPLICATION 0] IMPLICIT SEQUENCE.
+            (Class::Application, 0, true) => {
+                self.accept_association(session, received)?;
+                Ok(true)
+            }
+            // ACSE: RLRQ = [APPLICATION 2] IMPLICIT SEQUENCE.
+            (Class::Application, 2, true) => {
+                handle_release(session)?;
+                Ok(false)
+            }
+            // xDLMS: Get-Request = [192] IMPLICIT CHOICE.
+            (Class::Private, 0, false) => {
+                self.process_get(session)?;
+                Ok(true)
+            }
+            // xDLMS: Set-Request = [193] IMPLICIT CHOICE.
+            (Class::Private, 1, false) => {
+                self.process_set(session)?;
+                Ok(true)
+            }
+            // Table 89. Request is not well formed
+            _ => {
+                build_exception_response(session)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Get-Request (Normal, без access_selection) → Get-Response в session.tx.
+    #[cfg(any(feature = "tcp", feature = "ble"))]
+    fn process_get(&self, session: &mut Session) -> Result<(), Error> {
+        // 1) Декодируем Get-Request в owned-поля (session.rx уже содержит только APDU).
         let (invoke, descriptor) = {
-            let mut r = Reader::new(
-                &request[TRANSPORT_OVERHEAD..TRANSPORT_OVERHEAD + received.apdu_len() as usize],
-            );
+            let mut r = Reader::new(session.rx());
             match GetRequest::get(&mut r).map_err(Error::Codec)? {
                 GetRequest::Normal {
                     invoke,
@@ -617,87 +576,84 @@ impl<'a, const N: usize> Server<'a, N> {
             }
         };
 
-        // 3) Серверный взгляд на порты (Copy) для WPDU-заголовка.
-        let srv = match self.session(idx).ok_or(Error::InvalidSession)?.transport_ref() {
-            TransportRef::Wrapper(s) => s,
-            #[cfg(feature = "optical")]
-            TransportRef::Hdlc(_) => {
-                return Err(Error::Codec(cosempdu::Error::Message(
-                    "request handling requires Wrapper channel (tcp/ble)",
-                )))
+        // 2) Серверный взгляд на порты (Copy) для WPDU-заголовка.
+        let srv = server_wrapper(session)?;
+
+        // 3) WPDU-заголовок + Get-Response прямо в session.tx.
+        let n = {
+            let mut tx = session.tx_buffer();
+            srv.put(&mut tx, |buf| self.handle_get(invoke, descriptor, buf))?
+        };
+        session.set_tx_len(n);
+        Ok(())
+    }
+
+    /// Set-Request (Normal, без access_selection) → применить значение → Set-Response.
+    #[cfg(any(feature = "tcp", feature = "ble"))]
+    fn process_set(&mut self, session: &mut Session) -> Result<(), Error> {
+        // 1) Декодируем Set-Request::Normal и применяем значение к атрибуту.
+        //    Ошибка доступа к данным не прерывает обработку, а уходит в Set-Response.
+        let (invoke, result) = {
+            let mut r = Reader::new(session.rx());
+            match SetRequest::get(&mut r).map_err(Error::Codec)? {
+                SetRequest::Normal {
+                    invoke,
+                    descriptor,
+                    access_selection: None,
+                    value,
+                } => {
+                    let class_id = ClassId::from_u16(descriptor.class_id).ok_or(Error::NotFound)?;
+                    let obis = ObisCode::from_bytes(descriptor.instance_id);
+                    let key = AttributeKey::new(obis, descriptor.attribute_id as u8);
+
+                    // Применить значение; при Data-Access-Result вернуть его код в ответе.
+                    let result = match self.stream_set(class_id, key, AccessMask::CONFIGURATOR) {
+                        Ok(mut s) => {
+                            s.push(value.remaining_bytes())?;
+                            s.finish()?;
+                            DataAccessResult::Success
+                        }
+                        Err(Error::DataAccessResult(code)) => code,
+                        Err(e) => return Err(e),
+                    };
+
+                    (invoke, result)
+                }
+                _ => return Err(Error::NotFound),
             }
         };
 
-        // 4) WPDU-заголовок с длиной-заглушкой.
-        let start = response.pos();
-        response.put_u16(WRAPPER_VERSION).map_err(|e| Error::Codec(e.into()))?;
-        response.put_u16(srv.source_port()).map_err(|e| Error::Codec(e.into()))?;
-        response.put_u16(srv.destination_port()).map_err(|e| Error::Codec(e.into()))?;
-        let len_pos = response.pos();
-        response.put_u16(0).map_err(|e| Error::Codec(e.into()))?;
+        // 2) Серверный взгляд на порты (Copy) для WPDU-заголовка.
+        let srv = server_wrapper(session)?;
 
-        // 5) Get-Response APDU прямо в response.
-        let apdu_n = self.handle_get(invoke, descriptor, response)?;
-
-        // 6) Дописать длину APDU в заголовок.
-        response
-            .write_at(&(apdu_n as u16).to_be_bytes(), len_pos)
-            .map_err(|e| Error::Codec(e.into()))?;
-
-        Ok(response.pos() - start)
-    }
-
-    /// Обслужить один xDLMS-запрос после ассоциации: прочитать WPDU в локальный
-    /// буфер, обработать ([`Server::process_request`]) и отправить ответ. Ошибка —
-    /// сигнал завершить цикл (таймаут чтения, закрытие соединения, неверный кадр).
-    #[cfg(any(feature = "tcp", feature = "ble"))]
-    async fn handle_request<C: Channel<Frame = WrapperSetting>>(
-        &mut self,
-        idx: usize,
-        channel: &mut C,
-    ) -> Result<(), Error> {
-        // 1) Читаем WPDU в локальный буфер.
-        let mut request = [0u8; RX_BUF];
-        let received = channel.read(&mut request).await.map_err(Error::Codec)?;
-        let request_len = TRANSPORT_OVERHEAD + received.apdu_len() as usize;
-
-        // 2) Обрабатываем (validate + decode + encode) в локальный буфер ответа.
-        let mut response = [0u8; RX_BUF];
+        // 3) WPDU-заголовок + Set-Response прямо в session.tx.
         let n = {
-            let mut b = ByteBuffer::new(&mut response);
-            self.process_request(idx, received, &request[..request_len], &mut b)?
+            let mut tx = session.tx_buffer();
+            srv.put(&mut tx, |buf| {
+                SetResponse::put_normal(invoke, result, buf)
+            })?
         };
-
-        // 3) Отправляем ответ.
-        channel.write(&response[..n]).await.map_err(Error::Codec)?;
+        session.set_tx_len(n);
         Ok(())
     }
 
-    /// Выполнить ассоциацию (AARQ → AARE): прочитать WPDU, валидировать заголовок,
-    /// принять AARQ и отправить AARE. Разовый обмен — вне цикла.
+    /// Обслужить один xDLMS-запрос после ассоциации: прочитать WPDU в session.rx,
+    /// обработать ([`Server::process_request`]) и отправить ответ из session.tx.
+    /// Возвращает `Ok(false)`, если получен RLRQ (ассоциация освобождена).
     #[cfg(any(feature = "tcp", feature = "ble"))]
-    pub async fn associate<C: Channel<Frame = WrapperSetting>>(
+    async fn handle_request<C: Channel<Frame = Wrapper>>(
         &mut self,
-        idx: usize,
+        session: &mut Session,
         channel: &mut C,
-    ) -> Result<(), Error> {
-        // Читаем WPDU прямо в session.rx; канал возвращает метаданные кадра.
-        let setting = {
-            let session = self.session(idx).ok_or(Error::InvalidSession)?;
-            let setting = channel.read(session.rx_mut()).await.map_err(Error::Codec)?;
-            session.set_rx_len(TRANSPORT_OVERHEAD + setting.apdu_len() as usize);
-            setting
-        };
-        // Валидация Wrapper и приём AARQ → AARE (в session.tx).
-        self.validate_wrapper(idx, setting)?;
-        self.accept_association(idx, setting)?;
-        // Пишем ответ прямо из session.tx.
-        {
-            let session = self.session(idx).ok_or(Error::InvalidSession)?;
-            channel.write(session.tx()).await.map_err(Error::Codec)?;
-            session.clear_rx();
-        }
-        Ok(())
+    ) -> Result<bool, Error> {
+        let received = channel.read(session.rx_mut()).await.map_err(Error::Codec)?;
+        session.set_rx_len(received.apdu_len() as usize);
+
+        let keep = self.process_request(session, received)?;
+
+        channel.write(session.tx()).await.map_err(Error::Codec)?;
+        session.clear_rx();
+        Ok(keep)
     }
 
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
@@ -723,13 +679,112 @@ impl<'a> Server<'a, 3> {
     }
 }
 
+/// Транспортный слой: валидация Wrapper-заголовка (WPDU адресован нашему wPort)
+/// и построение настроек ответа (взгляд сервера: наш wPort → wPort клиента).
+#[cfg(any(feature = "tcp", feature = "ble"))]
+fn validate_wrapper(session: &mut Session, received: Wrapper) -> Result<Wrapper, Error> {
+    // Собственный wPort сервера уже сохранён в TransportRef при on_connect.
+    let server_port = match session.transport_ref() {
+        TransportRef::Wrapper(s) => s.source_port(),
+        #[cfg(feature = "optical")]
+        TransportRef::Hdlc(_) => {
+            return Err(Error::Codec(cosempdu::Error::Message(
+                "wrapper validation requires tcp/ble channel",
+            )))
+        }
+    };
+
+    // Валидация: клиент должен адресовать WPDU нашему wPort.
+    if received.destination_port() != server_port {
+        return Err(Error::Codec(cosempdu::Error::Message(
+            "wrong destination wPort",
+        )));
+    }
+
+    // Настройки ответа: наш wPort → wPort клиента (из его заголовка).
+    Ok(Wrapper::new(server_port, received.source_port()))
+}
+
+/// Серверный взгляд на порты (Copy) для WPDU-заголовка ответа.
+#[cfg(any(feature = "tcp", feature = "ble"))]
+fn server_wrapper(session: &Session) -> Result<Wrapper, Error> {
+    match session.transport_ref() {
+        TransportRef::Wrapper(s) => Ok(s),
+        #[cfg(feature = "optical")]
+        TransportRef::Hdlc(_) => Err(Error::Codec(cosempdu::Error::Message(
+            "request handling requires Wrapper channel (tcp/ble)",
+        ))),
+    }
+}
+
+/// Неизвестный/некорректно сформированный APDU → error-response адресату.
+///
+/// LN referencing — `ExceptionResponse` (service-unknown, operation-not-possible);
+/// SN referencing — `ConfirmedServiceError` (read, definition: other).
+#[cfg(any(feature = "tcp", feature = "ble"))]
+fn build_exception_response(session: &mut Session) -> Result<(), Error> {
+    // Серверный взгляд на порты (Copy) для WPDU-заголовка ответа.
+    let srv = server_wrapper(session)?;
+    let ctx = session.application_context();
+
+    let n = {
+        let mut tx = session.tx_buffer();
+        match ctx {
+            ApplicationContextName::LogicalNameNoCiphering
+            | ApplicationContextName::LogicalNameCiphering => {
+                let exc = ExceptionResponse {
+                    state_error: StateError::ServiceUnknown,
+                    service_error: ServiceError::OperationNotPossible,
+                };
+                srv.put(&mut tx, |buf| exc.put(buf))?
+            }
+            ApplicationContextName::ShortNameNoCiphering
+            | ApplicationContextName::ShortNameCiphering => {
+                let cse = ConfirmedServiceError {
+                    tag: confirmed_service_error_tag::READ,
+                    service_error: SnServiceError::Definition(Definition::Other),
+                };
+                srv.put(&mut tx, |buf| cse.put(buf))?
+            }
+        }
+    };
+    session.set_tx_len(n);
+    Ok(())
+}
+
+/// RLRQ → RLRE: подтвердить освобождение ассоциации и записать RLRE в session.tx.
+#[cfg(any(feature = "tcp", feature = "ble"))]
+fn handle_release(session: &mut Session) -> Result<(), Error> {
+    // Убедимся, что пришёл именно RLRQ (не AARQ/AARE/RLRE).
+    let acse = ACSEApdu::get(&mut Reader::new(session.rx())).map_err(Error::Codec)?;
+    match acse {
+        ACSEApdu::Rlrq(_) => {}
+        _ => return Err(Error::Codec(cosempdu::Error::Message("expected RLRQ"))),
+    }
+
+    // Серверный взгляд на порты (Copy) для WPDU-заголовка ответа.
+    let srv = server_wrapper(session)?;
+
+    // RLRE (reason normal) в session.tx.
+    let n = {
+        let mut tx = session.tx_buffer();
+        let rlre = RLREapdu {
+            reason: Some(ReleaseResponseReason::Normal),
+            user_information: None,
+        };
+        srv.put(&mut tx, |buf| rlre.put(buf))?
+    };
+    session.set_tx_len(n);
+    Ok(())
+}
+
 /// AARQ APDU → согласованный conformance и application-context-name.
 #[cfg(any(feature = "tcp", feature = "ble"))]
 fn decode_aarq(
-    apdu: &[u8],
+    reader: &mut Reader<'_>,
     server_conf: Conformance,
 ) -> Result<(Conformance, ApplicationContextName), Error> {
-    let acse = ACSEApdu::get(&mut Reader::new(apdu)).map_err(Error::Codec)?;
+    let acse = ACSEApdu::get(reader).map_err(Error::Codec)?;
     let aarq = match acse {
         ACSEApdu::Aarq(a) => a,
         _ => return Err(Error::Codec(cosempdu::Error::Message("expected AARQ"))),
@@ -750,7 +805,7 @@ fn decode_aarq(
 fn encode_aare(
     negotiated: Conformance,
     ctx: ApplicationContextName,
-    setting: &WrapperSetting,
+    setting: &Wrapper,
     out: &mut ByteBuffer<'_>,
 ) -> Result<usize, Error> {
     let resp = InitiateResponse {
@@ -779,22 +834,8 @@ fn encode_aare(
         user_information: Some(&ir[..n]),
     };
 
-    // WPDU-заголовок с длиной-заглушкой.
-    let start = out.pos();
-    out.put_u16(WRAPPER_VERSION).map_err(|e| Error::Codec(e.into()))?;
-    out.put_u16(setting.source_port()).map_err(|e| Error::Codec(e.into()))?;
-    out.put_u16(setting.destination_port()).map_err(|e| Error::Codec(e.into()))?;
-    let len_pos = out.pos();
-    out.put_u16(0).map_err(|e| Error::Codec(e.into()))?;
-
-    // AARE APDU прямо в out.
-    let aare_len = aare.put(out).map_err(Error::Codec)?;
-
-    // Дописать длину APDU в заголовок.
-    out.write_at(&(aare_len as u16).to_be_bytes(), len_pos)
-        .map_err(|e| Error::Codec(e.into()))?;
-
-    Ok(out.pos() - start)
+    // WPDU-заголовок + AARE APDU прямо в out.
+    setting.put(out, |buf| aare.put(buf)).map_err(Error::Codec)
 }
 
 
@@ -883,6 +924,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn server_handles_get_request_missing_object() {
+        // GET на несуществующий OBIS → GetResponse::Normal с DataAccessError(ObjectUnavailable).
+        let mut server = Server::new(OBJECTS, CONF);
+
+        let invoke = InvokeIdAndPriority::from_bits(1, true, false);
+        let descriptor = CosemAttributeDescriptor {
+            class_id: ClassId::Register.as_u16(),
+            instance_id: ObisCode::new(0xff, 0xff, 0xff, 0xff, 0xff, 0xff).bytes,
+            attribute_id: 2,
+        };
+        let mut tx = [0u8; 128];
+        let tx_n = {
+            let mut b = ByteBuffer::new(&mut tx);
+            server.handle_get(invoke, descriptor, &mut b).unwrap()
+        };
+
+        let resp = {
+            let mut r = Reader::new(&tx[..tx_n]);
+            GetResponse::get(&mut r).unwrap()
+        };
+
+        match resp {
+            GetResponse::Normal { invoke, result: GetDataResult::DataAccessError(code) } => {
+                assert_eq!(invoke.invoke_id(), 1);
+                assert_eq!(code, DataAccessResult::ObjectUnavailable);
+            }
+            _ => panic!("expected GetResponse::Normal with DataAccessError"),
+        }
+    }
+
     /// Тестовый хелпер: применить `Data` к атрибуту через потоковый SET.
     fn set_data(
         server: &mut Server<'_>,
@@ -945,13 +1017,13 @@ mod tests {
         }
 
         assert_eq!(server.put(ClassId::Register, REG_OBJ.value(), AccessMask(1 << 3), &mut buf), Err(Error::AccessDenied));
-        assert_eq!(set_data(&mut server, ClassId::Register, REG_OBJ.value(), AccessMask::PUBLIC, &Data::DoubleLongUnsigned(2)), Err(Error::AccessDenied));
+        assert_eq!(set_data(&mut server, ClassId::Register, REG_OBJ.value(), AccessMask::PUBLIC, &Data::DoubleLongUnsigned(2)), Err(Error::DataAccessResult(DataAccessResult::ScopeOfAccessViolated)));
         assert!(set_data(&mut server, ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR, &Data::Unsigned(200)).is_err());
-        assert_eq!(set_data(&mut server, ClassId::Data, SERIAL_OBJ.value(), AccessMask::CONFIGURATOR, &Data::Unsigned(0)), Err(Error::ReadOnly));
+        assert_eq!(set_data(&mut server, ClassId::Data, SERIAL_OBJ.value(), AccessMask::CONFIGURATOR, &Data::Unsigned(0)), Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied)));
 
         let missing = ObisCode::new(0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
-        assert_eq!(server.put(ClassId::Register, AttributeKey::new(missing, 2), AccessMask::PUBLIC, &mut buf), Err(Error::NotFound));
-        assert_eq!(set_data(&mut server, ClassId::Register, AttributeKey::new(missing, 2), AccessMask::PUBLIC, &Data::NullData), Err(Error::NotFound));
+        assert_eq!(server.put(ClassId::Register, AttributeKey::new(missing, 2), AccessMask::PUBLIC, &mut buf), Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable)));
+        assert_eq!(set_data(&mut server, ClassId::Register, AttributeKey::new(missing, 2), AccessMask::PUBLIC, &Data::NullData), Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable)));
     }
 
     #[test]
@@ -969,7 +1041,7 @@ mod tests {
             assert_eq!(buf.extract(), &[0x19, 0x07, 0xE8, 0x0A, 0x09, 0x00, 0x0F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0xFF]);
         }
 
-        assert_eq!(set_data(&mut server, ClassId::Clock, CLOCK_OBJ.time(), AccessMask::CONFIGURATOR, &Data::DateTime(t)), Err(Error::ReadOnly));
+        assert_eq!(set_data(&mut server, ClassId::Clock, CLOCK_OBJ.time(), AccessMask::CONFIGURATOR, &Data::DateTime(t)), Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied)));
 
         let mut p = ScalUnit { scaler: 0, unit: 255 };
         let pkey = REG_OBJ.scaler_unit();
@@ -1034,7 +1106,7 @@ mod tests {
     #[test]
     fn server_stream_set_blob() {
         let mut server = Server::new(OBJECTS, CONF);
-        let mut value = OctetString::<60> { buf: [0; 60], len: 0 };
+        let mut value: OctetString<60> = OctetString::default();
         let key = REG_OBJ.value();
         server.add_persistent(key, &mut value, reg_access()).unwrap();
 
@@ -1099,11 +1171,11 @@ mod tests {
 
         assert!(matches!(
             server.put(ClassId::Clock, REG_OBJ.value(), AccessMask::PUBLIC, &mut buf),
-            Err(Error::UnknownClass { .. })
+            Err(Error::DataAccessResult(DataAccessResult::ObjectClassInconsistent))
         ));
 
         let unknown = ObisCode::new(9, 9, 9, 9, 9, 9);
-        assert_eq!(server.put(ClassId::Register, AttributeKey::new(unknown, 2), AccessMask::PUBLIC, &mut buf), Err(Error::NotFound));
+        assert_eq!(server.put(ClassId::Register, AttributeKey::new(unknown, 2), AccessMask::PUBLIC, &mut buf), Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable)));
     }
 
     #[test]
@@ -1179,69 +1251,306 @@ mod transport_tests {
     fn connect_disconnect_and_slot_reuse() {
         let mut server: Server = Server::new(NO_OBJECTS, CONF);
 
-        let i0 = server.on_connect(Media::Optical).unwrap();
-        assert_eq!(i0, 0);
-        let i1 = server.on_connect(Media::Optical).unwrap();
-        assert_eq!(i1, 1);
-        let i2 = server.on_connect(Media::Optical).unwrap();
-        assert_eq!(i2, 2);
+        let s0 = server.on_connect(Media::Optical).unwrap();
+        let _s1 = server.on_connect(Media::Optical).unwrap();
+        let _s2 = server.on_connect(Media::Optical).unwrap();
 
-        // Лимит сессий и пула оптики (N = 3) исчерпан.
+        // Лимит слотов пула оптики (N = 3) исчерпан.
         assert!(matches!(server.on_connect(Media::Optical), Err(Error::NoSlot)));
 
-        // Освобождение сессии возвращает транспортный слот.
-        server.on_disconnect(i0);
-        let i3 = server.on_connect(Media::Optical).unwrap();
-        assert_eq!(i3, 0);
+        // Освобождение слота возвращает его в пул.
+        server.on_disconnect(s0.media());
+        let _s3 = server.on_connect(Media::Optical).unwrap();
     }
 
     #[test]
     fn data_accumulates_and_overflow() {
         let mut server: Server = Server::new(NO_OBJECTS, CONF);
-        let i = server.on_connect(Media::Optical).unwrap();
+        let mut s = server.on_connect(Media::Optical).unwrap();
 
-        server.on_data(i, &[1, 2, 3]).unwrap();
-        assert_eq!(server.session(i).unwrap().rx(), &[1, 2, 3]);
+        assert!(s.push_rx(&[1, 2, 3]));
+        assert_eq!(s.rx(), &[1, 2, 3]);
 
-        // Переполнение rx-буфера.
+        // Переполнение rx-буфера (push_rx возвращает false).
         let big = [0u8; RX_BUF + 1];
-        assert!(matches!(
-            server.on_data(i, &big),
-            Err(Error::Codec(cosempdu::Error::InputTooLarge { .. }))
-        ));
-    }
-
-    #[test]
-    fn invalid_session_is_error() {
-        let mut server: Server = Server::new(NO_OBJECTS, CONF);
-        assert!(matches!(server.on_data(0, &[1]), Err(Error::InvalidSession)));
-        server.on_disconnect(0); // не паникует
+        assert!(!s.push_rx(&big));
     }
 }
 
 #[cfg(all(test, any(feature = "tcp", feature = "ble")))]
 mod wrapper_tests {
-    use crate::{Wrapper, WrapperSetting};
+    use crate::{Media, Server, TransportRef, Wrapper};
+    use cosempdu::acse::{ACSEApdu, ReleaseRequestReason, ReleaseResponseReason, RLRQapdu};
+    use cosempdu::apdu_sn::Conformance;
     use cosempdu::buffer::{ByteBuffer, Reader};
+    use dlms1::ic::InterfaceClass;
+
+    const CONF: Conformance = Conformance([0x00, 0x7E, 0x1F]);
+    static NO_OBJECTS: &[&dyn InterfaceClass] = &[];
 
     #[test]
     fn wrapper_put_get_roundtrip() {
-        let mut setting = WrapperSetting::new(0);
-        setting.set_destination_port(0x1234);
+        let setting = Wrapper::new(0, 0x1234);
 
         let apdu = [0x0F, 0x01, 0x02, 0x03];
         let mut backing = [0u8; 64];
         let n = {
             let mut buf = ByteBuffer::new(&mut backing);
-            setting.put(&apdu, &mut buf).unwrap()
+            setting.put(&mut buf, |b| b.write(&apdu)).unwrap()
         };
 
         let mut reader = Reader::new(&backing[..n]);
-        let decoded = WrapperSetting::get(&mut reader).unwrap();
+        let decoded = Wrapper::get(&mut reader).unwrap();
         assert_eq!(decoded.apdu_len() as usize, apdu.len());
         assert_eq!(decoded.destination_port(), 0x1234);
         assert_eq!(decoded.source_port(), 0);
         assert_eq!(reader.read(decoded.apdu_len() as usize).unwrap(), &apdu[..]);
+    }
+
+    /// RLRQ (release-request) → RLRE (normal) + признак освобождения ассоциации.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_handles_rlrq() {
+        let mut server: Server = Server::new(NO_OBJECTS, CONF);
+        server.set_wport(1);
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+        // Состояние после AARQ: src=сервер(1) → dst=клиент(16).
+        session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+
+        // RLRQ APDU (reason normal).
+        let mut backing = [0u8; 16];
+        let apdu_n = {
+            let mut b = ByteBuffer::new(&mut backing);
+            RLRQapdu {
+                reason: Some(ReleaseRequestReason::Normal),
+                user_information: None,
+            }
+            .put(&mut b)
+            .unwrap()
+        };
+        session.rx_mut()[..apdu_n].copy_from_slice(&backing[..apdu_n]);
+        session.set_rx_len(apdu_n);
+
+        // Должен вернуть false (освобождение) и записать RLRE в tx.
+        assert!(!server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+
+        // Ответ: WPDU-заголовок + RLRE.
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        match ACSEApdu::get(&mut Reader::new(apdu)).unwrap() {
+            ACSEApdu::Rlre(r) => assert_eq!(r.reason, Some(ReleaseResponseReason::Normal)),
+            other => panic!("expected RLRE, got {other:?}"),
+        }
+    }
+
+    /// AARQ → AARE + Session.state = Associated.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_handles_aarq() {
+        use crate::AssociationState;
+        use cosempdu::acse::{AARQapdu, ApplicationContextName, AssociationResult};
+        use cosempdu::apdu_sn::InitiateRequest;
+
+        let mut server: Server = Server::new(NO_OBJECTS, CONF);
+        server.set_wport(1);
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+
+        // AARQ APDU.
+        let req = InitiateRequest {
+            dedicated_key: None,
+            response_allowed: true,
+            proposed_quality_of_service: None,
+            proposed_dlms_version_number: 6,
+            proposed_conformance: CONF,
+            client_max_receive_pdu_size: 1200,
+        };
+        let mut ui = [0u8; 64];
+        let n = req.put(&mut ByteBuffer::new(&mut ui)).unwrap();
+        let mut aarq = AARQapdu::new(ApplicationContextName::LogicalNameNoCiphering);
+        aarq.user_information = Some(&ui[..n]);
+        let mut apdu = [0u8; 256];
+        let m = aarq.put(&mut ByteBuffer::new(&mut apdu)).unwrap();
+        session.rx_mut()[..m].copy_from_slice(&apdu[..m]);
+        session.set_rx_len(m);
+
+        // received: клиент (src=16) → сервер (dst=1).
+        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        assert_eq!(session.state(), AssociationState::Associated);
+
+        // Ответ: AARE (accepted).
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        match ACSEApdu::get(&mut Reader::new(apdu)).unwrap() {
+            ACSEApdu::Aare(a) => assert_eq!(a.result, AssociationResult::Accepted),
+            other => panic!("expected AARE, got {other:?}"),
+        }
+    }
+
+    /// Неизвестный APDU-тег (LN) → ExceptionResponse (service-unknown, operation-not-possible).
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_handles_unknown_tag_ln() {
+        use cosempdu::apdu::{ExceptionResponse, ServiceError, StateError};
+
+        let mut server: Server = Server::new(NO_OBJECTS, CONF);
+        server.set_wport(1);
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+        session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+
+        // Тег [2] context-specific primitive — не GetRequest/SetRequest/ACSE.
+        session.rx_mut()[0] = 0x82;
+        session.set_rx_len(1);
+
+        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        let exc = ExceptionResponse::get(&mut Reader::new(apdu)).unwrap();
+        assert_eq!(exc.state_error, StateError::ServiceUnknown);
+        assert_eq!(exc.service_error, ServiceError::OperationNotPossible);
+    }
+
+    /// Неизвестный APDU-тег (SN) → ConfirmedServiceError (read, definition: other).
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_handles_unknown_tag_sn() {
+        use cosempdu::acse::ApplicationContextName;
+        use cosempdu::apdu_sn::{confirmed_service_error_tag, ConfirmedServiceError, Definition, ServiceError};
+
+        let mut server: Server = Server::new(NO_OBJECTS, CONF);
+        server.set_wport(1);
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+        session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+        session.set_application_context(ApplicationContextName::ShortNameNoCiphering);
+
+        session.rx_mut()[0] = 0x82;
+        session.set_rx_len(1);
+
+        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        let cse = ConfirmedServiceError::get(&mut Reader::new(apdu)).unwrap();
+        assert_eq!(cse.tag, confirmed_service_error_tag::READ);
+        assert_eq!(cse.service_error, ServiceError::Definition(Definition::Other));
+    }
+
+    /// Set-Request::Normal → значение применяется к атрибуту, в ответе — null-data.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_handles_set() {
+        use crate::{Access, AccessMask};
+        use cosempdu::apdu::{CosemAttributeDescriptor, DataAccessResult, InvokeIdAndPriority, SetRequest, SetResponse};
+        use dlms1::common_data_types::DoubleLongUnsigned;
+        use dlms1::ic::Register;
+        use dlms1::obis::ObisCode;
+
+        static REG_OBJ: Register = Register::new(ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL);
+        static OBJECTS: &[&dyn InterfaceClass] = &[&REG_OBJ];
+
+        let mut server: Server = Server::new(OBJECTS, CONF);
+        server.set_wport(1);
+        let mut register = DoubleLongUnsigned(0);
+        server
+            .add_persistent(
+                REG_OBJ.value(),
+                &mut register,
+                Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+            )
+            .unwrap();
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+        session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+
+        // Set-Request::Normal: value = DoubleLongUnsigned(7).
+        let invoke = InvokeIdAndPriority::from_bits(2, true, false);
+        let descriptor = CosemAttributeDescriptor {
+            class_id: REG_OBJ.class_id().as_u16(),
+            instance_id: REG_OBJ.obis().bytes,
+            attribute_id: 2,
+        };
+        let value = DoubleLongUnsigned(7);
+        let mut backing = [0u8; 128];
+        let apdu_n = {
+            let mut b = ByteBuffer::new(&mut backing);
+            SetRequest::put_normal(invoke, descriptor, None, &value, &mut b).unwrap()
+        };
+        session.rx_mut()[..apdu_n].copy_from_slice(&backing[..apdu_n]);
+        session.set_rx_len(apdu_n);
+
+        // Обработать: вернуть true (продолжать), атрибут обновлён.
+        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        assert_eq!(register.0, 7);
+
+        // Ответ: SetResponse::Normal (success).
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        match SetResponse::get(&mut Reader::new(apdu)).unwrap() {
+            SetResponse::Normal { invoke, result: DataAccessResult::Success } => {
+                assert_eq!(invoke.invoke_id(), 2);
+            }
+            other => panic!("expected SetResponse::Normal with success, got {other:?}"),
+        }
+    }
+
+    /// Set-Request на read-only атрибут → SetResponse::Normal с ReadWriteDenied (не прерывает).
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_handles_set_readonly() {
+        use crate::{Access, AccessMask};
+        use cosempdu::apdu::{CosemAttributeDescriptor, DataAccessResult, InvokeIdAndPriority, SetRequest, SetResponse};
+        use dlms1::common_data_types::DoubleLongUnsigned;
+        use dlms1::ic::Register;
+        use dlms1::obis::ObisCode;
+
+        static REG_OBJ: Register = Register::new(ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL);
+        static OBJECTS: &[&dyn InterfaceClass] = &[&REG_OBJ];
+
+        let mut server: Server = Server::new(OBJECTS, CONF);
+        server.set_wport(1);
+        let register = DoubleLongUnsigned(0);
+        server
+            .add_static(
+                REG_OBJ.value(),
+                &register,
+                Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+            )
+            .unwrap();
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+        session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+
+        // Set-Request::Normal: value = DoubleLongUnsigned(7).
+        let invoke = InvokeIdAndPriority::from_bits(2, true, false);
+        let descriptor = CosemAttributeDescriptor {
+            class_id: REG_OBJ.class_id().as_u16(),
+            instance_id: REG_OBJ.obis().bytes,
+            attribute_id: 2,
+        };
+        let value = DoubleLongUnsigned(7);
+        let mut backing = [0u8; 128];
+        let apdu_n = {
+            let mut b = ByteBuffer::new(&mut backing);
+            SetRequest::put_normal(invoke, descriptor, None, &value, &mut b).unwrap()
+        };
+        session.rx_mut()[..apdu_n].copy_from_slice(&backing[..apdu_n]);
+        session.set_rx_len(apdu_n);
+
+        // Обработать: не прерывать (true); в ответе — ReadWriteDenied.
+        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        match SetResponse::get(&mut Reader::new(apdu)).unwrap() {
+            SetResponse::Normal { invoke, result: DataAccessResult::ReadWriteDenied } => {
+                assert_eq!(invoke.invoke_id(), 2);
+            }
+            other => panic!("expected SetResponse::Normal with ReadWriteDenied, got {other:?}"),
+        }
     }
 }
 

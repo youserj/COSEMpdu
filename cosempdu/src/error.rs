@@ -102,8 +102,11 @@ pub enum Error {
     /// Composite nesting exceeded the maximum supported depth.
     NestingTooDeep,
 
+    WrongAssociationResult{ actual: u8 },
+    
     /// A message without any dynamic data.
     Message(&'static str),
+    
 }
 
 /// Convenience result alias used throughout the crate.
@@ -171,6 +174,7 @@ impl core::fmt::Display for Error {
             Error::InvalidLengthEncoding => write!(f, "invalid variable-length integer encoding"),
             Error::InternalState => write!(f, "decoder internal state error"),
             Error::NestingTooDeep => write!(f, "composite nesting too deep"),
+            Error::WrongAssociationResult { actual } => {write!(f, "invalid Association-result: {actual}")},
             Error::Message(msg) => write!(f, "{msg}"),
         }
     }

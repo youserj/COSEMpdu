@@ -10,15 +10,10 @@
       (`AttributeInfo.default`). Реализация под железо — позже.
 - [ ] **Асинхронный NVM.** `load`/`save`/`commit` станут `async fn` — Tokio
       (desktop) / Embassy (embedded).
-- [ ] **Обработка GET/SET-запросов.** Привязать `cosempdu::apdu`
-      (`GetRequest`/`SetRequest`) к `Server`: разбор → `ClassId` + `ObisCode` +
-      attribute_id → `put`/`set` → ответный APDU.
+- [ ] **Диспетчеризация SET/ACTION.** В цикле обслуживания разобран только GET;
+      `Set-Request` (через `stream_set`) и `Action-Request` ещё не привязаны.
 - [ ] **Методы объектов.** Диспетчеризация методов (Blue Book) с отдельными
       правами на методы — сейчас отложено.
-- [ ] **`#![no_std]` для крейта `server`.** Код уже готов (только `core`).
-- [ ] **Модель конкурентности.** Несколько соединений → несколько буферов
-      обмена (и, вероятно, несколько `ValueRef`).
-- [ ] **Интеграция ACSE/BER транспорта.**
 - [ ] **Тесты на реальных A-XDR значениях** (octet-string, visible-string,
       compact-array).
 
@@ -29,5 +24,13 @@
       `server` хранит атрибуты по отдельности (`Attribute` + `ValueRef`, ключ
       `ObisCode` + attribute_id) и валидирует входящие `class_id` + OBIS по
       статическому каталогу `OBJECTS`.
+- [x] **Обработка GET-запросов.** `Get-Request` (Normal) → `handle_get` →
+      `Get-Response`; декодирование в owned-поля, `get_codec` + проверка `read`.
+- [x] **Поточный SET в `Persistent`.** `stream_set` → `StreamDecoder` → `StreamSink`.
+- [x] **`#![no_std]` для крейта `server`.** `#![cfg_attr(not(feature = "std"), no_std)]`.
+- [x] **Модель конкурентности.** `Session` (с буферами `rx`/`tx`) принадлежит
+      вызывающему; `Server` владеет только реестром/каталогом/пулами.
+- [x] **Интеграция ACSE/BER транспорта.** `accept_association`/`process_request`
+      (AARQ → AARE, RLRQ → RLRE) поверх Wrapper (tcp/ble).
 
 

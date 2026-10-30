@@ -1,9 +1,15 @@
 //! Сессия DLMS/COSEM — общая для всех транспортных каналов.
+//!
+//! `Session` (с буферами `rx`/`tx`) принадлежит **вызывающему** (задаче
+//! соединения или `Server::serve`), а не `Server`: сервер хранит только реестр,
+//! каталог и счётчики слотов, а буферы обмена живут в сессии.
 
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use crate::transport::{Media, TransportRef, MAX_APDU, TRANSPORT_OVERHEAD};
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use cosempdu::apdu_sn::Conformance;
+#[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
+use cosempdu::acse::ApplicationContextName;
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use cosempdu::buffer::{ArrayBuffer, ByteBuffer, Reader};
 
@@ -31,6 +37,9 @@ pub struct Session {
     transport_ref: TransportRef,
     /// Согласованный conformance (результат AARQ/AARE для этой ассоциации).
     conformance: Conformance,
+    /// Согласованный application-context (LN vs SN referencing) — выбирает
+    /// формат error-response для некорректного APDU.
+    application_context: ApplicationContextName,
     state: AssociationState,
     invoke_id: u8,
     rx: ArrayBuffer<RX_BUF>,
@@ -44,6 +53,7 @@ impl Session {
             media,
             transport_ref,
             conformance: Conformance([0; 3]),
+            application_context: ApplicationContextName::LogicalNameNoCiphering,
             state: AssociationState::Idle,
             invoke_id: 0,
             rx: ArrayBuffer::new(),
@@ -58,7 +68,18 @@ impl Session {
     /// разбора WPDU-заголовка).
     pub fn set_transport_ref(&mut self, t: TransportRef) { self.transport_ref = t; }
     pub fn state(&self) -> AssociationState { self.state }
+
+    /// Обновить состояние ассоциации (например, `Associated` после AARQ).
+    pub fn set_state(&mut self, state: AssociationState) { self.state = state; }
+
     pub fn conformance(&self) -> Conformance { self.conformance }
+
+    /// Согласованный application-context (LN vs SN referencing).
+    pub fn application_context(&self) -> ApplicationContextName { self.application_context }
+
+    /// Обновить application-context после согласования AARQ/AARE.
+    pub fn set_application_context(&mut self, ctx: ApplicationContextName) { self.application_context = ctx; }
+
     pub fn invoke_id(&self) -> u8 { self.invoke_id }
 
     /// Накопленные байты приёма (срез до текущей позиции).

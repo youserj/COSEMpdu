@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+static_cell = {version = "2.1"}
 server   = { path = "../server", features = ["tcp"] }
 cosempdu = { path = "../cosempdu" }
 dlms1    = { path = "../DLMS1" }

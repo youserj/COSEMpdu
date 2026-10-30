@@ -52,9 +52,12 @@ pub enum ValueRef<'a> {
 
 pub struct Registry<'a> { /* отсортированный массив (AttributeKey, ValueRef<'a>) + бинарный поиск */ }
 
-pub struct Server<'a> { pub attributes: Registry<'a> }
+pub struct Server<'a, const N: usize = 3> {
+    // каталог COSEM-объектов + реестр атрибутов + conformance + пулы-счётчики
+    // (лимит N); буферы соединения — НЕ здесь, а в `Session` (см. «Транспорт и сессии»)
+}
 
-impl<'a> Server<'a> {
+impl<'a, const N: usize> Server<'a, N> {
     pub fn add_static(&mut self, key, attr: &'a dyn Codec, access: Access) -> Result<(), Error>;
     pub fn add_dynamic(&mut self, key, attr: &'a mut dyn Codec, access: Access) -> Result<(), Error>;
     pub fn add_persistent(&mut self, key, attr: &'a mut dyn Codec, access: Access) -> Result<(), Error>;
@@ -105,6 +108,59 @@ server.add_persistent(key, &mut register, acc)?;
 - **Сервер → клиент (PUT):** `put(key, level, buf)` → проверка `read` → `put` в `ByteBuffer`.
 - `Dynamic` сервер меняет сам (`update` из готового `Data`, без уровня), отдаётся через `put`.
 
+## Транспорт и сессии
+
+Соединение обслуживает **`Session`** — значение с буферами `rx`/`tx` и состоянием
+транспорта (`media`, `transport_ref`, `conformance`, `state`, `invoke_id`).
+**`Session` принадлежит вызывающему** (задаче соединения или `serve`), а не
+`Server`. Поэтому I/O канала читает/пишет в `session.rx`/`session.tx` и **не
+требует `&mut Server`** — мьютекс нужен только на короткую фазу разбора/кодирования.
+
+`Server` хранит только каталог объектов, реестр атрибутов, `proposed_conformance`
+и пулы-счётчики транспортных слотов (лимит `N`).
+
+```rust
+impl<'a, const N: usize> Server<'a, N> {
+    // Жизненный цикл соединения
+    pub fn on_connect(&mut self, media: Media) -> Result<Session, Error>;   // занять слот → Session
+    pub fn on_disconnect(&mut self, media: Media);                          // освободить слот
+
+    // DLMS-слой (без сетевого I/O — читают session.rx, пишут session.tx)
+    pub fn accept_association(&self, session: &mut Session, received: Wrapper) -> Result<(), Error>; // AARQ → AARE + state=Associated
+    pub fn process_request(&mut self, session: &mut Session, received: Wrapper) -> Result<bool, Error>; // AARQ/Get/Set/RLRQ
+
+    // Get-Request (Normal) → Get-Response; принимает декодированные owned-поля
+    pub fn handle_get(&self, invoke: InvokeIdAndPriority, descriptor: CosemAttributeDescriptor, buf: &mut ByteBuffer<'_>) -> Result<usize, Error>;
+
+    // Весь цикл соединения (AARQ/AARE, GET/SET, RLRQ — через process_request)
+    pub async fn serve<C: Channel<Frame = Wrapper>>(&mut self, media: Media, channel: C) -> Result<(), Error>;
+}
+```
+
+Поток на одно соединение:
+
+```
+on_connect(media) -> Session
+      │
+      ▼  (цикл обслуживания: read → process → write)
+channel.read(session.rx_mut())
+process_request(session, received)    // AARQ → AARE / Get / Set / RLRQ в session.tx
+channel.write(session.tx())
+      │  … до RLRQ/таймаута/закрытия/ошибки
+      ▼
+on_disconnect(media)
+```
+
+- Валидация Wrapper-заголовка (`validate_wrapper`) выполняется внутри
+  `accept_association` (вызывается из `process_request` для AARQ) и обновляет
+  порты в `session`; после успешной ассоциации `Session.state = Associated`.
+- `handle_get` декодирует `Get-Request` в owned-`Copy` поля (`InvokeIdAndPriority`,
+  `CosemAttributeDescriptor`) — ссылка на буфер приёма гаснет сразу, поэтому можно
+  одновременно держать `&mut Session` и `&self Server`.
+- `serve` — обёртка `on_connect` → цикл (приватный `handle_request`, включая AARQ)
+  → `on_disconnect` для однопоточного embedded-сценария. `tcp-pc-server` вместо неё
+  делает read/process/write вручную, не удерживая мьютекс на I/O.
+
 ## Валидация и восстановление
 
 - `assign` — декодирует `Data` в конкретный тип и проверяет его (тег для базы,
@@ -151,15 +207,22 @@ pub trait Nvm {
 
 - NVM-бэкенд: dirty-трекинг + `flush()`/async-задача (load/flush/commit), реализация под железо.
 - Асинхронный NVM: `load`/`save`/`commit` → `async fn` (Tokio / Embassy).
-- Обработка GET/SET-запросов: привязать `cosempdu::apdu` к `Server`.
-- Объявить `#![no_std]` на крейте `server`.
-- Модель конкурентности (несколько соединений → несколько буферов обмена).
-- Интеграция ACSE/BER транспорта.
+- Диспетчеризация SET/ACTION в цикле обслуживания (сейчас разобран только GET).
+- Методы объектов (Blue Book) с отдельными правами.
+- Тесты на реальных A-XDR значениях (octet-string, visible-string, compact-array).
+
+## Сделано
+
+- Обработка GET-запросов: `Get-Request` → `handle_get` → `Get-Response` (`process_request`).
+- Поточный SET в `Persistent`: `stream_set` → `StreamDecoder` → `StreamSink`.
+- `#![no_std]` на крейте `server` (`#![cfg_attr(not(feature = "std"), no_std)]`).
+- Модель конкурентности: `Session` (с буферами `rx`/`tx`) принадлежит вызывающему.
+- Интеграция ACSE/BER: `accept_association`/`process_request` (AARQ → AARE, RLRQ → RLRE).
 
 ## Открытые вопросы
 
-- Модель конкурентности: однопоточный `&mut self` vs несколько буферов обмена.
-- Несколько соединений → несколько буферов обмена (и, вероятно, несколько `ValueRef`).
+- Полный SET-диспетч: `stream_set` есть, но разбор `Set-Request` в цикле ещё не привязан.
+- Несколько `ValueRef` на атрибут, если потребуется конкурентный доступ к реестру (сейчас — один).
 
 ## Связанные документы
 

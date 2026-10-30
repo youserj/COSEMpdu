@@ -3,18 +3,22 @@
 //! Принимает TCP-соединения (по умолчанию `127.0.0.1:4059`), конкурентно
 //! обслуживает каждое через `tokio::spawn`: ассоциация (`AARQ` → `AARE`),
 //! затем цикл обработки xDLMS-запросов (GET) до закрытия/таймаута.
+//!
+//! Каждое соединение владеет собственной `Session` (буферы `rx`/`tx`), поэтому
+//! read/process/write идут без удержания мьютекса `Server` на сетевом I/O —
+//! мьютекс берётся только на короткую фазу разбора/кодирования.
 
 use std::sync::Arc;
 use std::time::Duration;
-
+use static_cell::StaticCell;
 use anyhow::{anyhow, Result};
 use cosempdu::apdu_sn::Conformance;
-use cosempdu::buffer::{ByteBuffer, Reader};
+use cosempdu::buffer::Reader;
 use cosempdu::error::Error as CosemError;
-use dlms1::common_data_types::{DoubleLongUnsigned, Unsigned};
-use dlms1::ic::{Clock, InterfaceClass, Register, DataObject};
+use dlms1::common_data_types::{DoubleLongUnsigned, Unsigned, OctetString};
+use dlms1::ic::{Clock, DataObject, InterfaceClass, Register, ScalUnit};
 use dlms1::obis::ObisCode;
-use server::{Access, AccessMask, Channel, Listener, Media, Server, Wrapper, WrapperSetting, RX_BUF};
+use server::{Access, AccessMask, Channel, Listener, Media, Server, Session, Wrapper};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -30,13 +34,16 @@ const SERVER_CONFORMANCE: Conformance = Conformance([0x00, 0x7E, 0x1F]);
 
 /// Каталог COSEM-объектов, доступных серверу (Register + Clock).
 static DATA_OBJ: DataObject = DataObject::new(ObisCode::new(0, 0, 96, 1, 0, 255));
+static DATA_OBJ2: DataObject = DataObject::new(ObisCode::new(0, 0, 96, 1, 1, 255));
 static REG_OBJ: Register = Register::new(ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL);
 static CLOCK_OBJ: Clock = Clock::new(ObisCode::CLOCK);
-static OBJECTS: &[&dyn InterfaceClass] = &[&DATA_OBJ, &REG_OBJ, &CLOCK_OBJ];
+static OBJECTS: &[&dyn InterfaceClass] = &[&DATA_OBJ, &DATA_OBJ2, &REG_OBJ, &CLOCK_OBJ];
 
 /// Значение атрибута `value` регистра (read-only, 100).
-static DATA_VALUE: Unsigned = Unsigned(1);
+static DATA_VALUE: StaticCell<Unsigned> = StaticCell::new();
+static DATA_VALUE2: OctetString<10> = OctetString::new(b"hello");
 static REG_VALUE: DoubleLongUnsigned = DoubleLongUnsigned(100);
+static REG_SU: ScalUnit = ScalUnit::new(3, 10);
 
 /// TCP-канал поверх tokio: читает/пишет полный WPDU (Wrapper-фрейминг).
 ///
@@ -68,25 +75,24 @@ impl TcpChannel {
 }
 
 impl Channel for TcpChannel {
-    type Frame = WrapperSetting;
+    type Frame = Wrapper;
 
-    async fn read(&mut self, buf: &mut [u8]) -> Result<WrapperSetting, CosemError> {
-        // Wrapper-заголовок (8 байт) — сразу в buf. `read_exact` сам дозапрашивает,
-        // если сегмент пришёл частями (< 8 байт).
+    async fn read(&mut self, buf: &mut [u8]) -> Result<Wrapper, CosemError> {
+        // Wrapper-заголовок (8 байт) — сразу в buf; затем APDU перезапишет его.
         if buf.len() < 8 {
-            return Err(CosemError::NotEnoughSpace { needed: 8 });
+            return Err(CosemError::ByteBufferError(cosempdu::buffer::Error::NotEnoughSpace { needed: 8 }));
         }
         self.read_exact_timeout(&mut buf[..8]).await?;
 
-        // Длина APDU из заголовка.
-        let setting = WrapperSetting::get(&mut Reader::new(&buf[..8]))?;
-        let total = 8 + setting.apdu_len() as usize;
-        if total > buf.len() {
-            return Err(CosemError::NotEnoughSpace { needed: total });
+        // Разбираем заголовок, чтобы узнать длину APDU.
+        let setting = Wrapper::get(&mut Reader::new(&buf[..8]))?;
+        let apdu_len = setting.apdu_len() as usize;
+        if apdu_len > buf.len() {
+            return Err(CosemError::ByteBufferError(cosempdu::buffer::Error::NotEnoughSpace { needed: apdu_len }));
         }
 
-        // APDU — сразу в buf[8..total].
-        self.read_exact_timeout(&mut buf[8..total]).await?;
+        // APDU — в начало buf (перезаписываем заголовок).
+        self.read_exact_timeout(&mut buf[..apdu_len]).await?;
         Ok(setting)
     }
 
@@ -127,8 +133,19 @@ async fn main() -> Result<()> {
         Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
     )?;
     server.add_static(
+        REG_OBJ.scaler_unit(),
+        &REG_SU,
+        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+    )?;
+    let data_value = DATA_VALUE.init(Unsigned(1));
+    server.add_persistent(
         DATA_OBJ.value(),
-        &DATA_VALUE,
+        data_value,
+        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+    )?;
+    server.add_static(
+        DATA_OBJ2.value(),
+        &DATA_VALUE2,
         Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
     )?;
     let server = Arc::new(Mutex::new(server));
@@ -154,63 +171,70 @@ async fn handle_connection(
     server: Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
     mut channel: TcpChannel,
 ) -> Result<()> {
-    let idx = server.lock().await.on_connect(Media::Tcp)?;
+    // Сессия (с буферами rx/tx) принадлежит этой задаче соединения.
+    let mut session = server.lock().await.on_connect(Media::Tcp)?;
 
     // Ассоциация (разовый обмен AARQ → AARE).
-    if let Err(e) = associate_session(&server, idx, &mut channel).await {
-        server.lock().await.on_disconnect(idx);
+    if let Err(e) = associate_session(&server, &mut session, &mut channel).await {
+        server.lock().await.on_disconnect(session.media());
         return Err(e);
     }
 
-    // Цикл обслуживания xDLMS-запросов; выходим по таймауту/закрытию/ошибке.
+    // Цикл обслуживания xDLMS-запросов; выходим по RLRQ/таймауту/закрытию/ошибке.
     let result = loop {
-        match request_session(&server, idx, &mut channel).await {
-            Ok(()) => {}
+        match request_session(&server, &mut session, &mut channel).await {
+            Ok(true) => {}
+            Ok(false) => break Ok(()),
             Err(e) => break Err(e),
         }
     };
 
-    // Всегда освобождаем сессию (сброс в Idle): и при успехе, и при таймауте/ошибке.
-    server.lock().await.on_disconnect(idx);
+    // Всегда освобождаем транспортный слот.
+    server.lock().await.on_disconnect(session.media());
     result
 }
 
-/// Ассоциация (AARQ → AARE) на выделенной сессии, с блокировкой сервера.
+/// Ассоциация (AARQ → AARE): read в session.rx (без мьютекса) → accept (короткий
+/// мьютекс, без I/O) → write из session.tx (без мьютекса).
 async fn associate_session(
     server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
-    idx: usize,
+    session: &mut Session,
     channel: &mut TcpChannel,
 ) -> Result<()> {
-    let mut srv = server.lock().await;
-    srv.associate(idx, channel)
-        .await
-        .map_err(|e| anyhow!("associate: {e:?}"))
+    let received = channel.read(session.rx_mut()).await.map_err(|e| anyhow!("read: {e:?}"))?;
+    session.set_rx_len(received.apdu_len() as usize);
+
+    {
+        let srv = server.lock().await;
+        srv.accept_association(session, received)
+            .map_err(|e| anyhow!("associate: {e:?}"))?;
+    }
+
+    channel.write(session.tx()).await.map_err(|e| anyhow!("write: {e:?}"))?;
+    session.clear_rx();
+    Ok(())
 }
 
-/// Обработка одного xDLMS-запроса (GET): read без мьютекса → process под
-/// мьютексом (без сетевого I/O) → write без мьютекса.
+/// Обработка одного xDLMS-запроса (GET/RLRQ): read в session.rx (без мьютекса) →
+/// process (короткий мьютекс, без I/O) → write из session.tx (без мьютекса).
+/// Возвращает `Ok(false)`, если получен RLRQ (ассоциация освобождена).
 async fn request_session(
     server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
-    idx: usize,
+    session: &mut Session,
     channel: &mut TcpChannel,
-) -> Result<()> {
-    // 1) Читаем WPDU, не удерживая мьютекс (блокирующее ожидание).
-    let mut request = [0u8; RX_BUF];
-    let received = channel.read(&mut request).await.map_err(|e| anyhow!("read: {e:?}"))?;
-    let request_len = 8 + received.apdu_len() as usize;
+) -> Result<bool> {
+    let received = channel.read(session.rx_mut()).await.map_err(|e| anyhow!("read: {e:?}"))?;
+    session.set_rx_len(received.apdu_len() as usize);
 
-    // 2) Обрабатываем под мьютексом (короткая фаза, без сетевого I/O).
-    let mut response = [0u8; RX_BUF];
-    let n = {
+    let keep = {
         let mut srv = server.lock().await;
-        let mut b = ByteBuffer::new(&mut response);
-        srv.process_request(idx, received, &request[..request_len], &mut b)
+        srv.process_request(session, received)
             .map_err(|e| anyhow!("request: {e:?}"))?
     };
 
-    // 3) Отправляем ответ, не удерживая мьютекс.
-    channel.write(&response[..n]).await.map_err(|e| anyhow!("write: {e:?}"))?;
-    Ok(())
+    channel.write(session.tx()).await.map_err(|e| anyhow!("write: {e:?}"))?;
+    session.clear_rx();
+    Ok(keep)
 }
 
 #[cfg(test)]
@@ -250,13 +274,10 @@ mod tests {
         let m = aarq.put(&mut ByteBuffer::new(&mut aarq_bytes)).unwrap();
 
         // Клиент: source_port = свой (1), destination_port = сервера (1).
-        let mut setting = WrapperSetting::new(1);
-        setting.set_destination_port(1);
+        let setting = Wrapper::new(1, 1);
         let mut wpdu = vec![0u8; 8 + m];
-        let k = setting
-            .put(&aarq_bytes[..m], &mut ByteBuffer::new(&mut wpdu))
-            .unwrap();
-        wpdu.truncate(k);
+        let mut buf = ByteBuffer::new(&mut wpdu);
+        setting.put(&mut buf, |b| b.write(&aarq_bytes[..m])).unwrap();
         wpdu
     }
 
@@ -273,11 +294,10 @@ mod tests {
             .unwrap();
 
         // Клиент: source_port = 16, destination_port = 1 (порт сервера).
-        let mut setting = WrapperSetting::new(16);
-        setting.set_destination_port(1);
+        let setting = Wrapper::new(16, 1);
         let mut wpdu = vec![0u8; 8 + n];
-        let k = setting.put(&apdu[..n], &mut ByteBuffer::new(&mut wpdu)).unwrap();
-        wpdu.truncate(k);
+        let mut buf = ByteBuffer::new(&mut wpdu);
+        setting.put(&mut buf, |b| b.write(&apdu[..n])).unwrap();
         wpdu
     }
 
@@ -304,7 +324,7 @@ mod tests {
 
         let mut header = [0u8; 8];
         socket.read_exact(&mut header).await.unwrap();
-        let setting = WrapperSetting::get(&mut Reader::new(&header)).unwrap();
+        let setting = Wrapper::get(&mut Reader::new(&header)).unwrap();
         let mut apdu = vec![0u8; setting.apdu_len() as usize];
         socket.read_exact(&mut apdu).await.unwrap();
 
@@ -347,7 +367,7 @@ mod tests {
         socket.write_all(&wpdu).await.unwrap();
         let mut header = [0u8; 8];
         socket.read_exact(&mut header).await.unwrap();
-        let setting = WrapperSetting::get(&mut Reader::new(&header)).unwrap();
+        let setting = Wrapper::get(&mut Reader::new(&header)).unwrap();
         let mut aare = vec![0u8; setting.apdu_len() as usize];
         socket.read_exact(&mut aare).await.unwrap();
         let acse = ACSEApdu::get(&mut Reader::new(&aare)).unwrap();
@@ -361,7 +381,7 @@ mod tests {
         socket.write_all(&get_wpdu).await.unwrap();
         let mut header = [0u8; 8];
         socket.read_exact(&mut header).await.unwrap();
-        let setting = WrapperSetting::get(&mut Reader::new(&header)).unwrap();
+        let setting = Wrapper::get(&mut Reader::new(&header)).unwrap();
         let mut resp = vec![0u8; setting.apdu_len() as usize];
         socket.read_exact(&mut resp).await.unwrap();
 
@@ -386,7 +406,7 @@ mod tests {
 
         let mut header = [0u8; 8];
         socket.read_exact(&mut header).await.unwrap();
-        let setting = WrapperSetting::get(&mut Reader::new(&header)).unwrap();
+        let setting = Wrapper::get(&mut Reader::new(&header)).unwrap();
         let mut apdu = vec![0u8; setting.apdu_len() as usize];
         socket.read_exact(&mut apdu).await.unwrap();
 

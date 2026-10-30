@@ -14,7 +14,7 @@
 use bytebuffer::ByteBuffer;
 use crate::error::{Error, Result};
 use crate::x680::Tag;
-use crate::x690::{put_length, put_tag};
+use crate::x690::{Length};
 
 // ---------------------------------------------------------------------------
 // Low-level byte helpers (tag/length encoding into plain vectors)
@@ -22,8 +22,8 @@ use crate::x690::{put_length, put_tag};
 
 /// Build a full TLV encoding (tag + length + content) directly into the buffer.
 pub fn put_tlv(buf: &mut ByteBuffer<'_>, tag: &Tag, content: &[u8]) -> Result<usize> {
-    let mut written = put_tag(buf, tag)?;
-    written += put_length(buf, content.len() as i64)?;
+    let mut written = tag.put(buf)?;
+    written += Length::new(content.len() as i64)?.put(buf)?;
     written += buf.write(content)?;
     Ok(written)
 }
@@ -45,6 +45,10 @@ pub fn put_signed(buf: &mut ByteBuffer<'_>, value: i64) -> Result<usize> {
     Ok(buf.write(&be[16 - num_bytes..])?)
 }
 
+pub fn put_u8(buf: &mut ByteBuffer<'_>, value: u8) -> Result<usize> {
+    Ok(buf.put_u8(value)?)
+}
+
 /// Decode big-endian two's-complement content octets into an `i64`.
 pub fn decode_signed(content: &[u8]) -> Result<i64> {
     if content.is_empty() {
@@ -59,6 +63,17 @@ pub fn decode_signed(content: &[u8]) -> Result<i64> {
     Ok(i64::from_be_bytes(buf))
 }
 
+/// Decode big-endian two's-complement content octets into an `u8`.
+pub fn decode_u8(content: &[u8]) -> Result<u8> {
+    if content.is_empty() {
+        return Err(Error::IntegerEmpty);
+    }
+    if content.len() != 1 {
+        return Err(Error::IntegerTooWide { len: content.len() });
+    }
+    Ok(content[0])
+}
+
 /// Write a tag + length prefix, invoke `f` to write the content into the
 /// reserved region, then backfill the length (X.690 §8.1.3).
 ///
@@ -70,7 +85,7 @@ pub fn with_content(
     f: impl FnOnce(&mut ByteBuffer<'_>) -> Result<usize>,
 ) -> Result<usize> {
     let start = buf.pos();
-    let tag_len = put_tag(buf, tag)?;
+    let tag_len = tag.put(buf)?;
     buf.put_u8(0)?; // placeholder length octet
     let content_start = buf.pos();
     let content_len = f(buf)?;

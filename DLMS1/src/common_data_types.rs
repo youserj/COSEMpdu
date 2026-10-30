@@ -141,7 +141,7 @@ macro_rules! string_type {
                     Data::$variant(s) => {
                         let b = s.as_bytes();
                         if b.len() > N {
-                            return Err(cosempdu::Error::InputTooLarge { len: b.len(), max: N });
+                            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: b.len(), max: N }));
                         }
                         self.buf[..b.len()].copy_from_slice(b);
                         self.len = b.len();
@@ -162,7 +162,7 @@ macro_rules! string_type {
         impl<const N: usize> StreamSink for $name<N> {
             fn blob_begin(&mut self, _tag: u8, len: usize) -> cosempdu::Result<()> {
                 if len > N {
-                    return Err(cosempdu::Error::InputTooLarge { len, max: N });
+                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len, max: N }));
                 }
                 self.len = len;
                 Ok(())
@@ -171,7 +171,7 @@ macro_rules! string_type {
             fn blob_write(&mut self, bytes: &[u8], _index: usize, offset: usize) -> cosempdu::Result<()> {
                 let end = offset + bytes.len();
                 if end > N {
-                    return Err(cosempdu::Error::InputTooLarge { len: end, max: N });
+                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: N }));
                 }
                 self.buf[offset..end].copy_from_slice(bytes);
                 Ok(())
@@ -259,15 +259,48 @@ impl StreamSink for DateTime {
 }
 
 /// `octet-string` of up to `N` bytes (variable length).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct OctetString<const N: usize> {
     pub buf: [u8; N],
-    pub len: usize,
+    len: usize,
 }
-
+impl<const N: usize> OctetString<N> {
+    pub const fn new(data: &[u8]) -> Self {
+        assert!(data.len() <= N);   // compile-time проверка при использовании в static
+        let mut buf = [0u8; N];
+        let mut i = 0;
+        while i < data.len() {
+            buf[i] = data[i];
+            i += 1;
+        }
+        Self { buf, len: data.len() }
+    }
+    pub fn try_new(data: &[u8]) -> cosempdu::Result<Self> {
+        if data.len() > N {
+            return Err(cosempdu::Error::Message("overload octet-string"));  // TODO: make other separate Error
+        }
+        Ok(Self::new(data))   // new уже безопасен после проверки
+    }
+}
 impl<const N: usize> Default for OctetString<N> {
     fn default() -> Self {
         OctetString { buf: [0; N], len: 0 }
+    }
+}
+
+impl<const N: usize> PartialEq for OctetString<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.buf[..self.len] == other.buf[..other.len]
+    }
+}
+impl<const N: usize> Eq for OctetString<N> {}
+
+impl<const N: usize> core::fmt::Debug for OctetString<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OctetString")
+            .field("data", &&self.buf[..self.len])
+            .field("len", &self.len)
+            .finish()
     }
 }
 
@@ -280,7 +313,7 @@ impl<const N: usize> Codec for OctetString<N> {
         match data {
             Data::OctetString(b) => {
                 if b.len() > N {
-                    return Err(cosempdu::Error::InputTooLarge { len: b.len(), max: N });
+                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: b.len(), max: N }));
                 }
                 self.buf[..b.len()].copy_from_slice(b);
                 self.len = b.len();
@@ -301,7 +334,7 @@ impl<const N: usize> Codec for OctetString<N> {
 impl<const N: usize> StreamSink for OctetString<N> {
     fn blob_begin(&mut self, _tag: u8, len: usize) -> cosempdu::Result<()> {
         if len > N {
-            return Err(cosempdu::Error::InputTooLarge { len, max: N });
+            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len, max: N }));
         }
         self.len = len;
         Ok(())
@@ -310,7 +343,7 @@ impl<const N: usize> StreamSink for OctetString<N> {
     fn blob_write(&mut self, bytes: &[u8], _index: usize, offset: usize) -> cosempdu::Result<()> {
         let end = offset + bytes.len();
         if end > N {
-            return Err(cosempdu::Error::InputTooLarge { len: end, max: N });
+            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: N }));
         }
         self.buf[offset..end].copy_from_slice(bytes);
         Ok(())
@@ -365,7 +398,7 @@ impl<const N: usize> StreamSink for OctetStringSized<N> {
     fn blob_write(&mut self, bytes: &[u8], _index: usize, offset: usize) -> cosempdu::Result<()> {
         let end = offset + bytes.len();
         if end > N {
-            return Err(cosempdu::Error::InputTooLarge { len: end, max: N });
+            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: N }));
         }
         self.0[offset..end].copy_from_slice(bytes);
         Ok(())
@@ -493,7 +526,7 @@ impl<const N: usize> Codec for BitString<N> {
     fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
         let num_octets = self.bit_len.div_ceil(8);
         if num_octets > N {
-            return Err(cosempdu::Error::InputTooLarge { len: num_octets, max: N });
+            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: num_octets, max: N }));
         }
         Data::BitString {
             bytes: &self.bytes[..num_octets],
@@ -506,7 +539,7 @@ impl<const N: usize> Codec for BitString<N> {
         match data {
             Data::BitString { bytes, bit_len } => {
                 if bytes.len() > N {
-                    return Err(cosempdu::Error::InputTooLarge { len: bytes.len(), max: N });
+                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: bytes.len(), max: N }));
                 }
                 self.bytes[..bytes.len()].copy_from_slice(bytes);
                 self.bit_len = *bit_len;
@@ -555,10 +588,10 @@ impl<const N: usize> Codec for CompactArray<N> {
                 array_contents,
             } => {
                 if array_contents.len() > N {
-                    return Err(cosempdu::Error::InputTooLarge {
+                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge {
                         len: array_contents.len(),
                         max: N,
-                    });
+                    }));
                 }
                 self.contents_description = *contents_description;
                 self.array_contents[..array_contents.len()].copy_from_slice(array_contents);

@@ -462,6 +462,56 @@ impl<'a> GetRequest<'a> {
     }
 }
 
+/// Data-Access-Result ::= ENUMERATED (single byte, no tag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DataAccessResult {
+    Success = 0,
+    HardwareFault = 1,
+    TemporaryFailure = 2,
+    ReadWriteDenied = 3,
+    ObjectUndefined = 4,
+    ObjectClassInconsistent = 9,
+    ObjectUnavailable = 11,
+    TypeUnmatched = 12,
+    ScopeOfAccessViolated = 13,
+    DataBlockUnavailable = 14,
+    LongGetAborted = 15,
+    NoLongGetInProgress = 16,
+    LongSetAborted = 17,
+    NoLongSetInProgress = 18,
+    DataBlockNumberInvalid = 19,
+    OtherReason = 250,
+}
+
+impl DataAccessResult {
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        Ok(buf.put_u8(*self as u8)?)
+    }
+
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        Ok(match buf.get_u8()? {
+            0 => Self::Success,
+            1 => Self::HardwareFault,
+            2 => Self::TemporaryFailure,
+            3 => Self::ReadWriteDenied,
+            4 => Self::ObjectUndefined,
+            9 => Self::ObjectClassInconsistent,
+            11 => Self::ObjectUnavailable,
+            12 => Self::TypeUnmatched,
+            13 => Self::ScopeOfAccessViolated,
+            14 => Self::DataBlockUnavailable,
+            15 => Self::LongGetAborted,
+            16 => Self::NoLongGetInProgress,
+            17 => Self::LongSetAborted,
+            18 => Self::NoLongSetInProgress,
+            19 => Self::DataBlockNumberInvalid,
+            250 => Self::OtherReason,
+            _ => return Err(Error::Message("unknown data-access-result")),
+        })
+    }
+}
+
 /// Get-Data-Result ::= CHOICE { data [0], data-access-error [1] }.
 ///
 /// # Read/write asymmetry — when is a `put_data` helper necessary?
@@ -482,7 +532,7 @@ impl<'a> GetRequest<'a> {
 pub enum GetDataResult<'a> {
     /// Raw A-XDR bytes of the `data` value (zero-copy).
     Data(Reader<'a>),
-    DataAccessError(u8),
+    DataAccessError(DataAccessResult),
 }
 
 impl<'a> GetDataResult<'a> {
@@ -494,16 +544,16 @@ impl<'a> GetDataResult<'a> {
     }
 
     /// Encode the `data-access-error` alternative: CHOICE tag `1` + error code.
-    pub fn put_access_error(code: u8, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put_access_error(code: DataAccessResult, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         let mut written = buf.put_u8(1)?;
-        written += buf.put_u8(code)?;
+        written += code.put(buf)?;
         Ok(written)
     }
 
     fn get(buf: &mut Reader<'a>) -> Result<Self> {
         match buf.get_u8()? {
             0 => Ok(GetDataResult::Data(data_value(buf)?)),
-            1 => Ok(GetDataResult::DataAccessError(buf.get_u8()?)),
+            1 => Ok(GetDataResult::DataAccessError(DataAccessResult::get(buf)?)),
             t => Err(Error::UnknownChoice { name: "Get-Data-Result", choice: t }),
         }
     }
@@ -513,7 +563,7 @@ impl<'a> GetDataResult<'a> {
 #[derive(Clone, Copy)]
 pub enum GetDataResultWrite<'a> {
     Data(&'a dyn Codec),
-    DataAccessError(u8),
+    DataAccessError(DataAccessResult),
 }
 
 impl GetDataResultWrite<'_> {
@@ -529,7 +579,7 @@ impl GetDataResultWrite<'_> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataBlockGResult<'a> {
     RawData(&'a [u8]),
-    DataAccessError(u8),
+    DataAccessError(DataAccessResult),
 }
 
 impl<'a> DataBlockGResult<'a> {
@@ -542,7 +592,7 @@ impl<'a> DataBlockGResult<'a> {
             }
             DataBlockGResult::DataAccessError(code) => {
                 let mut written = buf.put_u8(1)?;
-                written += buf.put_u8(*code)?;
+                written += code.put(buf)?;
                 Ok(written)
             }
         }
@@ -551,7 +601,7 @@ impl<'a> DataBlockGResult<'a> {
     fn get(buf: &mut Reader<'a>) -> Result<Self> {
         match buf.get_u8()? {
             0 => Ok(DataBlockGResult::RawData(crate::axdr::get_octet_string(buf)?)),
-            1 => Ok(DataBlockGResult::DataAccessError(buf.get_u8()?)),
+            1 => Ok(DataBlockGResult::DataAccessError(DataAccessResult::get(buf)?)),
             t => Err(Error::UnknownChoice { name: "DataBlock-G.result", choice: t }),
         }
     }
@@ -967,12 +1017,49 @@ impl<'a> SetRequest<'a> {
     }
 }
 
+/// Lazily-decoded list of [`DataAccessResult`] (zero allocation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DataAccessResultList<'a> {
+    count: usize,
+    buf: Reader<'a>,
+}
+
+impl<'a> DataAccessResultList<'a> {
+    /// Read a `Data-Access-Result` list from `buf`, returning a lazy cursor.
+    pub fn read(buf: &mut Reader<'a>) -> Result<Self> {
+        let count = get_length(buf)?;
+        let start = buf.pos();
+        for _ in 0..count {
+            DataAccessResult::get(buf)?;
+        }
+        let end = buf.pos();
+        Ok(DataAccessResultList { count, buf: Reader::new(buf.read_at(start, end - start)?) })
+    }
+
+    /// Number of elements remaining in the list.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+impl<'a> Iterator for DataAccessResultList<'a> {
+    type Item = Result<DataAccessResult>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(DataAccessResult::get(&mut self.buf))
+    }
+}
+
 /// Set-Response ::= [197] IMPLICIT CHOICE.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetResponse<'a> {
     Normal {
         invoke: InvokeIdAndPriority,
-        result: GetDataResult<'a>,
+        result: DataAccessResult,
     },
     Datablock {
         invoke: InvokeIdAndPriority,
@@ -980,27 +1067,26 @@ pub enum SetResponse<'a> {
     },
     LastDatablock {
         invoke: InvokeIdAndPriority,
-        result: u8,
+        result: DataAccessResult,
         block_number: u32,
     },
     LastDatablockWithList {
         invoke: InvokeIdAndPriority,
-        results: &'a [u8],
         block_number: u32,
     },
     WithList {
         invoke: InvokeIdAndPriority,
-        results: &'a [u8],
+        results: DataAccessResultList<'a>,
     },
 }
 
 impl<'a> SetResponse<'a> {
     const TAG: u8 = 197;
 
-    /// Encode the `normal` alternative from typed values.
+    /// Encode the `normal` alternative.
     pub fn put_normal(
         invoke: InvokeIdAndPriority,
-        result: GetDataResultWrite<'_>,
+        result: DataAccessResult,
         buf: &mut ByteBuffer<'_>,
     ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
@@ -1026,14 +1112,14 @@ impl<'a> SetResponse<'a> {
     /// Encode the `last-datablock` alternative.
     pub fn put_last_datablock(
         invoke: InvokeIdAndPriority,
-        result: u8,
+        result: DataAccessResult,
         block_number: u32,
         buf: &mut ByteBuffer<'_>,
     ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
         written += buf.put_u8(3)?;
         written += invoke.put(buf)?;
-        written += buf.put_u8(result)?;
+        written += result.put(buf)?;
         written += buf.write(&block_number.to_be_bytes())?;
         Ok(written)
     }
@@ -1041,15 +1127,12 @@ impl<'a> SetResponse<'a> {
     /// Encode the `last-datablock-with-list` alternative.
     pub fn put_last_datablock_with_list(
         invoke: InvokeIdAndPriority,
-        results: &[u8],
         block_number: u32,
         buf: &mut ByteBuffer<'_>,
     ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
         written += buf.put_u8(4)?;
         written += invoke.put(buf)?;
-        written += put_length(buf, results.len())?;
-        written += buf.write(results)?;
         written += buf.write(&block_number.to_be_bytes())?;
         Ok(written)
     }
@@ -1057,14 +1140,16 @@ impl<'a> SetResponse<'a> {
     /// Encode the `with-list` alternative.
     pub fn put_with_list(
         invoke: InvokeIdAndPriority,
-        results: &[u8],
+        results: &[DataAccessResult],
         buf: &mut ByteBuffer<'_>,
     ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
         written += buf.put_u8(5)?;
         written += invoke.put(buf)?;
         written += put_length(buf, results.len())?;
-        written += buf.write(results)?;
+        for r in results {
+            written += r.put(buf)?;
+        }
         Ok(written)
     }
 
@@ -1076,42 +1161,28 @@ impl<'a> SetResponse<'a> {
         Ok(match buf.get_u8()? {
             1 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let result = GetDataResult::get(buf)?;
+                let result = DataAccessResult::get(buf)?;
                 SetResponse::Normal { invoke, result }
             }
             2 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
                 let block_number = u32::from_be_bytes(read_n::<4>(buf)?);
-                SetResponse::Datablock {
-                    invoke,
-                    block_number,
-                }
+                SetResponse::Datablock { invoke, block_number }
             }
             3 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let result = buf.get_u8()?;
+                let result = DataAccessResult::get(buf)?;
                 let block_number = u32::from_be_bytes(read_n::<4>(buf)?);
-                SetResponse::LastDatablock {
-                    invoke,
-                    result,
-                    block_number,
-                }
+                SetResponse::LastDatablock { invoke, result, block_number }
             }
             4 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let results = buf.read(n)?;
                 let block_number = u32::from_be_bytes(read_n::<4>(buf)?);
-                SetResponse::LastDatablockWithList {
-                    invoke,
-                    results,
-                    block_number,
-                }
+                SetResponse::LastDatablockWithList { invoke, block_number }
             }
             5 => {
                 let invoke = InvokeIdAndPriority::get(buf)?;
-                let n = get_length(buf)?;
-                let results = buf.read(n)?;
+                let results = DataAccessResultList::read(buf)?;
                 SetResponse::WithList { invoke, results }
             }
             other => return Err(Error::UnknownChoice { name: "Set-Response", choice: other }),
@@ -1489,6 +1560,102 @@ impl<'a> EventNotificationRequest<'a> {
     }
 }
 
+/// State-Error ::= ENUMERATED { service-not-allowed (1), service-unknown (2) }.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StateError {
+    ServiceNotAllowed = 1,
+    ServiceUnknown = 2,
+}
+
+impl StateError {
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        Ok(buf.put_u8(*self as u8)?)
+    }
+
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        match buf.get_u8()? {
+            1 => Ok(Self::ServiceNotAllowed),
+            2 => Ok(Self::ServiceUnknown),
+            _ => Err(Error::Message("unknown state-error")),
+        }
+    }
+}
+
+/// Service-Error ::= CHOICE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceError {
+    /// operation-not-possible [1] IMPLICIT NULL.
+    OperationNotPossible,
+    /// service-not-supported [2] IMPLICIT NULL.
+    ServiceNotSupported,
+    /// other-reason [3] IMPLICIT NULL.
+    OtherReason,
+    /// pdu-too-long [4] IMPLICIT NULL.
+    PduTooLong,
+    /// deciphering-error [5] IMPLICIT NULL.
+    DecipheringError,
+    /// invocation-counter-error [6] IMPLICIT Unsigned32.
+    InvocationCounterError(u32),
+}
+
+impl ServiceError {
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        match *self {
+            ServiceError::OperationNotPossible => Ok(buf.put_u8(1)?),
+            ServiceError::ServiceNotSupported => Ok(buf.put_u8(2)?),
+            ServiceError::OtherReason => Ok(buf.put_u8(3)?),
+            ServiceError::PduTooLong => Ok(buf.put_u8(4)?),
+            ServiceError::DecipheringError => Ok(buf.put_u8(5)?),
+            ServiceError::InvocationCounterError(n) => {
+                let mut written = buf.put_u8(6)?;
+                written += buf.write(&n.to_be_bytes())?;
+                Ok(written)
+            }
+        }
+    }
+
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        match buf.get_u8()? {
+            1 => Ok(Self::OperationNotPossible),
+            2 => Ok(Self::ServiceNotSupported),
+            3 => Ok(Self::OtherReason),
+            4 => Ok(Self::PduTooLong),
+            5 => Ok(Self::DecipheringError),
+            6 => Ok(Self::InvocationCounterError(u32::from_be_bytes(read_n::<4>(buf)?))),
+            t => Err(Error::UnknownChoice { name: "Service-Error", choice: t }),
+        }
+    }
+}
+
+/// Exception-Response ::= [216] IMPLICIT SEQUENCE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionResponse {
+    pub state_error: StateError,
+    pub service_error: ServiceError,
+}
+
+impl ExceptionResponse {
+    const TAG: u8 = 216;
+
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        let mut written = buf.put_u8(Self::TAG)?;
+        written += self.state_error.put(buf)?;
+        written += self.service_error.put(buf)?;
+        Ok(written)
+    }
+
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        let tag = buf.get_u8()?;
+        if tag != Self::TAG {
+            return Err(Error::UnexpectedTag { name: "Exception-Response [216]", actual: tag });
+        }
+        let state_error = StateError::get(buf)?;
+        let service_error = ServiceError::get(buf)?;
+        Ok(ExceptionResponse { state_error, service_error })
+    }
+}
+
 /// XDLMS-APDU ::= CHOICE. Models the LN referencing GET/SET/ACTION services plus
 /// event notification.
 #[derive(Debug, Clone, PartialEq)]
@@ -1511,6 +1678,7 @@ pub enum XDLMSApdu<'a> {
     ActionRequest(ActionRequest<'a>),
     ActionResponse(ActionResponse<'a>),
     EventNotificationRequest(EventNotificationRequest<'a>),
+    ExceptionResponse(ExceptionResponse),
 }
 
 impl<'a> XDLMSApdu<'a> {
@@ -1556,6 +1724,7 @@ impl<'a> XDLMSApdu<'a> {
             Some(ActionRequest::TAG) => Ok(XDLMSApdu::ActionRequest(ActionRequest::get(buf)?)),
             Some(SetResponse::TAG) => Ok(XDLMSApdu::SetResponse(SetResponse::get(buf)?)),
             Some(ActionResponse::TAG) => Ok(XDLMSApdu::ActionResponse(ActionResponse::get(buf)?)),
+            Some(ExceptionResponse::TAG) => Ok(XDLMSApdu::ExceptionResponse(ExceptionResponse::get(buf)?)),
             Some(t) => Err(Error::UnknownTag { name: "xDLMS-APDU", tag: t }),
             None => Err(Error::Message("empty xDLMS-APDU")),
         }
@@ -1707,13 +1876,13 @@ mod tests {
         roundtrip!(
             |buf| GetResponse::put_normal(
                 InvokeIdAndPriority::from_bits(1, true, false),
-                GetDataResultWrite::DataAccessError(11),
+                GetDataResultWrite::DataAccessError(DataAccessResult::ObjectUnavailable),
                 buf,
             ),
             XDLMSApdu::get,
             |d| match d {
                 XDLMSApdu::GetResponse(GetResponse::Normal {
-                    result: GetDataResult::DataAccessError(11),
+                    result: GetDataResult::DataAccessError(DataAccessResult::ObjectUnavailable),
                     ..
                 }) => {}
                 _ => panic!("wrong variant"),
@@ -1804,12 +1973,12 @@ mod tests {
         roundtrip!(
             |buf| SetResponse::put_normal(
                 InvokeIdAndPriority::from_bits(1, true, false),
-                GetDataResultWrite::DataAccessError(0),
+                DataAccessResult::Success,
                 buf,
             ),
             SetResponse::get,
             |d| match d {
-                SetResponse::Normal { result: GetDataResult::DataAccessError(0), .. } => {}
+                SetResponse::Normal { result: DataAccessResult::Success, .. } => {}
                 _ => panic!("wrong variant"),
             }
         );
@@ -1820,7 +1989,7 @@ mod tests {
         roundtrip!(
             |buf| SetResponse::put_with_list(
                 InvokeIdAndPriority::from_bits(1, true, false),
-                &[0, 0],
+                &[DataAccessResult::Success, DataAccessResult::Success],
                 buf,
             ),
             SetResponse::get,
@@ -1924,6 +2093,41 @@ mod tests {
             |d| match d {
                 XDLMSApdu::SetRequest(SetRequest::Normal { value: v, .. }) => {
                     assert_eq!(v.as_bytes(), enc(&TestCodec(Data::Unsigned(9))).as_slice());
+                }
+                _ => panic!("wrong variant"),
+            }
+        );
+    }
+
+    #[test]
+    fn exception_response_roundtrip() {
+        let resp = ExceptionResponse {
+            state_error: StateError::ServiceNotAllowed,
+            service_error: ServiceError::InvocationCounterError(42),
+        };
+        roundtrip!(
+            |buf| resp.put(buf),
+            ExceptionResponse::get,
+            |d: ExceptionResponse| {
+                assert_eq!(d.state_error, StateError::ServiceNotAllowed);
+                assert_eq!(d.service_error, ServiceError::InvocationCounterError(42));
+            }
+        );
+    }
+
+    #[test]
+    fn xdlms_apdu_exception_response_dispatch_roundtrip() {
+        let resp = ExceptionResponse {
+            state_error: StateError::ServiceUnknown,
+            service_error: ServiceError::PduTooLong,
+        };
+        roundtrip!(
+            |buf| resp.put(buf),
+            XDLMSApdu::get,
+            |d| match d {
+                XDLMSApdu::ExceptionResponse(r) => {
+                    assert_eq!(r.state_error, StateError::ServiceUnknown);
+                    assert_eq!(r.service_error, ServiceError::PduTooLong);
                 }
                 _ => panic!("wrong variant"),
             }

@@ -6,7 +6,7 @@
 
 use bytebuffer::{ByteBuffer, Reader};
 use crate::error::{Error, Result};
-use crate::x680::{Class, Tag};
+use crate::x680::{Tag};
 
 // ---------------------------------------------------------------------------
 // Length component (X.690 §8.1.3)
@@ -96,65 +96,9 @@ pub fn put_length(buf: &mut ByteBuffer<'_>, value: i64) -> Result<usize> {
 // Tag encoding/decoding (X.690 §8.1.2)
 // ---------------------------------------------------------------------------
 
-/// Decode a BER tag (advancing the buffer) per X.690 §8.1.2.
-pub fn get_tag(buf: &mut Reader<'_>) -> Result<Tag> {
-    let first = buf.get_u8()?;
-    let class = Class::from_bits(first);
-    let constructed = first & 0x20 != 0;
-    let mut tag_number = first & 0x1F;
-    if tag_number == 0x1F {
-        // High-tag-number form (X.690 §8.1.2.4)
-        tag_number = 0;
-        loop {
-            let byte = buf.get_u8()?;
-            tag_number = (tag_number << 7) | (byte & 0x7F);
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-    }
-    Ok(Tag {
-        class,
-        number: tag_number,
-        constructed,
-    })
-}
-
-/// Encode a BER tag (advancing the buffer) per X.690 §8.1.2.
-pub fn put_tag(buf: &mut ByteBuffer<'_>, tag: &Tag) -> Result<usize> {
-    let mut initial = tag.class.bits();
-    if tag.constructed {
-        initial |= 0x20;
-    }
-    if tag.number < 0x1F {
-        return Ok(buf.put_u8(initial | tag.number as u8)?);
-    }
-    let mut written = buf.put_u8(initial | 0x1F)?;
-    // Encode tag number in 7-bit chunks, MSB first, last chunk bit 8 = 0.
-    let mut chunks = [0u8; 10];
-    let mut count = 0usize;
-    let mut n = tag.number;
-    loop {
-        chunks[count] = (n & 0x7F) as u8;
-        count += 1;
-        n >>= 7;
-        if n == 0 {
-            break;
-        }
-    }
-    for i in (0..count).rev() {
-        let mut chunk = chunks[i];
-        if i != 0 {
-            chunk |= 0x80;
-        }
-        written += buf.put_u8(chunk)?;
-    }
-    Ok(written)
-}
-
 /// Validate that the next tag in `buf` matches `expected` (consuming it).
 pub fn validate_tag(buf: &mut Reader<'_>, expected: &Tag) -> Result<()> {
-    let tag = get_tag(buf)?;
+    let tag = Tag::get(buf)?;
     if tag.number != expected.number {
         return Err(Error::TagNumber {
             expected: expected.number,

@@ -5,6 +5,9 @@
 //! `Value` types and constraint specifications are deliberately not modeled
 //! here: the DLMS/COSEM PDUs are represented by their own concrete types.
 
+use crate::{Result};
+use bytebuffer::{Reader, ByteBuffer};
+
 /// Universal tag class number (X.680 Table 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UniversalTag {
@@ -120,6 +123,64 @@ impl Tag {
             constructed: false,
         }
     }
+
+    /// Decode a BER tag (advancing the buffer) per X.690 §8.1.2.
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        let first = buf.get_u8()?;
+        let class = Class::from_bits(first);
+        let constructed = first & 0x20 != 0;
+        let mut tag_number = first & 0x1F;
+        if tag_number == 0x1F {
+            // High-tag-number form (X.690 §8.1.2.4)
+            tag_number = 0;
+            loop {
+                let byte = buf.get_u8()?;
+                tag_number = (tag_number << 7) | (byte & 0x7F);
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(Self {
+            class,
+            number: tag_number,
+            constructed,
+        })
+    }
+
+    /// Encode a BER tag (advancing the buffer) per X.690 §8.1.2.
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        let mut initial = self.class.bits();
+        if self.constructed {
+            initial |= 0x20;
+        }
+        if self.number < 0x1F {
+            return Ok(buf.put_u8(initial | self.number)?);
+        }
+        let mut written = buf.put_u8(initial | 0x1F)?;
+        // Encode tag number in 7-bit chunks, MSB first, last chunk bit 8 = 0.
+        let mut chunks = [0u8; 10];
+        let mut count = 0usize;
+        let mut n = self.number;
+        loop {
+            chunks[count] = (n & 0x7F) as u8;
+            count += 1;
+            n >>= 7;
+            if n == 0 {
+                break;
+            }
+        }
+        for i in (0..count).rev() {
+            let mut chunk = chunks[i];
+            if i != 0 {
+                chunk |= 0x80;
+            }
+            written += buf.put_u8(chunk)?;
+        }
+        Ok(written)
+    }
+
+
 }
 
 #[cfg(test)]

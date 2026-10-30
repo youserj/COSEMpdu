@@ -321,7 +321,7 @@ impl<const N: usize> StreamSink for RegisterAssignmentValue<N> {
     fn blob_write(&mut self, bytes: &[u8], index: usize, offset: usize) -> cosempdu::Result<()> {
         let end = offset + bytes.len();
         if end > 6 {
-            return Err(cosempdu::Error::InputTooLarge { len: end, max: 6 });
+            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: 6 }));
         }
         self.0[index].logical_name.bytes[offset..end].copy_from_slice(bytes);
         Ok(())

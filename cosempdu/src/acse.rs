@@ -4,13 +4,13 @@
 //! DLMS/COSEM association establishment and release. Encoding follows X.690
 //! with explicit/implicit context tagging.
 
-use crate::ber::{decode_signed, put_signed, put_tlv, with_content};
+use crate::ber::{decode_signed, decode_u8, put_signed, put_tlv, put_u8, with_content};
 use bytebuffer::{ByteBuffer, Reader};
 use crate::error::{Error, Result};
 use crate::x680::{Class, Tag, UniversalTag};
-use crate::x690::{get_tag, Length};
+use crate::x690::{Length};
 
-fn ctx(number: u8, constructed: bool) -> Tag {
+const fn ctx(number: u8, constructed: bool) -> Tag {
     Tag {
         class: Class::Context,
         number,
@@ -18,7 +18,7 @@ fn ctx(number: u8, constructed: bool) -> Tag {
     }
 }
 
-fn app(number: u8) -> Tag {
+const fn app(number: u8) -> Tag {
     Tag {
         class: Class::Application,
         number,
@@ -26,22 +26,57 @@ fn app(number: u8) -> Tag {
     }
 }
 
-/// Read one TLV (tag + content) from a buffer.
-fn read_tlv<'a>(buf: &mut Reader<'a>) -> Result<(Tag, &'a [u8])> {
-    let tag = get_tag(buf)?;
+/// Read one TLV header (tag + length) without checking the tag. Returns
+/// `(tag, content_length)`; the reader is left positioned at the content start.
+fn read_tlv_any(buf: &mut Reader<'_>) -> Result<(Tag, usize)> {
+    let tag = Tag::get(buf)?;
     let length = Length::get(buf)?;
     if length.value < 0 {
         return Err(Error::Unsupported {
             what: "indefinite length in ACSE",
         });
     }
-    let content = buf.read(length.value as usize)?;
-    Ok((tag, content))
+    Ok((tag, length.value as usize))
 }
 
-/// Decode the inner TLV content of an EXPLICIT field.
-fn unwrap_explicit<'a>(content: &'a [u8]) -> Result<(Tag, &'a [u8])> {
-    read_tlv(&mut Reader::new(content))
+/// Read one TLV header and verify its tag equals `expected`. Returns the
+/// content length; the reader is left positioned at the content start.
+fn read_tl(buf: &mut Reader<'_>, expected: Tag) -> Result<usize> {
+    let (tag, len) = read_tlv_any(buf)?;
+    if tag != expected {
+        return Err(Error::Message("unexpected tag"));
+    }
+    Ok(len)
+}
+
+/// Read a TLV whose content must fit entirely within `end` (the enclosing
+/// `[APPLICATION n] IMPLICIT SEQUENCE` boundary).
+fn read_tlv_bounded(buf: &mut Reader<'_>, end: usize) -> Result<(Tag, usize)> {
+    let (tag, len) = read_tlv_any(buf)?;
+    if buf.pos() + len > end {
+        return Err(Error::Message("TLV overruns enclosing SEQUENCE"));
+    }
+    Ok((tag, len))
+}
+
+/// Peek the tag number of the next field without consuming it. ACSE field tags
+/// are single-octet context tags (numbers < 31), so the number is the low 5 bits.
+fn peek_field_number(buf: &mut Reader<'_>) -> Result<u8> {
+    let byte = buf.peek(1)?[0];
+    Ok(byte & 0x1F)
+}
+
+/// Decode the inner TLV of an EXPLICIT field. `buf` is positioned at the start
+/// of the inner TLV and `len` is the EXPLICIT content length. Returns
+/// `(inner_tag, inner_content_length)`; errors if the inner TLV does not
+/// exactly fill the EXPLICIT content.
+fn unwrap_explicit(buf: &mut Reader<'_>, len: usize) -> Result<(Tag, usize)> {
+    let start = buf.pos();
+    let (tag, inner_len) = read_tlv_any(buf)?;
+    if buf.pos() - start + inner_len != len {
+        return Err(Error::Message("trailing data in explicit field"));
+    }
+    Ok((tag, inner_len))
 }
 
 fn put_explicit_oid(
@@ -206,9 +241,9 @@ impl ApplicationContextName {
 
     /// Decode the raw base-128 OBJECT IDENTIFIER content (no tag) directly,
     /// without materializing an intermediate arc array.
-    pub fn get(content: &[u8]) -> Result<Self> {
-        if content.len() != 7
-            || content[..5] != ACSE_OID_PREFIX_CONTENT[..]
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        let content = buf.read(7)?;
+        if content[..5] != ACSE_OID_PREFIX_CONTENT[..]
             || content[5] != CONTEXT_DISCRIMINATOR
             || content[6] > 127
         {
@@ -290,9 +325,9 @@ impl MechanismName {
 
     /// Decode the raw base-128 OBJECT IDENTIFIER content (no tag) directly,
     /// without materializing an intermediate arc array.
-    pub fn from_content(content: &[u8]) -> Result<Self> {
-        if content.len() != 7
-            || content[..5] != ACSE_OID_PREFIX_CONTENT[..]
+    pub fn from_content(buf: &mut Reader<'_>) -> Result<Self> {
+        let content = buf.read(7)?;
+        if content[..5] != ACSE_OID_PREFIX_CONTENT[..]
             || content[5] != MECHANISM_DISCRIMINATOR
             || content[6] > 127
         {
@@ -321,13 +356,13 @@ impl AssociationResult {
     }
 
     /// Decode the `result [2] Association-result` field content.
-    pub fn get(content: &[u8]) -> Result<Self> {
-        let (_itag, ocontent) = unwrap_explicit(content)?;
-        match decode_signed(ocontent)? {
+    pub fn get(buf: &mut Reader<'_>, len: usize) -> Result<Self> {
+        let (_itag, inner_len) = unwrap_explicit(buf, len)?;
+        match decode_u8(buf.read(inner_len)?)? {
             0 => Ok(AssociationResult::Accepted),
             1 => Ok(AssociationResult::RejectedPermanent),
             2 => Ok(AssociationResult::RejectedTransient),
-            _ => Err(Error::Message("unknown association result")),
+            err => Err(Error::WrongAssociationResult{actual: err}),
         }
     }
 }
@@ -369,7 +404,7 @@ pub enum AcseServiceUser {
 }
 
 impl AcseServiceUser {
-    fn from_i64(v: i64) -> Result<Self> {
+    fn from_u8(v: u8) -> Result<Self> {
         match v {
             0 => Ok(AcseServiceUser::Null),
             1 => Ok(AcseServiceUser::NoReasonGiven),
@@ -404,7 +439,7 @@ pub enum AcseServiceProvider {
 }
 
 impl AcseServiceProvider {
-    fn from_i64(v: i64) -> Result<Self> {
+    fn from_u8(v: u8) -> Result<Self> {
         match v {
             0 => Ok(AcseServiceProvider::Null),
             1 => Ok(AcseServiceProvider::NoReasonGiven),
@@ -431,16 +466,16 @@ impl AssociateSourceDiagnostic {
     }
 
     /// Decode the `result-source-diagnostic [3]` field content.
-    pub fn get(content: &[u8]) -> Result<Self> {
-        let (alt, inner) = unwrap_explicit(content)?;
-        let (_int, int_content) = unwrap_explicit(inner)?;
-        let value = decode_signed(int_content)?;
+    pub fn get(buf: &mut Reader<'_>, len: usize) -> Result<Self> {
+        let (alt, alt_len) = unwrap_explicit(buf, len)?;
+        let (_int, int_len) = unwrap_explicit(buf, alt_len)?;
+        let value = decode_u8(buf.read(int_len)?)?;
         match alt.number {
             1 => Ok(AssociateSourceDiagnostic::ServiceUser(
-                AcseServiceUser::from_i64(value)?,
+                AcseServiceUser::from_u8(value)?,
             )),
             2 => Ok(AssociateSourceDiagnostic::ServiceProvider(
-                AcseServiceProvider::from_i64(value)?,
+                AcseServiceProvider::from_u8(value)?,
             )),
             _ => Err(Error::Message("unknown Associate-source-diagnostic alternative")),
         }
@@ -484,6 +519,8 @@ pub struct AARQapdu<'a> {
 }
 
 impl<'a> AARQapdu<'a> {
+    const TAG: Tag = app(0);
+
     pub fn new(application_context_name: ApplicationContextName) -> Self {
         AARQapdu {
             protocol_version: None,
@@ -505,7 +542,7 @@ impl<'a> AARQapdu<'a> {
     }
 
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        with_content(buf, &app(0), |b| {
+        with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
             if let Some(pv) = &self.protocol_version {
                 written += put_implicit_bit_string(b, 0, pv)?;
@@ -555,54 +592,53 @@ impl<'a> AARQapdu<'a> {
     }
 
     pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
-        let (tag, content) = read_tlv(buf)?;
-        if tag != app(0) {
-            return Err(Error::Message("expected AARQ-apdu [APPLICATION 0]"));
-        }
-        let mut inner = Reader::new(content);
+        let len = read_tl(buf, Self::TAG)?;
+        let end = buf.pos() + len;
         let mut apdu = AARQapdu::new(ApplicationContextName::LogicalNameNoCiphering);
         let mut application_context_name = None;
-        while inner.pos() < inner.len() {
-            let (ftag, fcontent) = read_tlv(&mut inner)?;
+        while buf.pos() < end {
+            let (ftag, flen) = read_tlv_bounded(buf, end)?;
             match ftag.number {
-                0 => apdu.protocol_version = Some(fcontent),
+                0 => apdu.protocol_version = Some(buf.read(flen)?),
                 1 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
+                    let (_itag, _) = unwrap_explicit(buf, flen)?;
                     application_context_name =
-                        Some(ApplicationContextName::get(ocontent)?);
+                        Some(ApplicationContextName::get(buf)?);
                 }
                 2 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    apdu.called_ap_title = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    apdu.called_ap_title = Some(buf.read(olen)?);
                 }
                 3 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    apdu.called_ae_qualifier = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    apdu.called_ae_qualifier = Some(buf.read(olen)?);
                 }
-                4 => apdu.called_ap_invocation_id = Some(decode_signed(fcontent)?),
-                5 => apdu.called_ae_invocation_id = Some(decode_signed(fcontent)?),
+                4 => apdu.called_ap_invocation_id = Some(decode_signed(buf.read(flen)?)?),
+                5 => apdu.called_ae_invocation_id = Some(decode_signed(buf.read(flen)?)?),
                 6 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    apdu.calling_ap_title = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    apdu.calling_ap_title = Some(buf.read(olen)?);
                 }
                 7 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    apdu.calling_ae_qualifier = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    apdu.calling_ae_qualifier = Some(buf.read(olen)?);
                 }
-                8 => apdu.calling_ap_invocation_id = Some(decode_signed(fcontent)?),
-                9 => apdu.calling_ae_invocation_id = Some(decode_signed(fcontent)?),
-                10 => apdu.sender_acse_requirements = Some(fcontent),
-                11 => apdu.mechanism_name = Some(MechanismName::from_content(fcontent)?),
+                8 => apdu.calling_ap_invocation_id = Some(decode_signed(buf.read(flen)?)?),
+                9 => apdu.calling_ae_invocation_id = Some(decode_signed(buf.read(flen)?)?),
+                10 => apdu.sender_acse_requirements = Some(buf.read(flen)?),
+                11 => apdu.mechanism_name = Some(MechanismName::from_content(buf)?),
                 12 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    apdu.calling_authentication_value = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    apdu.calling_authentication_value = Some(buf.read(olen)?);
                 }
-                29 => apdu.implementation_information = Some(fcontent),
+                29 => apdu.implementation_information = Some(buf.read(flen)?),
                 30 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    apdu.user_information = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    apdu.user_information = Some(buf.read(olen)?);
                 }
-                _ => {}
+                _ => {
+                    buf.read(flen)?;
+                }
             }
         }
         apdu.application_context_name = application_context_name
@@ -640,8 +676,10 @@ pub struct AAREapdu<'a> {
 }
 
 impl<'a> AAREapdu<'a> {
+    const TAG: Tag = app(1);
+
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        with_content(buf, &app(1), |b| {
+        with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
             if let Some(pv) = &self.protocol_version {
                 written += put_implicit_bit_string(b, 0, pv)?;
@@ -682,11 +720,8 @@ impl<'a> AAREapdu<'a> {
     }
 
     pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
-        let (tag, content) = read_tlv(buf)?;
-        if tag != app(1) {
-            return Err(Error::Message("expected AARE-apdu [APPLICATION 1]"));
-        }
-        let mut inner = Reader::new(content);
+        let len = read_tl(buf, Self::TAG)?;
+        let end = buf.pos() + len;
         let mut protocol_version = None;
         let mut application_context_name = None;
         let mut result = AssociationResult::Accepted;
@@ -701,43 +736,45 @@ impl<'a> AAREapdu<'a> {
         let mut responding_authentication_value = None;
         let mut implementation_information = None;
         let mut user_information = None;
-        while inner.pos() < inner.len() {
-            let (ftag, fcontent) = read_tlv(&mut inner)?;
+        while buf.pos() < end {
+            let (ftag, flen) = read_tlv_bounded(buf, end)?;
             match ftag.number {
-                0 => protocol_version = Some(fcontent),
+                0 => protocol_version = Some(buf.read(flen)?),
                 1 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
+                    let (_itag, _) = unwrap_explicit(buf, flen)?;
                     application_context_name =
-                        Some(ApplicationContextName::get(ocontent)?);
+                        Some(ApplicationContextName::get(buf)?);
                 }
                 2 => {
-                    result = AssociationResult::get(fcontent)?;
+                    result = AssociationResult::get(buf, flen)?;
                 }
                 3 => {
-                    result_source_diagnostic = AssociateSourceDiagnostic::get(fcontent)?;
+                    result_source_diagnostic = AssociateSourceDiagnostic::get(buf, flen)?;
                 }
                 4 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    responding_ap_title = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    responding_ap_title = Some(buf.read(olen)?);
                 }
                 5 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    responding_ae_qualifier = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    responding_ae_qualifier = Some(buf.read(olen)?);
                 }
-                6 => responding_ap_invocation_id = Some(decode_signed(fcontent)?),
-                7 => responding_ae_invocation_id = Some(decode_signed(fcontent)?),
-                8 => responder_acse_requirements = Some(fcontent),
-                9 => mechanism_name = Some(MechanismName::from_content(fcontent)?),
+                6 => responding_ap_invocation_id = Some(decode_signed(buf.read(flen)?)?),
+                7 => responding_ae_invocation_id = Some(decode_signed(buf.read(flen)?)?),
+                8 => responder_acse_requirements = Some(buf.read(flen)?),
+                9 => mechanism_name = Some(MechanismName::from_content(buf)?),
                 10 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    responding_authentication_value = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    responding_authentication_value = Some(buf.read(olen)?);
                 }
-                29 => implementation_information = Some(fcontent),
+                29 => implementation_information = Some(buf.read(flen)?),
                 30 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    user_information = Some(ocontent);
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    user_information = Some(buf.read(olen)?);
                 }
-                _ => {}
+                _ => {
+                    buf.read(flen)?;
+                }
             }
         }
         Ok(AAREapdu {
@@ -759,19 +796,93 @@ impl<'a> AAREapdu<'a> {
     }
 }
 
+
+/// `Release-request-reason ::= INTEGER { normal (0), urgent (1), user-defined (30) }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReleaseRequestReason {
+    /// normal (0).
+    Normal = 0,
+    /// urgent (1).
+    Urgent = 1,
+    /// user-defined (30).
+    UserDefined = 30,
+}
+
+impl ReleaseRequestReason {
+    const TAG: Tag = ctx(0, false);
+
+    /// Encode as `reason [0] IMPLICIT Release-request-reason` (full TLV).
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        with_content(buf, &Self::TAG, |b| put_u8(b, *self as u8))
+    }
+
+    /// Decode the `reason [0] IMPLICIT Release-request-reason` field (full TLV).
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        let len = read_tl(buf, Self::TAG)?;
+        if len != 1 {
+            return Err(Error::Message("release request reason must be a 1-byte INTEGER"));
+        }
+        match buf.get_u8()? {
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::Urgent),
+            30 => Ok(Self::UserDefined),
+            _ => Err(Error::Message("unknown release request reason")),
+        }
+    }
+}
+
+
+/// `Release-response-reason ::= INTEGER { normal(0), not-finished(1), user-defined(30) }`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ReleaseResponseReason {
+    /// normal (0).
+    Normal = 0,
+    /// not-finished (1).
+    NotFinished = 1,
+    /// user-defined (30).
+    UserDefined = 30,
+}
+
+impl ReleaseResponseReason {
+    const TAG: Tag = ctx(0, false);
+
+    /// Encode as `reason [0] IMPLICIT Release-response-reason` (full TLV).
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        with_content(buf, &Self::TAG, |b| put_u8(b, *self as u8))
+    }
+
+    /// Decode `reason [0] IMPLICIT Release-response-reason` (full TLV).
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        let len = read_tl(buf, Self::TAG)?;
+        if len != 1 {
+            return Err(Error::Message("release response reason must be a 1-byte INTEGER"));
+        }
+        match buf.get_u8()? {
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::NotFinished),
+            30 => Ok(Self::UserDefined),
+            _ => Err(Error::Message("unknown release response reason")),
+        }
+    }
+}
+
 /// RLRQ-apdu ::= [APPLICATION 2] IMPLICIT SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RLRQapdu<'a> {
-    pub reason: Option<i64>,
+    pub reason: Option<ReleaseRequestReason>,
     pub user_information: Option<&'a [u8]>,
 }
 
 impl<'a> RLRQapdu<'a> {
+    const TAG: Tag = app(2);
+
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        with_content(buf, &app(2), |b| {
+        with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
             if let Some(reason) = self.reason {
-                written += put_implicit_integer(b, 0, reason)?;
+                written += reason.put(b)?;
             }
             if let Some(ui) = &self.user_information {
                 written += put_explicit_octet_string(b, 30, ui)?;
@@ -781,22 +892,22 @@ impl<'a> RLRQapdu<'a> {
     }
 
     pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
-        let (tag, content) = read_tlv(buf)?;
-        if tag != app(2) {
-            return Err(Error::Message("expected RLRQ-apdu [APPLICATION 2]"));
-        }
-        let mut inner = Reader::new(content);
+        let len = read_tl(buf, Self::TAG)?;
+        let end = buf.pos() + len;
         let mut reason = None;
         let mut user_information = None;
-        while inner.pos() < inner.len() {
-            let (ftag, fcontent) = read_tlv(&mut inner)?;
-            match ftag.number {
-                0 => reason = Some(decode_signed(fcontent)?),
+        while buf.pos() < end {
+            match peek_field_number(buf)? {
+                0 => reason = Some(ReleaseRequestReason::get(buf)?),
                 30 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    user_information = Some(ocontent);
+                    let (_ftag, flen) = read_tlv_bounded(buf, end)?;
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    user_information = Some(buf.read(olen)?);
                 }
-                _ => {}
+                _ => {
+                    let (_ftag, flen) = read_tlv_bounded(buf, end)?;
+                    buf.read(flen)?;
+                }
             }
         }
         Ok(RLRQapdu {
@@ -809,16 +920,18 @@ impl<'a> RLRQapdu<'a> {
 /// RLRE-apdu ::= [APPLICATION 3] IMPLICIT SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RLREapdu<'a> {
-    pub reason: Option<i64>,
+    pub reason: Option<ReleaseResponseReason>,
     pub user_information: Option<&'a [u8]>,
 }
 
 impl<'a> RLREapdu<'a> {
+    const TAG: Tag = app(3);
+
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        with_content(buf, &app(3), |b| {
+        with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
             if let Some(reason) = self.reason {
-                written += put_implicit_integer(b, 0, reason)?;
+                written += reason.put(b)?;
             }
             if let Some(ui) = &self.user_information {
                 written += put_explicit_octet_string(b, 30, ui)?;
@@ -828,22 +941,22 @@ impl<'a> RLREapdu<'a> {
     }
 
     pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
-        let (tag, content) = read_tlv(buf)?;
-        if tag != app(3) {
-            return Err(Error::Message("expected RLRE-apdu [APPLICATION 3]"));
-        }
-        let mut inner = Reader::new(content);
+        let len = read_tl(buf, Self::TAG)?;
+        let end = buf.pos() + len;
         let mut reason = None;
         let mut user_information = None;
-        while inner.pos() < inner.len() {
-            let (ftag, fcontent) = read_tlv(&mut inner)?;
-            match ftag.number {
-                0 => reason = Some(decode_signed(fcontent)?),
+        while buf.pos() < end {
+            match peek_field_number(buf)? {
+                0 => reason = Some(ReleaseResponseReason::get(buf)?),
                 30 => {
-                    let (_itag, ocontent) = unwrap_explicit(fcontent)?;
-                    user_information = Some(ocontent);
+                    let (_ftag, flen) = read_tlv_bounded(buf, end)?;
+                    let (_itag, olen) = unwrap_explicit(buf, flen)?;
+                    user_information = Some(buf.read(olen)?);
                 }
-                _ => {}
+                _ => {
+                    let (_ftag, flen) = read_tlv_bounded(buf, end)?;
+                    buf.read(flen)?;
+                }
             }
         }
         Ok(RLREapdu {
@@ -874,7 +987,7 @@ impl<'a> ACSEApdu<'a> {
 
     pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         let start = buf.pos();
-        let tag = get_tag(buf)?;
+        let tag = Tag::get(buf)?;
         buf.set_pos(start)?;
         match (tag.class, tag.number) {
             (Class::Application, 0) => Ok(ACSEApdu::Aarq(AARQapdu::get(buf)?)),
@@ -954,11 +1067,11 @@ mod tests {
     fn rlrq_rlre_roundtrip() {
         for apdu in [
             ACSEApdu::Rlrq(RLRQapdu {
-                reason: Some(0),
+                reason: Some(ReleaseRequestReason::Normal),
                 user_information: Some(b"\x09\x08\x07"),
             }),
             ACSEApdu::Rlre(RLREapdu {
-                reason: Some(1),
+                reason: Some(ReleaseResponseReason::NotFinished),
                 user_information: None,
             }),
         ] {
@@ -1005,21 +1118,17 @@ mod tests {
         assert_eq!(n, 7);
         assert_eq!(&backing[..7], &[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01]);
 
-        let decoded =
-            ApplicationContextName::get(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01])
-                .unwrap();
+        let oid = [0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01];
+        let decoded = ApplicationContextName::get(&mut Reader::new(&oid)).unwrap();
         assert_eq!(decoded, ApplicationContextName::LogicalNameNoCiphering);
 
         // Trailing arc > 127 rejected.
-        assert!(
-            ApplicationContextName::get(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x80])
-                .is_err()
-        );
+        let bad = [0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x80];
+        assert!(ApplicationContextName::get(&mut Reader::new(&bad)).is_err());
+
         // Wrong discriminator rejected.
-        assert!(
-            ApplicationContextName::get(&[0x60, 0x85, 0x74, 0x05, 0x08, 0x02, 0x01])
-                .is_err()
-        );
+        let bad = [0x60, 0x85, 0x74, 0x05, 0x08, 0x02, 0x01];
+        assert!(ApplicationContextName::get(&mut Reader::new(&bad)).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1294,7 +1403,9 @@ mod tests {
         };
         assert_eq!(&backing[..n], &[0xA3, 0x05, 0xA2, 0x03, 0x02, 0x01, 0x02]);
 
-        let decoded = AssociateSourceDiagnostic::get(&backing[2..n]).unwrap();
+        let content = &backing[2..n];
+        let decoded =
+            AssociateSourceDiagnostic::get(&mut Reader::new(content), content.len()).unwrap();
         assert_eq!(decoded, diag);
     }
 
@@ -1302,15 +1413,15 @@ mod tests {
     fn associate_source_diagnostic_unknown() {
         // Unknown acse-service-user value rejected.
         let bytes = [0xA1, 0x03, 0x02, 0x01, 0x0F]; // acse-service-user [1] 15
-        assert!(AssociateSourceDiagnostic::get(&bytes).is_err());
+        assert!(AssociateSourceDiagnostic::get(&mut Reader::new(&bytes), bytes.len()).is_err());
 
         // Unknown acse-service-provider value rejected.
         let bytes = [0xA2, 0x03, 0x02, 0x01, 0x03]; // acse-service-provider [2] 3
-        assert!(AssociateSourceDiagnostic::get(&bytes).is_err());
+        assert!(AssociateSourceDiagnostic::get(&mut Reader::new(&bytes), bytes.len()).is_err());
 
         // Unknown CHOICE alternative tag rejected.
         let bytes = [0xA5, 0x03, 0x02, 0x01, 0x00]; // [5] EXPLICIT INTEGER
-        assert!(AssociateSourceDiagnostic::get(&bytes).is_err());
+        assert!(AssociateSourceDiagnostic::get(&mut Reader::new(&bytes), bytes.len()).is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! `ReadResponse`, `WriteResponse` and `ConfirmedServiceError`, plus their
 //! supporting types.
 
-use crate::apdu::ReaderList;
+use crate::apdu::{DataAccessResult, ReaderList};
 use crate::axdr::{get_length, put_length};
 use crate::data::data_value;
 use crate::error::{Error, Result};
@@ -296,7 +296,7 @@ impl<'a> Iterator for VariableAccessSpecificationList<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReadResponseItem<'a> {
     Data(Reader<'a>),               // [0]
-    DataAccessError(u8),            // [1]
+    DataAccessError(DataAccessResult), // [1]
     DataBlockResult(DataBlockResult<'a>), // [2]
     BlockNumber(u16),               // [3]
 }
@@ -311,7 +311,7 @@ impl<'a> ReadResponseItem<'a> {
             }
             ReadResponseItem::DataAccessError(code) => {
                 let mut w = buf.put_u8(1)?;
-                w += buf.put_u8(*code)?;
+                w += code.put(buf)?;
                 Ok(w)
             }
             ReadResponseItem::DataBlockResult(r) => {
@@ -330,7 +330,7 @@ impl<'a> ReadResponseItem<'a> {
     pub fn get(buf: &mut Reader<'a>) -> Result<Self> {
         match buf.get_u8()? {
             0 => Ok(ReadResponseItem::Data(data_value(buf)?)),
-            1 => Ok(ReadResponseItem::DataAccessError(buf.get_u8()?)),
+            1 => Ok(ReadResponseItem::DataAccessError(DataAccessResult::get(buf)?)),
             2 => Ok(ReadResponseItem::DataBlockResult(DataBlockResult::get(buf)?)),
             3 => Ok(ReadResponseItem::BlockNumber(get_u16(buf)?)),
             t => Err(Error::UnknownChoice { name: "Read-Response", choice: t }),
@@ -377,7 +377,7 @@ impl<'a> Iterator for ReadResponseItemList<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WriteResponseItem {
     Success,          // [0] IMPLICIT NULL
-    DataAccessError(u8), // [1]
+    DataAccessError(DataAccessResult), // [1]
     BlockNumber(u16), // [2]
 }
 
@@ -387,7 +387,7 @@ impl WriteResponseItem {
             WriteResponseItem::Success => Ok(buf.put_u8(0)?),
             WriteResponseItem::DataAccessError(code) => {
                 let mut w = buf.put_u8(1)?;
-                w += buf.put_u8(*code)?;
+                w += code.put(buf)?;
                 Ok(w)
             }
             WriteResponseItem::BlockNumber(n) => {
@@ -401,7 +401,7 @@ impl WriteResponseItem {
     pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
         match buf.get_u8()? {
             0 => Ok(WriteResponseItem::Success),
-            1 => Ok(WriteResponseItem::DataAccessError(buf.get_u8()?)),
+            1 => Ok(WriteResponseItem::DataAccessError(DataAccessResult::get(buf)?)),
             2 => Ok(WriteResponseItem::BlockNumber(get_u16(buf)?)),
             t => Err(Error::UnknownChoice { name: "Write-Response", choice: t }),
         }
@@ -444,40 +444,190 @@ impl<'a> Iterator for WriteResponseItemList<'a> {
 }
 
 
-/// `ServiceError ::= CHOICE` of `IMPLICIT ENUMERATED` alternatives.
-///
-/// `tag` is the CHOICE alternative (`0`..`7`, `9`); `value` is the ENUMERATED
-/// code within that alternative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServiceError {
-    pub tag: u8,
-    pub value: u8,
+/// Генерирует `IMPLICIT ENUMERATED` (1-байтовый код без тега) с `put`/`get`.
+macro_rules! enumerated {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident = $code:expr),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u8)]
+        pub enum $name {
+            $($variant = $code),+
+        }
+
+        impl $name {
+            pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<u8> {
+                buf.put_u8(*self as u8)?;
+                Ok(1)
+            }
+
+            pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+                Ok(match buf.get_u8()? {
+                    $($code => Self::$variant,)+
+                    _ => return Err(Error::Message(concat!("unknown ", stringify!($name)))),
+                })
+            }
+        }
+    };
 }
 
-/// CHOICE tags for [`ServiceError`].
-pub mod service_error_tag {
-    pub const APPLICATION_REFERENCE: u8 = 0;
-    pub const HARDWARE_RESOURCE: u8 = 1;
-    pub const VDE_STATE_ERROR: u8 = 2;
-    pub const SERVICE: u8 = 3;
-    pub const DEFINITION: u8 = 4;
-    pub const ACCESS: u8 = 5;
-    pub const INITIATE: u8 = 6;
-    pub const LOAD_DATA_SET: u8 = 7;
-    pub const TASK: u8 = 9;
+enumerated! {
+    /// `application-reference [0] IMPLICIT ENUMERATED`.
+    ApplicationReference {
+        Other = 0,
+        TimeElapsed = 1,
+        ApplicationUnreachable = 2,
+        ApplicationReferenceInvalid = 3,
+        ApplicationContextUnsupported = 4,
+        ProviderCommunicationError = 5,
+        DecipheringError = 6,
+    }
+}
+
+enumerated! {
+    /// `hardware-resource [1] IMPLICIT ENUMERATED`.
+    HardwareResource {
+        Other = 0,
+        MemoryUnavailable = 1,
+        ProcessorResourceUnavailable = 2,
+        MassStorageUnavailable = 3,
+        OtherResourceUnavailable = 4,
+    }
+}
+
+enumerated! {
+    /// `vde-state-error [2] IMPLICIT ENUMERATED`.
+    VdeStateError {
+        Other = 0,
+        NoDlmsContext = 1,
+        LoadingDataSet = 2,
+        StatusNochange = 3,
+        StatusInoperable = 4,
+    }
+}
+
+enumerated! {
+    /// `service [3] IMPLICIT ENUMERATED`.
+    Service {
+        Other = 0,
+        PduSize = 1,
+        ServiceUnsupported = 2,
+    }
+}
+
+enumerated! {
+    /// `definition [4] IMPLICIT ENUMERATED`.
+    Definition {
+        Other = 0,
+        ObjectUndefined = 1,
+        ObjectClassInconsistent = 2,
+        ObjectAttributeInconsistent = 3,
+    }
+}
+
+enumerated! {
+    /// `access [5] IMPLICIT ENUMERATED`.
+    Access {
+        Other = 0,
+        ScopeOfAccessViolated = 1,
+        ObjectAccessViolated = 2,
+        HardwareFault = 3,
+        ObjectUnavailable = 4,
+    }
+}
+
+enumerated! {
+    /// `initiate [6] IMPLICIT ENUMERATED`.
+    Initiate {
+        Other = 0,
+        DlmsVersionTooLow = 1,
+        IncompatibleConformance = 2,
+        PduSizeTooShort = 3,
+        RefusedByTheVdeHandler = 4,
+    }
+}
+
+enumerated! {
+    /// `load-data-set [7] IMPLICIT ENUMERATED`.
+    LoadDataSet {
+        Other = 0,
+        PrimitiveOutOfSequence = 1,
+        NotLoadable = 2,
+        DatasetSizeTooLarge = 3,
+        NotAwaitedSegment = 4,
+        InterpretationFailure = 5,
+        StorageFailure = 6,
+        DataSetNotReady = 7,
+    }
+}
+
+enumerated! {
+    /// `task [9] IMPLICIT ENUMERATED`.
+    Task {
+        Other = 0,
+        NoRemoteControl = 1,
+        TiStopped = 2,
+        TiRunning = 3,
+        TiUnusable = 4,
+    }
+}
+
+/// `ServiceError ::= CHOICE` of `IMPLICIT ENUMERATED` alternatives.
+///
+/// Each variant carries the `IMPLICIT ENUMERATED` code of the corresponding
+/// CHOICE alternative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceError {
+    /// application-reference [0].
+    ApplicationReference(ApplicationReference),
+    /// hardware-resource [1].
+    HardwareResource(HardwareResource),
+    /// vde-state-error [2].
+    VdeStateError(VdeStateError),
+    /// service [3].
+    Service(Service),
+    /// definition [4].
+    Definition(Definition),
+    /// access [5].
+    Access(Access),
+    /// initiate [6].
+    Initiate(Initiate),
+    /// load-data-set [7].
+    LoadDataSet(LoadDataSet),
+    /// task [9].
+    Task(Task),
 }
 
 impl ServiceError {
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
-        let mut w = buf.put_u8(self.tag)?;
-        w += buf.put_u8(self.value)?;
+        let (tag, value) = match *self {
+            ServiceError::ApplicationReference(v) => (0, v as u8),
+            ServiceError::HardwareResource(v) => (1, v as u8),
+            ServiceError::VdeStateError(v) => (2, v as u8),
+            ServiceError::Service(v) => (3, v as u8),
+            ServiceError::Definition(v) => (4, v as u8),
+            ServiceError::Access(v) => (5, v as u8),
+            ServiceError::Initiate(v) => (6, v as u8),
+            ServiceError::LoadDataSet(v) => (7, v as u8),
+            ServiceError::Task(v) => (9, v as u8),
+        };
+        let mut w = buf.put_u8(tag)?;
+        w += buf.put_u8(value)?;
         Ok(w)
     }
 
     pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
-        let tag = buf.get_u8()?;
-        let value = buf.get_u8()?;
-        Ok(ServiceError { tag, value })
+        Ok(match buf.get_u8()? {
+            0 => ServiceError::ApplicationReference(ApplicationReference::get(buf)?),
+            1 => ServiceError::HardwareResource(HardwareResource::get(buf)?),
+            2 => ServiceError::VdeStateError(VdeStateError::get(buf)?),
+            3 => ServiceError::Service(Service::get(buf)?),
+            4 => ServiceError::Definition(Definition::get(buf)?),
+            5 => ServiceError::Access(Access::get(buf)?),
+            6 => ServiceError::Initiate(Initiate::get(buf)?),
+            7 => ServiceError::LoadDataSet(LoadDataSet::get(buf)?),
+            9 => ServiceError::Task(Task::get(buf)?),
+            t => return Err(Error::UnknownChoice { name: "Service-Error", choice: t }),
+        })
     }
 }
 
@@ -1011,10 +1161,7 @@ mod tests {
     fn confirmed_service_error_matches_green_book_example() {
         let err = ConfirmedServiceError {
             tag: confirmed_service_error_tag::INITIATE_ERROR,
-            service_error: ServiceError {
-                tag: service_error_tag::INITIATE,
-                value: 1, // dlms-version-too-low
-            },
+            service_error: ServiceError::Initiate(Initiate::DlmsVersionTooLow),
         };
         let bytes = enc(|b| err.put(b));
         // Green Book: 0E 01 06 01
@@ -1045,7 +1192,7 @@ mod tests {
         assert_eq!(resp.results.len(), 2);
         let mut it = resp.results;
         assert_eq!(it.next().unwrap().unwrap(), ReadResponseItem::Data(Reader::new(&[0x11, 0x01])));
-        assert_eq!(it.next().unwrap().unwrap(), ReadResponseItem::DataAccessError(3));
+        assert_eq!(it.next().unwrap().unwrap(), ReadResponseItem::DataAccessError(DataAccessResult::ReadWriteDenied));
         assert_eq!(enc(|b| resp.put(b)), resp_bytes);
     }
 }

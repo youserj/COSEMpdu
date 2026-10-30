@@ -107,6 +107,7 @@ assert_eq!(decoded, ACSEApdu::Aarq(aarq));
 | [COSEM Data Types](doc/data.md) | `cosempdu::data` |
 | [Byte Buffer](doc/buffer.md) | `cosempdu::buffer` |
 | [Streaming Decoder](doc/stream.md) | `cosempdu::stream` |
+| [DLMS/COSEM Server](doc/server.md) | `server` |
 
 ## Workspace crates
 

@@ -9,7 +9,7 @@ use cosempdu::error::Error;
 
 /// Асинхронный канал связи: читает/пишет полный WPDU (с фреймингом).
 ///
-/// `Frame` — метаданные принятого кадра (например, `WrapperSetting` для TCP/BLE;
+/// `Frame` — метаданные принятого кадра (например, `Wrapper` для TCP/BLE;
 /// для будущего HDLC-канала — свой тип кадра). Это точка обобщения под HDLC.
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 #[allow(async_fn_in_trait)]
@@ -17,7 +17,7 @@ pub trait Channel {
     /// Метаданные принятого кадра (заголовок, длина payload).
     type Frame;
 
-    /// Прочитать один полный WPDU из носителя в `buf`, вернуть метаданные кадра.
+    /// Прочитать один WPDU: заголовок — в метаданные кадра, APDU — в `buf`.
     async fn read(&mut self, buf: &mut [u8]) -> Result<Self::Frame, Error>;
 
     /// Записать `data` (WPDU) в носитель.
