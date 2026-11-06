@@ -1,6 +1,8 @@
 //! COSEM interface class "Data" (class_id 1, version 0).
 
-use crate::ic::{AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, InterfaceClass, V0};
+use crate::ic::{
+    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, InterfaceClass, V0,
+};
 use crate::obis::ObisCode;
 
 /// Attribute 1 — `logical_name` (octet-string).

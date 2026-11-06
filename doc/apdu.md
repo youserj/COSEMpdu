@@ -79,7 +79,7 @@ APDU messages are embedded in ACSE `UserInformation` and transmitted over a BER 
 
 ## Usage
 
-> **Decoding** (`get`) now takes an immutable `Reader` plus an `Arena` (zero-copy): `X::get(&mut reader, &mut arena)`. Encoding (`put`) still writes into a mutable `ByteBuffer`.
+> **Decoding** (`get`) takes a mutable `Reader` and returns zero-copy views into the input buffer: `X::get(&mut reader)`. Encoding (`put*`) writes into a mutable `ByteBuffer`.
 
 ### Building a GET Request
 
@@ -87,36 +87,37 @@ APDU messages are embedded in ACSE `UserInformation` and transmitted over a BER 
 use cosempdu::apdu::{CosemAttributeDescriptor, GetRequest, InvokeIdAndPriority};
 use cosempdu::buffer::ByteBuffer;
 
-let request = GetRequest::Normal {
-    invoke: InvokeIdAndPriority::from_bits(1, true, false),
-    descriptor: CosemAttributeDescriptor {
+let mut backing = [0u8; 4096];
+let mut buf = ByteBuffer::new(&mut backing);
+GetRequest::put_normal(
+    InvokeIdAndPriority::from_bits(1, true, false),
+    CosemAttributeDescriptor {
         class_id: 7,                             // Register
         instance_id: [0x01, 0x00, 0x01, 0x08, 0x00, 0xFF],
         attribute_id: 2,                         // value
     },
-    access_selection: None,
-};
-
-let mut backing = [0u8; 4096];
-let mut buf = ByteBuffer::new(&mut backing);
-request.put(&mut buf)?;
+    None,
+    &mut buf,
+)?;
 let bytes = buf.extract();
 ```
 
 ### Handling a GET Response
 
 ```rust
-use cosempdu::apdu::{GetDataResult, GetResponse};
+use cosempdu::apdu::{GetDataResult, GetResponse, GetResponseNormal};
 use cosempdu::buffer::ByteBuffer;
-use cosempdu::data::Data;
 
 let mut backing = [0u8; 4096];
 backing[..received_bytes.len()].copy_from_slice(&received_bytes);
 let mut buf = ByteBuffer::new(&mut backing[..received_bytes.len()]);
 let response = GetResponse::get(&mut buf)?;
 
-if let GetResponse::Normal { result: GetDataResult::Data(Data::Long64(v)), .. } = response {
-    println!("value = {}", v.0);
+if let GetResponse::Normal(GetResponseNormal {
+    result: GetDataResult::Data(reader),
+    ..
+}) = response {
+    println!("raw data = {:?}", reader.as_bytes());
 }
 ```
 
@@ -130,8 +131,8 @@ let mut backing = [0u8; 4096];
 backing[..bytes.len()].copy_from_slice(&bytes);
 let mut buf = ByteBuffer::new(&mut backing[..bytes.len()]);
 
-if let GetRequest::WithList { invoke, descriptors } = GetRequest::get(&mut buf)? {
-    println!("{} descriptors", descriptors.len());
+if let GetRequest::WithList(w) = GetRequest::get(&mut buf)? {
+    println!("{} descriptors", w.descriptors.len());
 }
 ```
 

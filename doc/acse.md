@@ -27,7 +27,6 @@ All ACSE types use BER encoding (X.690) with explicit/implicit context tagging, 
 
 | Field | Tag | Type |
 |-------|-----|------|
-| `protocol_version` | `[0]` IMPLICIT BIT STRING | `Option<Vec<u8>>` (usually omitted) |
 | `application_context_name` | `[1]` EXPLICIT OID | `Vec<u64>` (arcs) |
 | `user_information` | `[30]` EXPLICIT OCTET STRING | `Option<Vec<u8>>` |
 
@@ -37,7 +36,6 @@ All ACSE types use BER encoding (X.690) with explicit/implicit context tagging, 
 
 | Field | Tag | Type |
 |-------|-----|------|
-| `protocol_version` | `[0]` IMPLICIT BIT STRING | `Option<Vec<u8>>` |
 | `application_context_name` | `[1]` EXPLICIT OID | `Vec<u64>` |
 | `result` | `[2]` Association-result | `AssociationResult` |
 | `result_source_diagnostic` | `[3]` Associate-source-diagnostic | `AssociateSourceDiagnostic` (CHOICE) |
@@ -99,7 +97,6 @@ All ACSE messages are encoded in BER (X.690). Example AARQ structure:
 ```
 [APPLICATION 0, CONSTRUCTED]  (AARQ tag)
   Length (entire message)
-  +-- protocol_version [0] BIT STRING (optional)
   +-- application_context_name [1] EXPLICIT OID
   +-- user_information [30] EXPLICIT OCTET STRING (optional)
         Contains COSEM APDU in A-XDR
@@ -110,13 +107,10 @@ All ACSE messages are encoded in BER (X.690). Example AARQ structure:
 ### Encoding an AARQ Request
 
 ```rust
-use cosempdu::acse::AARQapdu;
+use cosempdu::acse::{AARQapdu, ApplicationContextName};
 
-let aarq = AARQapdu {
-    protocol_version: None,
-    application_context_name: vec![2, 16, 756, 5, 8, 1, 1],
-    user_information: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-};
+let mut aarq = AARQapdu::new(ApplicationContextName::LogicalNameNoCiphering);
+aarq.user_information = Some(b"\xDE\xAD\xBE\xEF");
 
 let mut backing = [0u8; 4096];
 let mut buf = ByteBuffer::new(&mut backing);

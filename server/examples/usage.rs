@@ -1,6 +1,6 @@
 //! Пример использования `Server`: атрибуты по отдельности + каталог объектов.
 
-use cosempdu::apdu_sn::Conformance;
+use cosempdu::apdu::Conformance;
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::Data;
 
@@ -24,7 +24,10 @@ fn main() -> Result<(), server::Error> {
     server.add_static(
         SERIAL_OBJ.value(),
         &SN,
-        Access { read: read_all, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: read_all,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
 
     // writable (persistent): register value
@@ -32,14 +35,22 @@ fn main() -> Result<(), server::Error> {
     server.add_persistent(
         REG_OBJ.value(),
         &mut register,
-        Access { read: read_all, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: read_all,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
 
     // GET (читает Reader)
     {
         let mut backing = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut backing);
-        server.put(ClassId::Register, REG_OBJ.value(), AccessMask::READER, &mut buf)?;
+        server.put(
+            ClassId::Register,
+            REG_OBJ.value(),
+            AccessMask::READER,
+            &mut buf,
+        )?;
         println!("register value: {:?}", buf.extract());
     }
 
@@ -50,14 +61,20 @@ fn main() -> Result<(), server::Error> {
             let mut b = ByteBuffer::new(&mut backing);
             Data::DoubleLongUnsigned(231000).put(&mut b)?
         };
-        let mut s = server.stream_set(ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR)?;
+        let mut s =
+            server.stream_set(ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR)?;
         s.push(&backing[..n])?;
         s.finish()?;
     }
     {
         let mut backing = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut backing);
-        server.put(ClassId::Register, REG_OBJ.value(), AccessMask::PUBLIC, &mut buf)?;
+        server.put(
+            ClassId::Register,
+            REG_OBJ.value(),
+            AccessMask::PUBLIC,
+            &mut buf,
+        )?;
         println!("register value (after SET): {:?}", buf.extract());
     }
 
@@ -65,7 +82,12 @@ fn main() -> Result<(), server::Error> {
     {
         let mut backing = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut backing);
-        server.put(ClassId::Data, SERIAL_OBJ.value(), AccessMask::PUBLIC, &mut buf)?;
+        server.put(
+            ClassId::Data,
+            SERIAL_OBJ.value(),
+            AccessMask::PUBLIC,
+            &mut buf,
+        )?;
         println!("serial: {:?}", buf.extract());
     }
 

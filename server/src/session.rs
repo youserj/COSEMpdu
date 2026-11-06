@@ -7,11 +7,11 @@
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use crate::transport::{Media, TransportRef, MAX_APDU, TRANSPORT_OVERHEAD};
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-use cosempdu::apdu_sn::Conformance;
-#[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-use cosempdu::acse::ApplicationContextName;
+use cosempdu::apdu::Conformance;
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use cosempdu::buffer::{ArrayBuffer, ByteBuffer, Reader};
+#[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
+use crate::Error;
 
 /// Размер буфера обмена сессии (APDU + транспортный заголовок).
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
@@ -37,9 +37,8 @@ pub struct Session {
     transport_ref: TransportRef,
     /// Согласованный conformance (результат AARQ/AARE для этой ассоциации).
     conformance: Conformance,
-    /// Согласованный application-context (LN vs SN referencing) — выбирает
-    /// формат error-response для некорректного APDU.
-    application_context: ApplicationContextName,
+    /// Согласованный application-context.ciphering
+    pub ciphering: bool,
     state: AssociationState,
     invoke_id: u8,
     rx: ArrayBuffer<RX_BUF>,
@@ -53,7 +52,7 @@ impl Session {
             media,
             transport_ref,
             conformance: Conformance([0; 3]),
-            application_context: ApplicationContextName::LogicalNameNoCiphering,
+            ciphering: false,
             state: AssociationState::Idle,
             invoke_id: 0,
             rx: ArrayBuffer::new(),
@@ -61,53 +60,96 @@ impl Session {
         }
     }
 
-    pub fn media(&self) -> Media { self.media }
-    pub fn transport_ref(&self) -> TransportRef { self.transport_ref }
+    pub fn media(&self) -> Media {
+        self.media
+    }
+    pub fn transport_ref(&self) -> TransportRef {
+        self.transport_ref
+    }
 
     /// Обновить настройки соединения (например, сохранить wPort клиента после
     /// разбора WPDU-заголовка).
-    pub fn set_transport_ref(&mut self, t: TransportRef) { self.transport_ref = t; }
-    pub fn state(&self) -> AssociationState { self.state }
+    pub fn set_transport_ref(&mut self, t: TransportRef) {
+        self.transport_ref = t;
+    }
+    pub fn state(&self) -> AssociationState {
+        self.state
+    }
 
     /// Обновить состояние ассоциации (например, `Associated` после AARQ).
-    pub fn set_state(&mut self, state: AssociationState) { self.state = state; }
+    pub fn set_state(&mut self, state: AssociationState) {
+        self.state = state;
+    }
 
-    pub fn conformance(&self) -> Conformance { self.conformance }
+    pub fn conformance(&self) -> Conformance {
+        self.conformance
+    }
 
-    /// Согласованный application-context (LN vs SN referencing).
-    pub fn application_context(&self) -> ApplicationContextName { self.application_context }
+    pub fn set_conformance(&mut self, conformance: Conformance) {
+        self.conformance = conformance
+    }
 
-    /// Обновить application-context после согласования AARQ/AARE.
-    pub fn set_application_context(&mut self, ctx: ApplicationContextName) { self.application_context = ctx; }
-
-    pub fn invoke_id(&self) -> u8 { self.invoke_id }
+    pub fn invoke_id(&self) -> u8 {
+        self.invoke_id
+    }
 
     /// Накопленные байты приёма (срез до текущей позиции).
-    pub fn rx(&self) -> &[u8] { self.rx.extract() }
+    pub fn rx(&self) -> &[u8] {
+        self.rx.extract()
+    }
 
     /// Длина накопленных данных приёма.
-    pub fn rx_len(&self) -> usize { self.rx.pos() }
+    pub fn rx_len(&self) -> usize {
+        self.rx.pos()
+    }
 
     /// Транзиентный `Reader` поверх принятых байт.
-    pub fn reader(&self) -> Reader<'_> { Reader::new(self.rx.extract()) }
+    pub fn reader(&self) -> Reader<'_> {
+        Reader::new(self.rx.extract())
+    }
 
     /// Полный rx-буфер для чтения из канала (затем `set_rx_len`).
-    pub fn rx_mut(&mut self) -> &mut [u8] { self.rx.as_bytes_mut() }
+    pub fn rx_mut(&mut self) -> &mut [u8] {
+        self.rx.as_bytes_mut()
+    }
 
     /// Задать длину валидных байт приёма.
-    pub fn set_rx_len(&mut self, len: usize) { let _ = self.rx.set_pos(len); }
+    pub fn set_rx_len(&mut self, len: usize) {
+        let _ = self.rx.set_pos(len);
+    }
 
     /// Байты ответа (срез до текущей позиции).
-    pub fn tx(&self) -> &[u8] { self.tx.extract() }
+    pub fn tx(&self) -> &[u8] {
+        self.tx.extract()
+    }
 
     /// Длина байт ответа.
-    pub fn tx_len(&self) -> usize { self.tx.pos() }
+    pub fn tx_len(&self) -> usize {
+        self.tx.pos()
+    }
 
     /// Транзиентный `ByteBuffer` для записи ответа (затем `set_tx_len`).
-    pub fn tx_buffer(&mut self) -> ByteBuffer<'_> { ByteBuffer::new(self.tx.as_bytes_mut()) }
+    pub fn tx_buffer(&mut self) -> ByteBuffer<'_> {
+        ByteBuffer::new(self.tx.as_bytes_mut())
+    }
 
     /// Задать длину валидных байт ответа.
-    pub fn set_tx_len(&mut self, len: usize) { let _ = self.tx.set_pos(len); }
+    pub fn set_tx_len(&mut self, len: usize) {
+        let _ = self.tx.set_pos(len);
+    }
+
+    /// Закодировать ответ в tx-буфер и зафиксировать его длину.
+    ///
+    /// Инкапсулирует повторяющуюся пару `tx_buffer()` → encode → `set_tx_len(n)`.
+    pub fn encode_tx<E, F>(&mut self, f: F) -> Result<(), Error>
+    where
+        F: FnOnce(&mut ByteBuffer<'_>) -> Result<usize, E>,
+        Error: From<E>,
+    {
+        let n = f(&mut self.tx_buffer())?;
+        self.set_tx_len(n);
+        Ok(())
+    }
 
     /// Добавить байты в rx-буфер. Возвращает `false` при переполнении.
     pub fn push_rx(&mut self, data: &[u8]) -> bool {
@@ -118,5 +160,7 @@ impl Session {
     }
 
     /// Сбросить rx-буфер (после обработки кадра).
-    pub fn clear_rx(&mut self) { self.rx.clear(); }
+    pub fn clear_rx(&mut self) {
+        self.rx.clear();
+    }
 }

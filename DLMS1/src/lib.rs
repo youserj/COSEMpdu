@@ -21,14 +21,14 @@ pub mod obis;
 
 pub use common_data_types::{
     Bcd, BitString, Boolean, CompactArray, Date, DateTime, DeltaDoubleLong,
-    DeltaDoubleLongUnsigned, DeltaInteger, DeltaLong, DeltaLongUnsigned, DeltaUnsigned,
-    DoubleLong, DoubleLongUnsigned, Enum, Float32, Float64, Integer, Long, Long64,
-    Long64Unsigned, LongUnsigned, NullData, OctetString, OctetStringSized, Time, Unsigned,
-    Utf8String, VisibleString,
+    DeltaDoubleLongUnsigned, DeltaInteger, DeltaLong, DeltaLongUnsigned, DeltaUnsigned, DoubleLong,
+    DoubleLongUnsigned, Enum, Float32, Float64, Integer, Long, Long64, Long64Unsigned,
+    LongUnsigned, NullData, OctetString, OctetStringSized, Time, Unsigned, Utf8String,
+    VisibleString,
 };
 pub use error::{Error, Result};
 pub use ic::{
-    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier,
-    CommonDataType, InterfaceClass, Validator,
+    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, CommonDataType,
+    InterfaceClass, Validator,
 };
 pub use obis::ObisCode;

@@ -5,8 +5,8 @@
 //! `Value` types and constraint specifications are deliberately not modeled
 //! here: the DLMS/COSEM PDUs are represented by their own concrete types.
 
-use crate::{Result};
-use bytebuffer::{Reader, ByteBuffer};
+use crate::Result;
+use bytebuffer::{ByteBuffer, Reader};
 
 /// Universal tag class number (X.680 Table 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,7 +66,6 @@ pub enum Class {
 }
 
 impl Class {
-
     /// Raw two-bit value used in the first tag octet.
     pub fn bits(self) -> u8 {
         match self {
@@ -148,6 +147,17 @@ impl Tag {
         })
     }
 
+    /// Decode a BER tag without advancing the buffer (X.690 §8.1.2).
+    ///
+    /// Useful for pre-reading a tag before dispatching to a specific decoder,
+    /// keeping the `Reader` position intact for reuse.
+    pub fn peek(buf: &mut Reader<'_>) -> Result<Self> {
+        let start = buf.pos();
+        let tag = Self::get(buf)?;
+        buf.set_pos(start)?;
+        Ok(tag)
+    }
+
     /// Encode a BER tag (advancing the buffer) per X.690 §8.1.2.
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         let mut initial = self.class.bits();
@@ -179,8 +189,6 @@ impl Tag {
         }
         Ok(written)
     }
-
-
 }
 
 #[cfg(test)]
@@ -192,5 +200,43 @@ mod tests {
         let t = Tag::universal(UniversalTag::Integer);
         assert_eq!(t.class, Class::Universal);
         assert_eq!(t.number, 2);
+    }
+
+    #[test]
+    fn tag_peek_does_not_advance() {
+        // [APPLICATION 0] constructed, затем [1] context primitive.
+        let bytes = [0x60, 0x81];
+        let mut r = Reader::new(&bytes);
+
+        let tag = Tag::peek(&mut r).unwrap();
+        assert_eq!(
+            tag,
+            Tag {
+                class: Class::Application,
+                number: 0,
+                constructed: true,
+            }
+        );
+        // Позиция не сдвинулась.
+        assert_eq!(r.pos(), 0);
+
+        // Повторное чтение даёт тот же тег и сдвигает буфер.
+        let tag2 = Tag::get(&mut r).unwrap();
+        assert_eq!(tag, tag2);
+        assert_eq!(r.pos(), 1);
+    }
+
+    #[test]
+    fn tag_peek_high_number_does_not_advance() {
+        // Context [31] в high-tag-number форме: 0x9F 0x1F.
+        let bytes = [0x9F, 0x1F, 0x00];
+        let mut r = Reader::new(&bytes);
+
+        let tag = Tag::peek(&mut r).unwrap();
+        assert_eq!(tag.class, Class::Context);
+        assert_eq!(tag.number, 31);
+        assert!(!tag.constructed);
+        // Двухбайтовый тег тоже прочитан без сдвига.
+        assert_eq!(r.pos(), 0);
     }
 }

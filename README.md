@@ -31,36 +31,34 @@ Requires the Rust 2021 edition.
 use cosempdu::apdu::{CosemAttributeDescriptor, GetRequest, InvokeIdAndPriority};
 use cosempdu::buffer::ByteBuffer;
 
-let get = GetRequest::Normal {
-    invoke: InvokeIdAndPriority::from_bits(0x1, true, true), // invoke_id=1, confirmed, high priority
-    descriptor: CosemAttributeDescriptor {
+let mut backing = [0u8; 4096];
+let mut buf = ByteBuffer::new(&mut backing);
+GetRequest::put_normal(
+    InvokeIdAndPriority::from_bits(0x1, true, true), // invoke_id=1, confirmed, high priority
+    CosemAttributeDescriptor {
         class_id: 8,                          // Clock object
         instance_id: [0x00, 0x00, 0x01, 0x00, 0x00, 0xff], // logical name
         attribute_id: 2,                      // attribute #2 (time)
     },
-    access_selection: None,
-};
-
-let mut backing = [0u8; 4096];
-let mut buf = ByteBuffer::new(&mut backing);
-get.put(&mut buf)?;                           // encode A-XDR bytes
+    None,                                     // no selective access
+    &mut buf,
+)?;                                          // encode A-XDR bytes
 
 buf.set_pos(0)?;
-let decoded = GetRequest::get(&mut buf)?;     // decode
-assert_eq!(decoded, get);
+if let GetRequest::Normal(n) = GetRequest::get(&mut buf)? {
+    assert_eq!(n.invoke.invoke_id(), 1);      // decode
+    assert_eq!(n.descriptor.attribute_id, 2);
+}
 ```
 
 ### ACSE (BER) Example
 
 ```rust
-use cosempdu::acse::{AARQapdu, ACSEApdu};
+use cosempdu::acse::{AARQapdu, ACSEApdu, ApplicationContextName};
 use cosempdu::buffer::ByteBuffer;
 
-let aarq = AARQapdu {
-    protocol_version: None,
-    application_context_name: vec![2, 16, 756, 5, 8, 1, 1], // LN referencing
-    user_information: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-};
+let mut aarq = AARQapdu::new(ApplicationContextName::LogicalNameNoCiphering);
+aarq.user_information = Some(b"\xDE\xAD\xBE\xEF");
 
 let mut backing = [0u8; 4096];
 let mut buf = ByteBuffer::new(&mut backing);

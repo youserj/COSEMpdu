@@ -10,8 +10,8 @@
 //! Соединения обслуживаются [`Session`] — значением с буферами `rx`/`tx`, которое
 //! принадлежит вызывающему (задаче соединения или [`Server::serve`]), а не
 //! серверу. Поэтому I/O канала не требует `&mut Server`: [`Server::on_connect`]
-//! возвращает `Session`, а [`Server::accept_association`] и
-//! [`Server::process_request`] обрабатывают уже прочитанный WPDU из `session.rx`.
+//! возвращает `Session`, а [`Server::process_request`] обрабатывает уже
+//! прочитанный WPDU из `session.rx`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -20,10 +20,16 @@ extern crate std;
 
 use core::fmt;
 
-use cosempdu::apdu::{CosemAttributeDescriptor, DataAccessResult, GetDataResultWrite, GetResponse, InvokeIdAndPriority};
+use cosempdu::apdu::{
+    CosemAttributeDescriptor, DataAccessResult, GetDataResultWrite, GetResponse,
+    InvokeIdAndPriority,
+};
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::apdu::{ExceptionResponse, GetRequest, ServiceError, SetRequest, SetResponse, StateError};
-use cosempdu::apdu_sn::Conformance;
+use cosempdu::apdu::{
+    ExceptionResponse, GetRequest, GetRequestNormal, ImplicitTagged, ServiceError_, SetRequest,
+    SetRequestNormal, SetResponse, StateError,
+};
+use cosempdu::apdu::Conformance;
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::{Codec, Data};
 use cosempdu::stream::{StreamDecoder, StreamSink};
@@ -31,9 +37,15 @@ use dlms1::ic::{AttributeKey, ClassId, InterfaceClass};
 use dlms1::obis::ObisCode;
 
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::acse::{AAREapdu, ACSEApdu, AcseServiceUser, ApplicationContextName, AssociateSourceDiagnostic, AssociationResult, ReleaseResponseReason, RLREapdu};
+use cosempdu::acse::{
+    AAREapdu, AARQapdu, ACSEApdu, AcseServiceUser, ApplicationContextName, AssociateSourceDiagnostic,
+    AssociationResult, BerTagged, RLREapdu, ReleaseResponseReason,
+};
 #[cfg(any(feature = "tcp", feature = "ble"))]
-use cosempdu::apdu_sn::{confirmed_service_error_tag, ConfirmedServiceError, Definition, InitiateRequest, InitiateResponse, ObjectName, ServiceError as SnServiceError};
+use cosempdu::apdu::{
+    confirmed_service_error_tag, ConfirmedServiceError, DLMS_VERSION_NUMBER, Initiate,
+    InitiateRequest, InitiateResponse, SnServiceError
+};
 #[cfg(any(feature = "tcp", feature = "ble"))]
 use cosempdu::buffer::Reader;
 #[cfg(any(feature = "tcp", feature = "ble"))]
@@ -181,14 +193,20 @@ impl<'a> Registry<'a> {
         }
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Бинарный поиск значения по ключу.
     pub fn get(&self, key: &AttributeKey) -> Option<&ValueRef<'a>> {
         let idx = {
             let occupied = &self.entries[..self.len];
-            occupied.binary_search_by(|e| e.as_ref().unwrap().0.cmp(key)).ok()?
+            occupied
+                .binary_search_by(|e| e.as_ref().unwrap().0.cmp(key))
+                .ok()?
         };
         Some(&self.entries[idx].as_ref().unwrap().1)
     }
@@ -197,7 +215,9 @@ impl<'a> Registry<'a> {
     pub fn get_mut(&mut self, key: &AttributeKey) -> Option<&mut ValueRef<'a>> {
         let idx = {
             let occupied = &self.entries[..self.len];
-            occupied.binary_search_by(|e| e.as_ref().unwrap().0.cmp(key)).ok()?
+            occupied
+                .binary_search_by(|e| e.as_ref().unwrap().0.cmp(key))
+                .ok()?
         };
         Some(&mut self.entries[idx].as_mut().unwrap().1)
     }
@@ -242,7 +262,6 @@ pub struct Server<'a, const N: usize = 3> {
     attributes: Registry<'a>,
     /// Conformance, предлагаемый сервером при ассоциации (AARQ).
     proposed_conformance: Conformance,
-
     #[cfg(feature = "optical")]
     optical_pool: HdlcPool<N>,
     #[cfg(feature = "tcp")]
@@ -289,7 +308,11 @@ impl<'a, const N: usize> Server<'a, N> {
     }
 
     /// Найти объект по OBIS и проверить `class_id`.
-    fn find_object(&self, class_id: ClassId, obis: &ObisCode) -> Result<&'static dyn InterfaceClass, Error> {
+    fn find_object(
+        &self,
+        class_id: ClassId,
+        obis: &ObisCode,
+    ) -> Result<&'static dyn InterfaceClass, Error> {
         let obj = self
             .objects
             .iter()
@@ -297,25 +320,43 @@ impl<'a, const N: usize> Server<'a, N> {
             .copied()
             .ok_or(Error::DataAccessResult(DataAccessResult::ObjectUnavailable))?;
         if obj.class_id() != class_id {
-            return Err(Error::DataAccessResult(DataAccessResult::ObjectClassInconsistent));
+            return Err(Error::DataAccessResult(
+                DataAccessResult::ObjectClassInconsistent,
+            ));
         }
         Ok(obj)
     }
 
     /// Зарегистрировать read-only значение.
-    pub fn add_static(&mut self, key: AttributeKey, attr: &'a dyn Codec, access: Access) -> Result<(), Error> {
+    pub fn add_static(
+        &mut self,
+        key: AttributeKey,
+        attr: &'a dyn Codec,
+        access: Access,
+    ) -> Result<(), Error> {
         self.attributes.insert(key, ValueRef::Static(attr, access))
     }
 
     /// Зарегистрировать значение, изменяемое только самим сервером.
-    pub fn add_dynamic(&mut self, key: AttributeKey, attr: &'a mut dyn Codec, access: Access) -> Result<(), Error> {
+    pub fn add_dynamic(
+        &mut self,
+        key: AttributeKey,
+        attr: &'a mut dyn Codec,
+        access: Access,
+    ) -> Result<(), Error> {
         self.attributes.insert(key, ValueRef::Dynamic(attr, access))
     }
 
     /// Зарегистрировать значение, изменяемое извне через SET (NVM).
-    pub fn add_persistent(&mut self, key: AttributeKey, attr: &'a mut dyn Codec, access: Access) -> Result<(), Error> {
+    pub fn add_persistent(
+        &mut self,
+        key: AttributeKey,
+        attr: &'a mut dyn Codec,
+        access: Access,
+    ) -> Result<(), Error> {
         // TODO: NVM — регистрация + восстановление из заводского дефолта.
-        self.attributes.insert(key, ValueRef::Persistent(attr, access))
+        self.attributes
+            .insert(key, ValueRef::Persistent(attr, access))
     }
 
     /// Найти атрибут и вернуть его значение как `&dyn Codec` (после проверки
@@ -329,11 +370,15 @@ impl<'a, const N: usize> Server<'a, N> {
         self.find_object(class_id, &key.obis)?;
         match self.attributes.get(&key).ok_or(Error::NotFound)? {
             ValueRef::Static(a, access) => {
-                if !access.read.contains(level) { return Err(Error::AccessDenied); }
+                if !access.read.contains(level) {
+                    return Err(Error::AccessDenied);
+                }
                 Ok(*a)
             }
             ValueRef::Dynamic(a, access) | ValueRef::Persistent(a, access) => {
-                if !access.read.contains(level) { return Err(Error::AccessDenied); }
+                if !access.read.contains(level) {
+                    return Err(Error::AccessDenied);
+                }
                 Ok(&**a)
             }
         }
@@ -380,8 +425,9 @@ impl<'a, const N: usize> Server<'a, N> {
 
     /// Разобрать дескриптор (class_id + OBIS + attribute_id) и найти значение.
     fn lookup_codec(&self, descriptor: CosemAttributeDescriptor) -> Result<&dyn Codec, Error> {
-        let class_id = ClassId::from_u16(descriptor.class_id)
-            .ok_or(Error::DataAccessResult(DataAccessResult::ObjectClassInconsistent))?;
+        let class_id = ClassId::from_u16(descriptor.class_id).ok_or(Error::DataAccessResult(
+            DataAccessResult::ObjectClassInconsistent,
+        ))?;
         let obis = ObisCode::from_bytes(descriptor.instance_id);
         let key = AttributeKey::new(obis, descriptor.attribute_id as u8);
         self.get_codec(class_id, key, AccessMask::PUBLIC)
@@ -398,11 +444,21 @@ impl<'a, const N: usize> Server<'a, N> {
         self.find_object(class_id, &key.obis)?;
         match self.attributes.get_mut(&key) {
             Some(ValueRef::Persistent(a, access)) => {
-                if !access.write.contains(level) { return Err(Error::DataAccessResult(DataAccessResult::ScopeOfAccessViolated)); }
-                let sink = a.stream_sink().ok_or_else(|| { Error::DataAccessResult(DataAccessResult::HardwareFault) })?;
-                Ok(StreamingSet { decoder: StreamDecoder::new(sink) })
+                if !access.write.contains(level) {
+                    return Err(Error::DataAccessResult(
+                        DataAccessResult::ScopeOfAccessViolated,
+                    ));
+                }
+                let sink = a
+                    .stream_sink()
+                    .ok_or_else(|| Error::DataAccessResult(DataAccessResult::HardwareFault))?;
+                Ok(StreamingSet {
+                    decoder: StreamDecoder::new(sink),
+                })
             }
-            Some(ValueRef::Static(..)) | Some(ValueRef::Dynamic(..)) => return Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied)),
+            Some(ValueRef::Static(..)) | Some(ValueRef::Dynamic(..)) => {
+                return Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied))
+            }
             None => return Err(Error::DataAccessResult(DataAccessResult::ObjectUndefined)),
         }
     }
@@ -410,8 +466,12 @@ impl<'a, const N: usize> Server<'a, N> {
     /// Внутреннее обновление `Dynamic`-атрибута (без проверки уровня и class_id).
     pub fn update(&mut self, key: AttributeKey, data: &Data<'_>) -> Result<(), Error> {
         match self.attributes.get_mut(&key) {
-            Some(ValueRef::Dynamic(a, _)) => { a.assign(data)?; }
-            Some(ValueRef::Static(..)) | Some(ValueRef::Persistent(..)) => return Err(Error::ReadOnly),
+            Some(ValueRef::Dynamic(a, _)) => {
+                a.assign(data)?;
+            }
+            Some(ValueRef::Static(..)) | Some(ValueRef::Persistent(..)) => {
+                return Err(Error::ReadOnly)
+            }
             None => return Err(Error::NotFound),
         }
         Ok(())
@@ -419,7 +479,9 @@ impl<'a, const N: usize> Server<'a, N> {
 
     /// Число одновременных сессий, которое поддерживает сервер.
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
-    pub const fn capacity(&self) -> usize { N }
+    pub const fn capacity(&self) -> usize {
+        N
+    }
 
     /// Создать сессию для нового соединения: занимает транспортный слот и
     /// возвращает [`Session`]. Сессия (с буферами `rx`/`tx`) принадлежит
@@ -452,42 +514,6 @@ impl<'a, const N: usize> Server<'a, N> {
         self.release(media);
     }
 
-    /// DLMS-слой: принять ассоциацию — AARQ из session.rx → AARE в session.tx.
-    ///
-    /// Сначала валидирует Wrapper-заголовок и запоминает wPort клиента (это
-    /// первый кадр), затем декодирует AARQ и кодирует AARE.
-    #[cfg(any(feature = "tcp", feature = "ble"))]
-    pub fn accept_association(
-        &self,
-        session: &mut Session,
-        received: Wrapper,
-    ) -> Result<(), Error> {
-        // Валидация Wrapper + настройки ответа (взгляд сервера).
-        let setting = validate_wrapper(session, received)?;
-        // Запомнить wPort клиента для последующих запросов.
-        session.set_transport_ref(TransportRef::Wrapper(setting));
-
-        let conf = self.proposed_conformance();
-
-        // 1. Декодировать AARQ (session.rx уже содержит только APDU).
-        let (negotiated, ctx) = {
-            let mut r = Reader::new(session.rx());
-            decode_aarq(&mut r, conf)?
-        };
-        // Запомнить referencing (LN vs SN) для error-response.
-        session.set_application_context(ctx);
-
-        // 2. Закодировать AARE WPDU прямо в session.tx.
-        let n = {
-            let mut tx = session.tx_buffer();
-            encode_aare(negotiated, ctx, &setting, &mut tx)?
-        };
-        session.set_tx_len(n);
-        // Ассоциация установлена.
-        session.set_state(AssociationState::Associated);
-        Ok(())
-    }
-
     /// Обслужить одно соединение: on_connect → ассоциация → цикл
     /// Get-запросов → on_disconnect.
     #[cfg(any(feature = "tcp", feature = "ble"))]
@@ -499,12 +525,13 @@ impl<'a, const N: usize> Server<'a, N> {
         let mut session = self.on_connect(media)?;
 
         // Цикл обслуживания: AARQ/AARE, GET/SET, RLRQ — всё через process_request.
-        // Выход по RLRQ/таймауту/закрытию/ошибке.
+        // Выход по RLRQ (state = Disconnecting)/таймауту/закрытию/ошибке.
         let result = loop {
-            match self.handle_request(&mut session, &mut channel).await {
-                Ok(true) => {}
-                Ok(false) => break Ok(()),
-                Err(e) => break Err(e),
+            if let Err(e) = self.handle_request(&mut session, &mut channel).await {
+                break Err(e);
+            }
+            if session.state() == AssociationState::Disconnecting {
+                break Ok(());
             }
         };
 
@@ -517,47 +544,114 @@ impl<'a, const N: usize> Server<'a, N> {
     /// `session.rx` и сформировать ответный WPDU прямо в `session.tx`.
     /// Сетевого I/O не делает.
     ///
-    /// Возвращает `Ok(true)`, если соединение следует продолжать, и `Ok(false)`,
-    /// если получен RLRQ (ассоциация освобождается).
+    /// Освобождение ассоциации (RLRQ) отражается в `session.state()`
+    /// (`Disconnecting`) — вызывающий по нему решает, продолжать ли цикл.
     #[cfg(any(feature = "tcp", feature = "ble"))]
     pub fn process_request(
         &mut self,
         session: &mut Session,
         received: Wrapper,
-    ) -> Result<bool, Error> {
-        // Диспетчеризация по тегу APDU (класс, номер, constructed).
+    ) -> Result<(), Error> {
+        // Диспетчеризация по тегу APDU (класс, номер, constructed) + состояние.
         let tag = {
             let mut r = Reader::new(session.rx());
             Tag::get(&mut r).map_err(Error::Codec)?
         };
 
-        match (tag.class, tag.number, tag.constructed) {
+        match (tag.class, tag.number, tag.constructed, session.state()) {
             // ACSE: AARQ = [APPLICATION 0] IMPLICIT SEQUENCE.
-            (Class::Application, 0, true) => {
-                self.accept_association(session, received)?;
-                Ok(true)
+            (Class::Application, 0, true, AssociationState::Idle) => {
+                let conf = self.proposed_conformance();
+                let aarq = {
+                    let mut r = Reader::new(session.rx());
+                    AARQapdu::get(&mut r).map_err(Error::Codec)?
+                };
+                let mut aare = AAREapdu::rejected_permanent();
+                let ui = aarq.user_information.ok_or_else(|| {
+                    Error::Codec(cosempdu::Error::Message("AARQ without user-information"))
+                })?;
+                let req = InitiateRequest::get(&mut Reader::new(ui)).map_err(Error::Codec)?;
+                let proposed_dlms_version = req.proposed_dlms_version_number;
+                let negotiated = req.proposed_conformance.intersection(conf);
+                let wrapper = validate_wrapper(&session.transport_ref(), received)?;
+
+                // Owned-поля (Copy) — извлекаем сразу, чтобы отпустить borrow
+                // на session.rx() до мутабельного доступа к session.
+                let ctx = aarq.application_context_name;
+                match ctx {
+                    ApplicationContextName::ShortNameCiphering | ApplicationContextName::ShortNameNoCiphering => {
+                        aare.application_context_name = ApplicationContextName::LogicalNameNoCiphering;
+                        aare.result_source_diagnostic = AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::ApplicationContextNameNotSupported);
+                        session.encode_tx(|out|wrapper.put(out, |buf| aare.put(buf)).map_err(Error::Codec))?;
+                        return Ok(());
+                    },
+                    ApplicationContextName::LogicalNameCiphering => {
+                        session.ciphering = true;
+                    },
+                    _ => {}
+                }
+                let mut u_i = [0u8; 64];
+                if proposed_dlms_version < DLMS_VERSION_NUMBER {
+                    // Отказ: dlms-version-too-low → AARE(RejectedPermanent) +
+                    // ConfirmedServiceError(initiate-error: dlms-version-too-low).
+                    aare.application_context_name = ctx;
+                    aare.result_source_diagnostic = AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::NoReasonGiven);
+                    let cse = ConfirmedServiceError {
+                        tag: confirmed_service_error_tag::INITIATE_ERROR,
+                        service_error: SnServiceError::Initiate(Initiate::DlmsVersionTooLow),
+                    };
+                    let cse_n = cse
+                        .put(&mut ByteBuffer::new(&mut u_i))
+                        .map_err(Error::Codec)?;
+                    aare.user_information = Some(&u_i[..cse_n]);
+                    session.encode_tx(|out|wrapper.put(out, |buf| aare.put(buf)).map_err(Error::Codec))?;
+                    return Ok(());
+                };
+               // Запомнить wPort клиента для последующих запросов.
+                session.set_transport_ref(TransportRef::Wrapper(wrapper));
+                session.set_state(AssociationState::Associating);
+
+                // Закодировать AARE WPDU прямо в session.tx.
+                // InitiateResponse (user-information) в scratch-буфер.
+                let resp = InitiateResponse::new(negotiated, MAX_APDU as u16);
+                let ir_n = resp
+                    .put(&mut ByteBuffer::new(&mut u_i))
+                    .map_err(Error::Codec)?;
+
+                aare.result = AssociationResult::Accepted;
+                aare.result_source_diagnostic = AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null);
+                aare.user_information = Some(&u_i[..ir_n]);
+                // WPDU-заголовок + AARE APDU прямо в tx.
+                session.encode_tx(|tx| wrapper.put(tx, |buf| aare.put(buf)))?;
+                session.set_conformance(negotiated);
+                // Ассоциация установлена.
+                session.set_state(AssociationState::Associated);
+            }
+            (Class::Application, 0, true, _) => {
+                build_association_not_established(session)?;
             }
             // ACSE: RLRQ = [APPLICATION 2] IMPLICIT SEQUENCE.
-            (Class::Application, 2, true) => {
+            (Class::Application, 2, true, _) => {
                 handle_release(session)?;
-                Ok(false)
             }
-            // xDLMS: Get-Request = [192] IMPLICIT CHOICE.
-            (Class::Private, 0, false) => {
+            // xDLMS: Get-Request = [192] IMPLICIT CHOICE (ассоциация установлена).
+            (Class::Private, 0, false, AssociationState::Associated) => {
                 self.process_get(session)?;
-                Ok(true)
             }
-            // xDLMS: Set-Request = [193] IMPLICIT CHOICE.
-            (Class::Private, 1, false) => {
+            // xDLMS: Set-Request = [193] IMPLICIT CHOICE (ассоциация установлена).
+            (Class::Private, 1, false, AssociationState::Associated) => {
                 self.process_set(session)?;
-                Ok(true)
+            }
+            // GET/SET при неустановленной ассоциации → "Association is not established".
+            (Class::Private, 0 | 1, false, _) => {
+                build_association_not_established(session)?;
             }
             // Table 89. Request is not well formed
             _ => {
                 build_exception_response(session)?;
-                Ok(true)
             }
         }
+        Ok(())
     }
 
     /// Get-Request (Normal, без access_selection) → Get-Response в session.tx.
@@ -567,24 +661,20 @@ impl<'a, const N: usize> Server<'a, N> {
         let (invoke, descriptor) = {
             let mut r = Reader::new(session.rx());
             match GetRequest::get(&mut r).map_err(Error::Codec)? {
-                GetRequest::Normal {
+                GetRequest::Normal(GetRequestNormal {
                     invoke,
                     descriptor,
                     access_selection: None,
-                } => (invoke, descriptor),
+                }) => (invoke, descriptor),
                 _ => return Err(Error::NotFound),
             }
         };
 
         // 2) Серверный взгляд на порты (Copy) для WPDU-заголовка.
-        let srv = server_wrapper(session)?;
+        let srv = get_wrapper(session)?;
 
         // 3) WPDU-заголовок + Get-Response прямо в session.tx.
-        let n = {
-            let mut tx = session.tx_buffer();
-            srv.put(&mut tx, |buf| self.handle_get(invoke, descriptor, buf))?
-        };
-        session.set_tx_len(n);
+        session.encode_tx(|tx| srv.put(tx, |buf| self.handle_get(invoke, descriptor, buf)))?;
         Ok(())
     }
 
@@ -596,12 +686,12 @@ impl<'a, const N: usize> Server<'a, N> {
         let (invoke, result) = {
             let mut r = Reader::new(session.rx());
             match SetRequest::get(&mut r).map_err(Error::Codec)? {
-                SetRequest::Normal {
+                SetRequest::Normal(SetRequestNormal {
                     invoke,
                     descriptor,
                     access_selection: None,
                     value,
-                } => {
+                }) => {
                     let class_id = ClassId::from_u16(descriptor.class_id).ok_or(Error::NotFound)?;
                     let obis = ObisCode::from_bytes(descriptor.instance_id);
                     let key = AttributeKey::new(obis, descriptor.attribute_id as u8);
@@ -624,36 +714,30 @@ impl<'a, const N: usize> Server<'a, N> {
         };
 
         // 2) Серверный взгляд на порты (Copy) для WPDU-заголовка.
-        let srv = server_wrapper(session)?;
+        let srv = get_wrapper(session)?;
 
         // 3) WPDU-заголовок + Set-Response прямо в session.tx.
-        let n = {
-            let mut tx = session.tx_buffer();
-            srv.put(&mut tx, |buf| {
-                SetResponse::put_normal(invoke, result, buf)
-            })?
-        };
-        session.set_tx_len(n);
+        session.encode_tx(|tx| srv.put(tx, |buf| SetResponse::put_normal(invoke, result, buf)))?;
         Ok(())
     }
 
-    /// Обслужить один xDLMS-запрос после ассоциации: прочитать WPDU в session.rx,
-    /// обработать ([`Server::process_request`]) и отправить ответ из session.tx.
-    /// Возвращает `Ok(false)`, если получен RLRQ (ассоциация освобождена).
+    /// Обслужить один xDLMS-запрос: прочитать WPDU в session.rx, обработать
+    /// ([`Server::process_request`]) и отправить ответ из session.tx.
+    /// Освобождение ассоциации отражается в `session.state()`.
     #[cfg(any(feature = "tcp", feature = "ble"))]
     async fn handle_request<C: Channel<Frame = Wrapper>>(
         &mut self,
         session: &mut Session,
         channel: &mut C,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         let received = channel.read(session.rx_mut()).await.map_err(Error::Codec)?;
         session.set_rx_len(received.apdu_len() as usize);
 
-        let keep = self.process_request(session, received)?;
+        self.process_request(session, received)?;
 
         channel.write(session.tx()).await.map_err(Error::Codec)?;
         session.clear_rx();
-        Ok(keep)
+        Ok(())
     }
 
     #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
@@ -671,10 +755,7 @@ impl<'a, const N: usize> Server<'a, N> {
 
 impl<'a> Server<'a, 3> {
     /// Создать сервер с дефолтным числом сессий (3) и предлагаемым conformance.
-    pub fn new(
-        objects: &'static [&'static dyn InterfaceClass],
-        conformance: Conformance,
-    ) -> Self {
+    pub fn new(objects: &'static [&'static dyn InterfaceClass], conformance: Conformance) -> Self {
         Self::with_capacity(objects, conformance)
     }
 }
@@ -682,9 +763,9 @@ impl<'a> Server<'a, 3> {
 /// Транспортный слой: валидация Wrapper-заголовка (WPDU адресован нашему wPort)
 /// и построение настроек ответа (взгляд сервера: наш wPort → wPort клиента).
 #[cfg(any(feature = "tcp", feature = "ble"))]
-fn validate_wrapper(session: &mut Session, received: Wrapper) -> Result<Wrapper, Error> {
+fn validate_wrapper(transport: &TransportRef, received: Wrapper) -> Result<Wrapper, Error> {
     // Собственный wPort сервера уже сохранён в TransportRef при on_connect.
-    let server_port = match session.transport_ref() {
+    let server_port = match transport {
         TransportRef::Wrapper(s) => s.source_port(),
         #[cfg(feature = "optical")]
         TransportRef::Hdlc(_) => {
@@ -707,7 +788,7 @@ fn validate_wrapper(session: &mut Session, received: Wrapper) -> Result<Wrapper,
 
 /// Серверный взгляд на порты (Copy) для WPDU-заголовка ответа.
 #[cfg(any(feature = "tcp", feature = "ble"))]
-fn server_wrapper(session: &Session) -> Result<Wrapper, Error> {
+fn get_wrapper(session: &Session) -> Result<Wrapper, Error> {
     match session.transport_ref() {
         TransportRef::Wrapper(s) => Ok(s),
         #[cfg(feature = "optical")]
@@ -720,37 +801,34 @@ fn server_wrapper(session: &Session) -> Result<Wrapper, Error> {
 /// Неизвестный/некорректно сформированный APDU → error-response адресату.
 ///
 /// LN referencing — `ExceptionResponse` (service-unknown, operation-not-possible);
-/// SN referencing — `ConfirmedServiceError` (read, definition: other).
+/// SN referencing — not used.
 #[cfg(any(feature = "tcp", feature = "ble"))]
 fn build_exception_response(session: &mut Session) -> Result<(), Error> {
     // Серверный взгляд на порты (Copy) для WPDU-заголовка ответа.
-    let srv = server_wrapper(session)?;
-    let ctx = session.application_context();
-
-    let n = {
-        let mut tx = session.tx_buffer();
-        match ctx {
-            ApplicationContextName::LogicalNameNoCiphering
-            | ApplicationContextName::LogicalNameCiphering => {
-                let exc = ExceptionResponse {
-                    state_error: StateError::ServiceUnknown,
-                    service_error: ServiceError::OperationNotPossible,
-                };
-                srv.put(&mut tx, |buf| exc.put(buf))?
-            }
-            ApplicationContextName::ShortNameNoCiphering
-            | ApplicationContextName::ShortNameCiphering => {
-                let cse = ConfirmedServiceError {
-                    tag: confirmed_service_error_tag::READ,
-                    service_error: SnServiceError::Definition(Definition::Other),
-                };
-                srv.put(&mut tx, |buf| cse.put(buf))?
-            }
-        }
+    let wrapper = get_wrapper(session)?;
+    let exc = ExceptionResponse {
+        state_error: StateError::ServiceUnknown,
+        service_error: ServiceError_::OperationNotPossible,
     };
-    session.set_tx_len(n);
+    session.encode_tx(|tx| wrapper.put(tx, |buf| exc.put(buf)))?;
     Ok(())
 }
+
+
+/// LN referencing — `ExceptionResponse` (service-not-allowed, operation-not-possible).
+#[cfg(any(feature = "tcp", feature = "ble"))]
+fn build_association_not_established(session: &mut Session) -> Result<(), Error> {
+    let wrapper = get_wrapper(session)?;
+    session.encode_tx(|tx| {
+        let exc = ExceptionResponse {
+            state_error: StateError::ServiceNotAllowed,
+            service_error: ServiceError_::OperationNotPossible,
+        };
+        wrapper.put(tx, |buf| exc.put(buf))
+    })?;
+    Ok(())
+}
+
 
 /// RLRQ → RLRE: подтвердить освобождение ассоциации и записать RLRE в session.tx.
 #[cfg(any(feature = "tcp", feature = "ble"))]
@@ -763,81 +841,19 @@ fn handle_release(session: &mut Session) -> Result<(), Error> {
     }
 
     // Серверный взгляд на порты (Copy) для WPDU-заголовка ответа.
-    let srv = server_wrapper(session)?;
+    let srv = get_wrapper(session)?;
 
     // RLRE (reason normal) в session.tx.
-    let n = {
-        let mut tx = session.tx_buffer();
+    session.encode_tx(|tx| {
         let rlre = RLREapdu {
             reason: Some(ReleaseResponseReason::Normal),
             user_information: None,
         };
-        srv.put(&mut tx, |buf| rlre.put(buf))?
-    };
-    session.set_tx_len(n);
+        srv.put(tx, |buf| rlre.put(buf))
+    })?;
+    session.set_state(AssociationState::Disconnecting);
     Ok(())
 }
-
-/// AARQ APDU → согласованный conformance и application-context-name.
-#[cfg(any(feature = "tcp", feature = "ble"))]
-fn decode_aarq(
-    reader: &mut Reader<'_>,
-    server_conf: Conformance,
-) -> Result<(Conformance, ApplicationContextName), Error> {
-    let acse = ACSEApdu::get(reader).map_err(Error::Codec)?;
-    let aarq = match acse {
-        ACSEApdu::Aarq(a) => a,
-        _ => return Err(Error::Codec(cosempdu::Error::Message("expected AARQ"))),
-    };
-    let ui = aarq
-        .user_information
-        .ok_or_else(|| Error::Codec(cosempdu::Error::Message("AARQ without user-information")))?;
-    let req = InitiateRequest::get(&mut Reader::new(ui)).map_err(Error::Codec)?;
-
-    // Согласование: пересечение возможностей клиента и сервера.
-    let (c, s) = (req.proposed_conformance.0, server_conf.0);
-    let negotiated = Conformance([c[0] & s[0], c[1] & s[1], c[2] & s[2]]);
-    Ok((negotiated, aarq.application_context_name))
-}
-
-/// AARE WPDU (заголовок + APDU) прямо в `out`. Транспортно-независимо.
-#[cfg(any(feature = "tcp", feature = "ble"))]
-fn encode_aare(
-    negotiated: Conformance,
-    ctx: ApplicationContextName,
-    setting: &Wrapper,
-    out: &mut ByteBuffer<'_>,
-) -> Result<usize, Error> {
-    let resp = InitiateResponse {
-        negotiated_quality_of_service: None,
-        negotiated_dlms_version_number: 6,
-        negotiated_conformance: negotiated,
-        server_max_receive_pdu_size: MAX_APDU as u16,
-        vaa_name: ObjectName(0x0007),
-    };
-    let mut ir = [0u8; 64];
-    let n = resp.put(&mut ByteBuffer::new(&mut ir)).map_err(Error::Codec)?;
-
-    let aare = AAREapdu {
-        protocol_version: None,
-        application_context_name: ctx,
-        result: AssociationResult::Accepted,
-        result_source_diagnostic: AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null),
-        responding_ap_title: None,
-        responding_ae_qualifier: None,
-        responding_ap_invocation_id: None,
-        responding_ae_invocation_id: None,
-        responder_acse_requirements: None,
-        mechanism_name: None,
-        responding_authentication_value: None,
-        implementation_information: None,
-        user_information: Some(&ir[..n]),
-    };
-
-    // WPDU-заголовок + AARE APDU прямо в out.
-    setting.put(out, |buf| aare.put(buf)).map_err(Error::Codec)
-}
-
 
 /// Дескриптор потокового SET: держит декодер поверх приёмника атрибута, пока
 /// принимаются блоки значения.
@@ -862,11 +878,16 @@ impl<'s> StreamingSet<'s> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dlms1::common_data_types::{DateTime, DoubleLongUnsigned, OctetString};
-    use dlms1::ic::{Clock, DataObject, Register, RegisterActivation, RegisterAssignmentValue, ScalUnit};
-    use cosempdu::apdu::{CosemAttributeDescriptor, GetDataResult, InvokeIdAndPriority};
-    use cosempdu::apdu_sn::Conformance;
+    use cosempdu::apdu::{
+        CosemAttributeDescriptor, GetDataResult, GetResponseNormal, ImplicitTagged,
+        InvokeIdAndPriority,
+    };
+    use cosempdu::apdu::Conformance;
     use cosempdu::buffer::Reader;
+    use dlms1::common_data_types::{DateTime, DoubleLongUnsigned, OctetString};
+    use dlms1::ic::{
+        Clock, DataObject, Register, RegisterActivation, RegisterAssignmentValue, ScalUnit,
+    };
 
     const CONF: Conformance = Conformance([0x00, 0x7E, 0x1F]);
 
@@ -888,7 +909,9 @@ mod tests {
         // 1) сервер + зарегистрированный атрибут (Register attr 2 = value)
         let mut server = Server::new(OBJECTS, CONF);
         let reg = DoubleLongUnsigned(42);
-        server.add_static(REG_OBJ.attr_key(2).unwrap(), &reg, reg_access()).unwrap();
+        server
+            .add_static(REG_OBJ.attr_key(2).unwrap(), &reg, reg_access())
+            .unwrap();
 
         // 2) обработать GetRequest::Normal напрямую (owned invoke + descriptor)
         let invoke = InvokeIdAndPriority::from_bits(1, true, false);
@@ -911,7 +934,10 @@ mod tests {
 
         // 4) сверить
         match resp {
-            GetResponse::Normal { invoke, result: GetDataResult::Data(r) } => {
+            GetResponse::Normal(GetResponseNormal {
+                invoke,
+                result: GetDataResult::Data(r),
+            }) => {
                 assert_eq!(invoke.invoke_id(), 1);
                 let mut eb = [0u8; 16];
                 let en = {
@@ -947,7 +973,10 @@ mod tests {
         };
 
         match resp {
-            GetResponse::Normal { invoke, result: GetDataResult::DataAccessError(code) } => {
+            GetResponse::Normal(GetResponseNormal {
+                invoke,
+                result: GetDataResult::DataAccessError(code),
+            }) => {
                 assert_eq!(invoke.invoke_id(), 1);
                 assert_eq!(code, DataAccessResult::ObjectUnavailable);
             }
@@ -976,7 +1005,10 @@ mod tests {
     #[test]
     fn registry_sorted_insert_and_search() {
         static A: DoubleLongUnsigned = DoubleLongUnsigned(1);
-        let acc = Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR };
+        let acc = Access {
+            read: AccessMask::PUBLIC,
+            write: AccessMask::CONFIGURATOR,
+        };
         let mut r = Registry::new();
         let k1 = AttributeKey::new(ObisCode::new(1, 0, 0, 0, 0, 0), 1);
         let k2 = AttributeKey::new(ObisCode::new(2, 0, 0, 0, 0, 0), 1);
@@ -988,7 +1020,9 @@ mod tests {
         assert!(r.get(&k1).is_some());
         assert!(r.get(&k2).is_some());
         assert!(r.get(&k3).is_some());
-        assert!(r.get(&AttributeKey::new(ObisCode::new(9, 9, 9, 9, 9, 9), 1)).is_none());
+        assert!(r
+            .get(&AttributeKey::new(ObisCode::new(9, 9, 9, 9, 9, 9), 1))
+            .is_none());
     }
 
     #[test]
@@ -997,56 +1031,172 @@ mod tests {
 
         static SN: DoubleLongUnsigned = DoubleLongUnsigned(123456);
         let serial = SERIAL_OBJ.value();
-        server.add_static(serial, &SN, Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR }).unwrap();
+        server
+            .add_static(
+                serial,
+                &SN,
+                Access {
+                    read: AccessMask::PUBLIC,
+                    write: AccessMask::CONFIGURATOR,
+                },
+            )
+            .unwrap();
 
         let mut register = DoubleLongUnsigned(230000);
         let rw = REG_OBJ.value();
-        server.add_persistent(rw, &mut register, reg_access()).unwrap();
+        server
+            .add_persistent(rw, &mut register, reg_access())
+            .unwrap();
 
         let mut backing = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut backing);
-        server.put(ClassId::Register, REG_OBJ.value(), AccessMask::READER, &mut buf).unwrap();
+        server
+            .put(
+                ClassId::Register,
+                REG_OBJ.value(),
+                AccessMask::READER,
+                &mut buf,
+            )
+            .unwrap();
         assert_eq!(buf.extract(), &[0x06, 0x00, 0x03, 0x82, 0x70]);
 
-        set_data(&mut server, ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR, &Data::DoubleLongUnsigned(1)).unwrap();
+        set_data(
+            &mut server,
+            ClassId::Register,
+            REG_OBJ.value(),
+            AccessMask::CONFIGURATOR,
+            &Data::DoubleLongUnsigned(1),
+        )
+        .unwrap();
         {
             let mut backing = [0u8; 64];
             let mut buf = ByteBuffer::new(&mut backing);
-            server.put(ClassId::Register, REG_OBJ.value(), AccessMask::PUBLIC, &mut buf).unwrap();
+            server
+                .put(
+                    ClassId::Register,
+                    REG_OBJ.value(),
+                    AccessMask::PUBLIC,
+                    &mut buf,
+                )
+                .unwrap();
             assert_eq!(buf.extract(), &[0x06, 0x00, 0x00, 0x00, 0x01]);
         }
 
-        assert_eq!(server.put(ClassId::Register, REG_OBJ.value(), AccessMask(1 << 3), &mut buf), Err(Error::AccessDenied));
-        assert_eq!(set_data(&mut server, ClassId::Register, REG_OBJ.value(), AccessMask::PUBLIC, &Data::DoubleLongUnsigned(2)), Err(Error::DataAccessResult(DataAccessResult::ScopeOfAccessViolated)));
-        assert!(set_data(&mut server, ClassId::Register, REG_OBJ.value(), AccessMask::CONFIGURATOR, &Data::Unsigned(200)).is_err());
-        assert_eq!(set_data(&mut server, ClassId::Data, SERIAL_OBJ.value(), AccessMask::CONFIGURATOR, &Data::Unsigned(0)), Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied)));
+        assert_eq!(
+            server.put(
+                ClassId::Register,
+                REG_OBJ.value(),
+                AccessMask(1 << 3),
+                &mut buf
+            ),
+            Err(Error::AccessDenied)
+        );
+        assert_eq!(
+            set_data(
+                &mut server,
+                ClassId::Register,
+                REG_OBJ.value(),
+                AccessMask::PUBLIC,
+                &Data::DoubleLongUnsigned(2)
+            ),
+            Err(Error::DataAccessResult(
+                DataAccessResult::ScopeOfAccessViolated
+            ))
+        );
+        assert!(set_data(
+            &mut server,
+            ClassId::Register,
+            REG_OBJ.value(),
+            AccessMask::CONFIGURATOR,
+            &Data::Unsigned(200)
+        )
+        .is_err());
+        assert_eq!(
+            set_data(
+                &mut server,
+                ClassId::Data,
+                SERIAL_OBJ.value(),
+                AccessMask::CONFIGURATOR,
+                &Data::Unsigned(0)
+            ),
+            Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied))
+        );
 
         let missing = ObisCode::new(0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
-        assert_eq!(server.put(ClassId::Register, AttributeKey::new(missing, 2), AccessMask::PUBLIC, &mut buf), Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable)));
-        assert_eq!(set_data(&mut server, ClassId::Register, AttributeKey::new(missing, 2), AccessMask::PUBLIC, &Data::NullData), Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable)));
+        assert_eq!(
+            server.put(
+                ClassId::Register,
+                AttributeKey::new(missing, 2),
+                AccessMask::PUBLIC,
+                &mut buf
+            ),
+            Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable))
+        );
+        assert_eq!(
+            set_data(
+                &mut server,
+                ClassId::Register,
+                AttributeKey::new(missing, 2),
+                AccessMask::PUBLIC,
+                &Data::NullData
+            ),
+            Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable))
+        );
     }
 
     #[test]
     fn server_dynamic_update() {
         let mut server = Server::new(OBJECTS, CONF);
         let mut clock_time = DateTime([0; 12]);
-        server.add_dynamic(CLOCK_OBJ.time(), &mut clock_time, reg_access()).unwrap();
+        server
+            .add_dynamic(CLOCK_OBJ.time(), &mut clock_time, reg_access())
+            .unwrap();
 
-        let t: [u8; 12] = [0x07, 0xE8, 0x0A, 0x09, 0x00, 0x0F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0xFF];
+        let t: [u8; 12] = [
+            0x07, 0xE8, 0x0A, 0x09, 0x00, 0x0F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0xFF,
+        ];
         server.update(CLOCK_OBJ.time(), &Data::DateTime(t)).unwrap();
         {
             let mut backing = [0u8; 64];
             let mut buf = ByteBuffer::new(&mut backing);
-            server.put(ClassId::Clock, CLOCK_OBJ.time(), AccessMask::PUBLIC, &mut buf).unwrap();
-            assert_eq!(buf.extract(), &[0x19, 0x07, 0xE8, 0x0A, 0x09, 0x00, 0x0F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0xFF]);
+            server
+                .put(
+                    ClassId::Clock,
+                    CLOCK_OBJ.time(),
+                    AccessMask::PUBLIC,
+                    &mut buf,
+                )
+                .unwrap();
+            assert_eq!(
+                buf.extract(),
+                &[0x19, 0x07, 0xE8, 0x0A, 0x09, 0x00, 0x0F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0xFF]
+            );
         }
 
-        assert_eq!(set_data(&mut server, ClassId::Clock, CLOCK_OBJ.time(), AccessMask::CONFIGURATOR, &Data::DateTime(t)), Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied)));
+        assert_eq!(
+            set_data(
+                &mut server,
+                ClassId::Clock,
+                CLOCK_OBJ.time(),
+                AccessMask::CONFIGURATOR,
+                &Data::DateTime(t)
+            ),
+            Err(Error::DataAccessResult(DataAccessResult::ReadWriteDenied))
+        );
 
-        let mut p = ScalUnit { scaler: 0, unit: 255 };
+        let mut p = ScalUnit {
+            scaler: 0,
+            unit: 255,
+        };
         let pkey = REG_OBJ.scaler_unit();
         server.add_persistent(pkey, &mut p, reg_access()).unwrap();
-        assert_eq!(server.update(REG_OBJ.scaler_unit(), &Data::Structure(&[Data::Integer(0), Data::Enum(255)])), Err(Error::ReadOnly));
+        assert_eq!(
+            server.update(
+                REG_OBJ.scaler_unit(),
+                &Data::Structure(&[Data::Integer(0), Data::Enum(255)])
+            ),
+            Err(Error::ReadOnly)
+        );
     }
 
     #[test]
@@ -1054,7 +1204,9 @@ mod tests {
         let mut server = Server::new(OBJECTS, CONF);
         let mut register = DoubleLongUnsigned(0);
         let key = REG_OBJ.value();
-        server.add_persistent(key, &mut register, reg_access()).unwrap();
+        server
+            .add_persistent(key, &mut register, reg_access())
+            .unwrap();
 
         // Encode DoubleLongUnsigned(42) = [tag 6, 0x00, 0x00, 0x00, 0x2A].
         let mut backing = [0u8; 64];
@@ -1064,7 +1216,9 @@ mod tests {
         };
 
         {
-            let mut s = server.stream_set(ClassId::Register, key, AccessMask::CONFIGURATOR).unwrap();
+            let mut s = server
+                .stream_set(ClassId::Register, key, AccessMask::CONFIGURATOR)
+                .unwrap();
             let mid = n / 2;
             s.push(&backing[..mid]).unwrap();
             s.push(&backing[mid..n]).unwrap();
@@ -1073,14 +1227,19 @@ mod tests {
 
         let mut out = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut out);
-        server.put(ClassId::Register, key, AccessMask::PUBLIC, &mut buf).unwrap();
+        server
+            .put(ClassId::Register, key, AccessMask::PUBLIC, &mut buf)
+            .unwrap();
         assert_eq!(buf.extract(), &[0x06, 0x00, 0x00, 0x00, 0x2A]);
     }
 
     #[test]
     fn server_stream_set_composite() {
         let mut server = Server::new(OBJECTS, CONF);
-        let mut scal = ScalUnit { scaler: 0, unit: 255 };
+        let mut scal = ScalUnit {
+            scaler: 0,
+            unit: 255,
+        };
         let key = REG_OBJ.scaler_unit();
         server.add_persistent(key, &mut scal, reg_access()).unwrap();
 
@@ -1088,18 +1247,24 @@ mod tests {
         let mut backing = [0u8; 64];
         let n = {
             let mut buf = ByteBuffer::new(&mut backing);
-            Data::Structure(&[Data::Integer(3), Data::Enum(1)]).put(&mut buf).unwrap()
+            Data::Structure(&[Data::Integer(3), Data::Enum(1)])
+                .put(&mut buf)
+                .unwrap()
         };
 
         {
-            let mut s = server.stream_set(ClassId::Register, key, AccessMask::CONFIGURATOR).unwrap();
+            let mut s = server
+                .stream_set(ClassId::Register, key, AccessMask::CONFIGURATOR)
+                .unwrap();
             s.push(&backing[..n]).unwrap();
             s.finish().unwrap();
         }
 
         let mut out = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut out);
-        server.put(ClassId::Register, key, AccessMask::PUBLIC, &mut buf).unwrap();
+        server
+            .put(ClassId::Register, key, AccessMask::PUBLIC, &mut buf)
+            .unwrap();
         assert_eq!(buf.extract(), &[0x02, 0x02, 0x0F, 0x03, 0x16, 0x01]);
     }
 
@@ -1108,7 +1273,9 @@ mod tests {
         let mut server = Server::new(OBJECTS, CONF);
         let mut value: OctetString<60> = OctetString::default();
         let key = REG_OBJ.value();
-        server.add_persistent(key, &mut value, reg_access()).unwrap();
+        server
+            .add_persistent(key, &mut value, reg_access())
+            .unwrap();
 
         // ~60-байтный octet-string, детерминированный паттерн (без heap).
         let content: [u8; 60] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
@@ -1119,7 +1286,9 @@ mod tests {
         };
 
         {
-            let mut s = server.stream_set(ClassId::Register, key, AccessMask::CONFIGURATOR).unwrap();
+            let mut s = server
+                .stream_set(ClassId::Register, key, AccessMask::CONFIGURATOR)
+                .unwrap();
             for chunk in backing[..n].chunks(20) {
                 s.push(chunk).unwrap();
             }
@@ -1128,7 +1297,9 @@ mod tests {
 
         let mut out = [0u8; 128];
         let mut buf = ByteBuffer::new(&mut out);
-        server.put(ClassId::Register, key, AccessMask::PUBLIC, &mut buf).unwrap();
+        server
+            .put(ClassId::Register, key, AccessMask::PUBLIC, &mut buf)
+            .unwrap();
         assert_eq!(buf.extract(), &backing[..n]);
     }
 
@@ -1139,11 +1310,25 @@ mod tests {
         let key = REG_OBJ.scaler_unit();
         server.add_persistent(key, &mut scal, reg_access()).unwrap();
 
-        set_data(&mut server, ClassId::Register, REG_OBJ.scaler_unit(), AccessMask::CONFIGURATOR, &Data::Structure(&[Data::Integer(7), Data::Enum(2)])).unwrap();
+        set_data(
+            &mut server,
+            ClassId::Register,
+            REG_OBJ.scaler_unit(),
+            AccessMask::CONFIGURATOR,
+            &Data::Structure(&[Data::Integer(7), Data::Enum(2)]),
+        )
+        .unwrap();
         {
             let mut backing = [0u8; 64];
             let mut buf = ByteBuffer::new(&mut backing);
-            server.put(ClassId::Register, REG_OBJ.scaler_unit(), AccessMask::PUBLIC, &mut buf).unwrap();
+            server
+                .put(
+                    ClassId::Register,
+                    REG_OBJ.scaler_unit(),
+                    AccessMask::PUBLIC,
+                    &mut buf,
+                )
+                .unwrap();
             assert_eq!(buf.extract(), &[0x02, 0x02, 0x0F, 0x07, 0x16, 0x02]);
         }
 
@@ -1162,20 +1347,44 @@ mod tests {
         let mut server = Server::new(OBJECTS, CONF);
         let mut register = DoubleLongUnsigned(0);
         let key = REG_OBJ.value();
-        server.add_persistent(key, &mut register, reg_access()).unwrap();
+        server
+            .add_persistent(key, &mut register, reg_access())
+            .unwrap();
 
         let mut backing = [0u8; 64];
         let mut buf = ByteBuffer::new(&mut backing);
 
-        server.put(ClassId::Register, REG_OBJ.value(), AccessMask::PUBLIC, &mut buf).unwrap();
+        server
+            .put(
+                ClassId::Register,
+                REG_OBJ.value(),
+                AccessMask::PUBLIC,
+                &mut buf,
+            )
+            .unwrap();
 
         assert!(matches!(
-            server.put(ClassId::Clock, REG_OBJ.value(), AccessMask::PUBLIC, &mut buf),
-            Err(Error::DataAccessResult(DataAccessResult::ObjectClassInconsistent))
+            server.put(
+                ClassId::Clock,
+                REG_OBJ.value(),
+                AccessMask::PUBLIC,
+                &mut buf
+            ),
+            Err(Error::DataAccessResult(
+                DataAccessResult::ObjectClassInconsistent
+            ))
         ));
 
         let unknown = ObisCode::new(9, 9, 9, 9, 9, 9);
-        assert_eq!(server.put(ClassId::Register, AttributeKey::new(unknown, 2), AccessMask::PUBLIC, &mut buf), Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable)));
+        assert_eq!(
+            server.put(
+                ClassId::Register,
+                AttributeKey::new(unknown, 2),
+                AccessMask::PUBLIC,
+                &mut buf
+            ),
+            Err(Error::DataAccessResult(DataAccessResult::ObjectUnavailable))
+        );
     }
 
     #[test]
@@ -1184,13 +1393,21 @@ mod tests {
         let mut server = Server::new(OBJECTS, CONF);
         let key = RA_OBJ.register_assignment();
         let mut value = RegisterAssignmentValue::<2>::default();
-        server.add_persistent(key, &mut value, reg_access()).unwrap();
+        server
+            .add_persistent(key, &mut value, reg_access())
+            .unwrap();
 
         // 2. Кодируем array из 2 object_definition.
-        let ln0 = ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL;   // 1.0.1.8.0.255
-        let ln1 = ObisCode::ACTIVE_ENERGY_EXPORT_TOTAL;   // 1.0.2.8.0.255
-        let f0 = [Data::LongUnsigned(ClassId::Register.as_u16()), Data::OctetString(&ln0.bytes)];
-        let f1 = [Data::LongUnsigned(ClassId::ExtendedRegister.as_u16()), Data::OctetString(&ln1.bytes)];
+        let ln0 = ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL; // 1.0.1.8.0.255
+        let ln1 = ObisCode::ACTIVE_ENERGY_EXPORT_TOTAL; // 1.0.2.8.0.255
+        let f0 = [
+            Data::LongUnsigned(ClassId::Register.as_u16()),
+            Data::OctetString(&ln0.bytes),
+        ];
+        let f1 = [
+            Data::LongUnsigned(ClassId::ExtendedRegister.as_u16()),
+            Data::OctetString(&ln1.bytes),
+        ];
         let items = [Data::Structure(&f0), Data::Structure(&f1)];
         let mut backing = [0u8; 128];
         let n = {
@@ -1200,7 +1417,9 @@ mod tests {
 
         // 3. Потоковый приём за 3 прохода через сервер.
         {
-            let mut s = server.stream_set(ClassId::RegisterActivation, key, AccessMask::CONFIGURATOR).unwrap();
+            let mut s = server
+                .stream_set(ClassId::RegisterActivation, key, AccessMask::CONFIGURATOR)
+                .unwrap();
             let a = n / 3;
             let b = 2 * a;
             s.push(&backing[..a]).unwrap();
@@ -1212,12 +1431,24 @@ mod tests {
         // 4. Сверяем выдачу.
         let mut out = [0u8; 128];
         let mut buf = ByteBuffer::new(&mut out);
-        server.put(ClassId::RegisterActivation, key, AccessMask::PUBLIC, &mut buf).unwrap();
-        assert_eq!(buf.extract(), &[
-            0x01, 0x02,                                                             // array {2}
-            0x02, 0x02, 0x12, 0x00, 0x03, 0x09, 0x06, 0x01, 0x00, 0x01, 0x08, 0x00, 0xFF, // {Register, 1.0.1.8.0.255}
-            0x02, 0x02, 0x12, 0x00, 0x04, 0x09, 0x06, 0x01, 0x00, 0x02, 0x08, 0x00, 0xFF, // {ExtendedRegister, 1.0.2.8.0.255}
-        ]);
+        server
+            .put(
+                ClassId::RegisterActivation,
+                key,
+                AccessMask::PUBLIC,
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(
+            buf.extract(),
+            &[
+                0x01, 0x02, // array {2}
+                0x02, 0x02, 0x12, 0x00, 0x03, 0x09, 0x06, 0x01, 0x00, 0x01, 0x08, 0x00,
+                0xFF, // {Register, 1.0.1.8.0.255}
+                0x02, 0x02, 0x12, 0x00, 0x04, 0x09, 0x06, 0x01, 0x00, 0x02, 0x08, 0x00,
+                0xFF, // {ExtendedRegister, 1.0.2.8.0.255}
+            ]
+        );
     }
 
     #[test]
@@ -1226,21 +1457,40 @@ mod tests {
         let entry = size_of::<Option<(AttributeKey, ValueRef<'static>)>>();
         let registry = size_of::<Registry<'static>>();
 
-        println!("AccessMask                  = {} B", size_of::<AccessMask>());
+        println!(
+            "AccessMask                  = {} B",
+            size_of::<AccessMask>()
+        );
         println!("Access                      = {} B", size_of::<Access>());
-        println!("AttributeKey                = {} B", size_of::<AttributeKey>());
-        println!("ValueRef<'static>           = {} B", size_of::<ValueRef<'static>>());
+        println!(
+            "AttributeKey                = {} B",
+            size_of::<AttributeKey>()
+        );
+        println!(
+            "ValueRef<'static>           = {} B",
+            size_of::<ValueRef<'static>>()
+        );
         println!("entry Option<(key, ValueRef)> = {} B", entry);
-        println!("Registry<'static>           = {} B ({} slots)", registry, MAX_ATTRS);
-        println!("Server<'static, 3>          = {} B", size_of::<Server<'static>>());
-        println!("registry per 1000 attrs     = {} B ~ {} KB", entry * 1000, entry * 1000 / 1024);
+        println!(
+            "Registry<'static>           = {} B ({} slots)",
+            registry, MAX_ATTRS
+        );
+        println!(
+            "Server<'static, 3>          = {} B",
+            size_of::<Server<'static>>()
+        );
+        println!(
+            "registry per 1000 attrs     = {} B ~ {} KB",
+            entry * 1000,
+            entry * 1000 / 1024
+        );
     }
 }
 
 #[cfg(all(test, feature = "optical"))]
 mod transport_tests {
     use crate::{Error, Media, Server, RX_BUF};
-    use cosempdu::apdu_sn::Conformance;
+    use cosempdu::apdu::Conformance;
     use dlms1::ic::InterfaceClass;
 
     const CONF: Conformance = Conformance([0x00, 0x7E, 0x1F]);
@@ -1256,7 +1506,10 @@ mod transport_tests {
         let _s2 = server.on_connect(Media::Optical).unwrap();
 
         // Лимит слотов пула оптики (N = 3) исчерпан.
-        assert!(matches!(server.on_connect(Media::Optical), Err(Error::NoSlot)));
+        assert!(matches!(
+            server.on_connect(Media::Optical),
+            Err(Error::NoSlot)
+        ));
 
         // Освобождение слота возвращает его в пул.
         server.on_disconnect(s0.media());
@@ -1280,8 +1533,8 @@ mod transport_tests {
 #[cfg(all(test, any(feature = "tcp", feature = "ble")))]
 mod wrapper_tests {
     use crate::{Media, Server, TransportRef, Wrapper};
-    use cosempdu::acse::{ACSEApdu, ReleaseRequestReason, ReleaseResponseReason, RLRQapdu};
-    use cosempdu::apdu_sn::Conformance;
+    use cosempdu::acse::{ACSEApdu, RLRQapdu, ReleaseRequestReason, ReleaseResponseReason};
+    use cosempdu::apdu::Conformance;
     use cosempdu::buffer::{ByteBuffer, Reader};
     use dlms1::ic::InterfaceClass;
 
@@ -1311,6 +1564,8 @@ mod wrapper_tests {
     #[cfg(feature = "tcp")]
     #[test]
     fn process_request_handles_rlrq() {
+        use crate::AssociationState;
+
         let mut server: Server = Server::new(NO_OBJECTS, CONF);
         server.set_wport(1);
         let mut session = server.on_connect(Media::Tcp).unwrap();
@@ -1331,8 +1586,11 @@ mod wrapper_tests {
         session.rx_mut()[..apdu_n].copy_from_slice(&backing[..apdu_n]);
         session.set_rx_len(apdu_n);
 
-        // Должен вернуть false (освобождение) и записать RLRE в tx.
-        assert!(!server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        // Должен записать RLRE в tx и перевести сессию в Disconnecting.
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
+        assert_eq!(session.state(), AssociationState::Disconnecting);
 
         // Ответ: WPDU-заголовок + RLRE.
         let tx = session.tx();
@@ -1350,18 +1608,62 @@ mod wrapper_tests {
     fn process_request_handles_aarq() {
         use crate::AssociationState;
         use cosempdu::acse::{AARQapdu, ApplicationContextName, AssociationResult};
-        use cosempdu::apdu_sn::InitiateRequest;
+        use cosempdu::apdu::InitiateRequest;
 
         let mut server: Server = Server::new(NO_OBJECTS, CONF);
         server.set_wport(1);
         let mut session = server.on_connect(Media::Tcp).unwrap();
 
         // AARQ APDU.
+        let req = InitiateRequest::new(CONF, 1200);
+        let mut ui = [0u8; 64];
+        let n = req.put(&mut ByteBuffer::new(&mut ui)).unwrap();
+        let mut aarq = AARQapdu::new(ApplicationContextName::LogicalNameNoCiphering);
+        aarq.user_information = Some(&ui[..n]);
+        let mut apdu = [0u8; 256];
+        let m = aarq.put(&mut ByteBuffer::new(&mut apdu)).unwrap();
+        session.rx_mut()[..m].copy_from_slice(&apdu[..m]);
+        session.set_rx_len(m);
+
+        // received: клиент (src=16) → сервер (dst=1).
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
+        assert_eq!(session.state(), AssociationState::Associated);
+
+        // Ответ: AARE (accepted).
+        let tx = session.tx();
+        let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
+        let apdu = &tx[8..8 + frame.apdu_len() as usize];
+        match ACSEApdu::get(&mut Reader::new(apdu)).unwrap() {
+            ACSEApdu::Aare(a) => assert_eq!(a.result, AssociationResult::Accepted),
+            other => panic!("expected AARE, got {other:?}"),
+        }
+    }
+
+    /// AARQ с version-too-low → AARE(RejectedPermanent) + ConfirmedServiceError(initiate: dlms-version-too-low).
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn process_request_rejects_dlms_version_too_low() {
+        use crate::AssociationState;
+        use cosempdu::acse::{
+            AARQapdu, AcseServiceUser, ApplicationContextName, AssociateSourceDiagnostic,
+            AssociationResult,
+        };
+        use cosempdu::apdu::{
+            confirmed_service_error_tag, ConfirmedServiceError, ImplicitTagged, Initiate,
+            InitiateRequest, SnServiceError,
+        };
+
+        let mut server: Server = Server::new(NO_OBJECTS, CONF);
+        server.set_wport(1);
+        let mut session = server.on_connect(Media::Tcp).unwrap();
+
+        // AARQ APDU с proposed_dlms_version_number = 5 (< 6).
         let req = InitiateRequest {
             dedicated_key: None,
             response_allowed: true,
-            proposed_quality_of_service: None,
-            proposed_dlms_version_number: 6,
+            proposed_dlms_version_number: 5,
             proposed_conformance: CONF,
             client_max_receive_pdu_size: 1200,
         };
@@ -1375,15 +1677,32 @@ mod wrapper_tests {
         session.set_rx_len(m);
 
         // received: клиент (src=16) → сервер (dst=1).
-        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
-        assert_eq!(session.state(), AssociationState::Associated);
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
 
-        // Ответ: AARE (accepted).
+        // Ассоциация НЕ установлена (остаёмся в Idle).
+        assert_eq!(session.state(), AssociationState::Idle);
+
+        // Ответ: AARE (rejected-permanent) + ConfirmedServiceError(initiate: dlms-version-too-low).
         let tx = session.tx();
         let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
         let apdu = &tx[8..8 + frame.apdu_len() as usize];
         match ACSEApdu::get(&mut Reader::new(apdu)).unwrap() {
-            ACSEApdu::Aare(a) => assert_eq!(a.result, AssociationResult::Accepted),
+            ACSEApdu::Aare(a) => {
+                assert_eq!(a.result, AssociationResult::RejectedPermanent);
+                assert_eq!(
+                    a.result_source_diagnostic,
+                    AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::NoReasonGiven)
+                );
+                let ui = a.user_information.expect("AARE with user-information");
+                let cse = ConfirmedServiceError::get(&mut Reader::new(ui)).unwrap();
+                assert_eq!(cse.tag, confirmed_service_error_tag::INITIATE_ERROR);
+                assert_eq!(
+                    cse.service_error,
+                    SnServiceError::Initiate(Initiate::DlmsVersionTooLow)
+                );
+            }
             other => panic!("expected AARE, got {other:?}"),
         }
     }
@@ -1392,7 +1711,7 @@ mod wrapper_tests {
     #[cfg(feature = "tcp")]
     #[test]
     fn process_request_handles_unknown_tag_ln() {
-        use cosempdu::apdu::{ExceptionResponse, ServiceError, StateError};
+        use cosempdu::apdu::{ExceptionResponse, ImplicitTagged, ServiceError_, StateError};
 
         let mut server: Server = Server::new(NO_OBJECTS, CONF);
         server.set_wport(1);
@@ -1403,48 +1722,56 @@ mod wrapper_tests {
         session.rx_mut()[0] = 0x82;
         session.set_rx_len(1);
 
-        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
 
         let tx = session.tx();
         let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
         let apdu = &tx[8..8 + frame.apdu_len() as usize];
         let exc = ExceptionResponse::get(&mut Reader::new(apdu)).unwrap();
         assert_eq!(exc.state_error, StateError::ServiceUnknown);
-        assert_eq!(exc.service_error, ServiceError::OperationNotPossible);
+        assert_eq!(exc.service_error, ServiceError_::OperationNotPossible);
     }
 
-    /// Неизвестный APDU-тег (SN) → ConfirmedServiceError (read, definition: other).
+
+    /// Get-Request при неустановленной ассоциации → "Association is not established"
+    /// (LN: exception-response service-not-allowed / operation-not-possible).
     #[cfg(feature = "tcp")]
     #[test]
-    fn process_request_handles_unknown_tag_sn() {
-        use cosempdu::acse::ApplicationContextName;
-        use cosempdu::apdu_sn::{confirmed_service_error_tag, ConfirmedServiceError, Definition, ServiceError};
+    fn process_request_rejects_get_without_association_ln() {
+        use cosempdu::apdu::{ExceptionResponse, ImplicitTagged, ServiceError_, StateError};
 
         let mut server: Server = Server::new(NO_OBJECTS, CONF);
         server.set_wport(1);
         let mut session = server.on_connect(Media::Tcp).unwrap();
         session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
-        session.set_application_context(ApplicationContextName::ShortNameNoCiphering);
+        // state = Idle — ассоциация не установлена.
 
-        session.rx_mut()[0] = 0x82;
+        session.rx_mut()[0] = 0xC0; // Get-Request [192]
         session.set_rx_len(1);
 
-        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
 
         let tx = session.tx();
         let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
         let apdu = &tx[8..8 + frame.apdu_len() as usize];
-        let cse = ConfirmedServiceError::get(&mut Reader::new(apdu)).unwrap();
-        assert_eq!(cse.tag, confirmed_service_error_tag::READ);
-        assert_eq!(cse.service_error, ServiceError::Definition(Definition::Other));
+        let exc = ExceptionResponse::get(&mut Reader::new(apdu)).unwrap();
+        assert_eq!(exc.state_error, StateError::ServiceNotAllowed);
+        assert_eq!(exc.service_error, ServiceError_::OperationNotPossible);
     }
 
     /// Set-Request::Normal → значение применяется к атрибуту, в ответе — null-data.
     #[cfg(feature = "tcp")]
     #[test]
     fn process_request_handles_set() {
-        use crate::{Access, AccessMask};
-        use cosempdu::apdu::{CosemAttributeDescriptor, DataAccessResult, InvokeIdAndPriority, SetRequest, SetResponse};
+        use crate::{Access, AccessMask, AssociationState};
+        use cosempdu::apdu::{
+            CosemAttributeDescriptor, DataAccessResult, ImplicitTagged, InvokeIdAndPriority, SetRequest,
+            SetResponse, SetResponseNormal,
+        };
         use dlms1::common_data_types::DoubleLongUnsigned;
         use dlms1::ic::Register;
         use dlms1::obis::ObisCode;
@@ -1459,11 +1786,15 @@ mod wrapper_tests {
             .add_persistent(
                 REG_OBJ.value(),
                 &mut register,
-                Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+                Access {
+                    read: AccessMask::PUBLIC,
+                    write: AccessMask::CONFIGURATOR,
+                },
             )
             .unwrap();
         let mut session = server.on_connect(Media::Tcp).unwrap();
         session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+        session.set_state(AssociationState::Associated);
 
         // Set-Request::Normal: value = DoubleLongUnsigned(7).
         let invoke = InvokeIdAndPriority::from_bits(2, true, false);
@@ -1482,7 +1813,9 @@ mod wrapper_tests {
         session.set_rx_len(apdu_n);
 
         // Обработать: вернуть true (продолжать), атрибут обновлён.
-        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
         assert_eq!(register.0, 7);
 
         // Ответ: SetResponse::Normal (success).
@@ -1490,7 +1823,10 @@ mod wrapper_tests {
         let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
         let apdu = &tx[8..8 + frame.apdu_len() as usize];
         match SetResponse::get(&mut Reader::new(apdu)).unwrap() {
-            SetResponse::Normal { invoke, result: DataAccessResult::Success } => {
+            SetResponse::Normal(SetResponseNormal {
+                invoke,
+                result: DataAccessResult::Success,
+            }) => {
                 assert_eq!(invoke.invoke_id(), 2);
             }
             other => panic!("expected SetResponse::Normal with success, got {other:?}"),
@@ -1501,8 +1837,11 @@ mod wrapper_tests {
     #[cfg(feature = "tcp")]
     #[test]
     fn process_request_handles_set_readonly() {
-        use crate::{Access, AccessMask};
-        use cosempdu::apdu::{CosemAttributeDescriptor, DataAccessResult, InvokeIdAndPriority, SetRequest, SetResponse};
+        use crate::{Access, AccessMask, AssociationState};
+        use cosempdu::apdu::{
+            CosemAttributeDescriptor, DataAccessResult, ImplicitTagged, InvokeIdAndPriority, SetRequest,
+            SetResponse, SetResponseNormal,
+        };
         use dlms1::common_data_types::DoubleLongUnsigned;
         use dlms1::ic::Register;
         use dlms1::obis::ObisCode;
@@ -1517,11 +1856,15 @@ mod wrapper_tests {
             .add_static(
                 REG_OBJ.value(),
                 &register,
-                Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+                Access {
+                    read: AccessMask::PUBLIC,
+                    write: AccessMask::CONFIGURATOR,
+                },
             )
             .unwrap();
         let mut session = server.on_connect(Media::Tcp).unwrap();
         session.set_transport_ref(TransportRef::Wrapper(Wrapper::new(1, 16)));
+        session.set_state(AssociationState::Associated);
 
         // Set-Request::Normal: value = DoubleLongUnsigned(7).
         let invoke = InvokeIdAndPriority::from_bits(2, true, false);
@@ -1540,19 +1883,21 @@ mod wrapper_tests {
         session.set_rx_len(apdu_n);
 
         // Обработать: не прерывать (true); в ответе — ReadWriteDenied.
-        assert!(server.process_request(&mut session, Wrapper::new(16, 1)).unwrap());
+        server
+            .process_request(&mut session, Wrapper::new(16, 1))
+            .unwrap();
 
         let tx = session.tx();
         let frame = Wrapper::get(&mut Reader::new(&tx[..8])).unwrap();
         let apdu = &tx[8..8 + frame.apdu_len() as usize];
         match SetResponse::get(&mut Reader::new(apdu)).unwrap() {
-            SetResponse::Normal { invoke, result: DataAccessResult::ReadWriteDenied } => {
+            SetResponse::Normal(SetResponseNormal {
+                invoke,
+                result: DataAccessResult::ReadWriteDenied,
+            }) => {
                 assert_eq!(invoke.invoke_id(), 2);
             }
             other => panic!("expected SetResponse::Normal with ReadWriteDenied, got {other:?}"),
         }
     }
 }
-
-
-

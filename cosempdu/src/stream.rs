@@ -56,7 +56,6 @@ pub trait StreamSink {
     }
 }
 
-
 /// Fixed content size (bytes) of a scalar tag, or `None` otherwise.
 pub(crate) fn scalar_size(tag: u8) -> Option<usize> {
     Some(match tag {
@@ -88,11 +87,22 @@ enum State {
     /// Expecting a tag byte (top level or the next element of a composite).
     Tag,
     /// Accumulating a fixed-size scalar.
-    Scalar { tag: u8, size: usize, filled: usize, buf: [u8; 12] },
+    Scalar {
+        tag: u8,
+        size: usize,
+        filled: usize,
+        buf: [u8; 12],
+    },
     /// Reading the first octet of a variable-length integer (blob length / element count).
     LengthFirst { tag: u8, is_composite: bool },
     /// Reading the remaining octets of a long-form variable-length integer.
-    LengthRest { tag: u8, is_composite: bool, num_bytes: usize, filled: usize, value: u64 },
+    LengthRest {
+        tag: u8,
+        is_composite: bool,
+        num_bytes: usize,
+        filled: usize,
+        value: u64,
+    },
     /// Streaming blob content.
     Blob { total: usize, remaining: usize },
     /// The whole value has been decoded.
@@ -131,13 +141,17 @@ impl<'s, S: StreamSink + ?Sized> StreamDecoder<'s, S> {
                 State::Blob { total, remaining } => {
                     let n = remaining.min(bytes.len());
                     let index = self.index();
-                    self.sink.blob_write(&bytes[..n], index, total - remaining)?;
+                    self.sink
+                        .blob_write(&bytes[..n], index, total - remaining)?;
                     bytes = &bytes[n..];
                     if n == remaining {
                         self.sink.blob_end()?;
                         self.end_element()?;
                     } else {
-                        self.state = State::Blob { total, remaining: remaining - n };
+                        self.state = State::Blob {
+                            total,
+                            remaining: remaining - n,
+                        };
                     }
                 }
                 _ => {
@@ -158,7 +172,6 @@ impl<'s, S: StreamSink + ?Sized> StreamDecoder<'s, S> {
         }
     }
 
-
     fn step(&mut self, b: u8) -> Result<()> {
         match self.state {
             State::Tag => {
@@ -169,25 +182,46 @@ impl<'s, S: StreamSink + ?Sized> StreamDecoder<'s, S> {
                         self.sink.scalar(tag, &[], index)?;
                         self.end_element()?;
                     } else {
-                        self.state = State::Scalar { tag, size, filled: 0, buf: [0; 12] };
+                        self.state = State::Scalar {
+                            tag,
+                            size,
+                            filled: 0,
+                            buf: [0; 12],
+                        };
                     }
                 } else if is_blob(tag) {
-                    self.state = State::LengthFirst { tag, is_composite: false };
+                    self.state = State::LengthFirst {
+                        tag,
+                        is_composite: false,
+                    };
                 } else if is_composite(tag) {
-                    self.state = State::LengthFirst { tag, is_composite: true };
+                    self.state = State::LengthFirst {
+                        tag,
+                        is_composite: true,
+                    };
                 } else {
-                    return Err(Error::UnknownTag { name: "Data", tag });
+                    return Err(Error::UnknownTag { tag });
                 }
                 Ok(())
             }
-            State::Scalar { tag, size, filled, mut buf } => {
+            State::Scalar {
+                tag,
+                size,
+                filled,
+                mut buf,
+            } => {
                 buf[filled] = b;
                 if filled + 1 == size {
                     let index = self.index();
                     self.sink.scalar(tag, &buf[..size], index)?;
                     self.end_element()?;
                 } else {
-                    self.state = State::Scalar { tag, size, filled: filled + 1, buf };
+                    self.state = State::Scalar {
+                        tag,
+                        size,
+                        filled: filled + 1,
+                        buf,
+                    };
                 }
                 Ok(())
             }
@@ -199,16 +233,34 @@ impl<'s, S: StreamSink + ?Sized> StreamDecoder<'s, S> {
                     if n == 0 {
                         return Err(Error::InvalidLengthEncoding);
                     }
-                    self.state = State::LengthRest { tag, is_composite, num_bytes: n, filled: 0, value: 0 };
+                    self.state = State::LengthRest {
+                        tag,
+                        is_composite,
+                        num_bytes: n,
+                        filled: 0,
+                        value: 0,
+                    };
                 }
                 Ok(())
             }
-            State::LengthRest { tag, is_composite, num_bytes, filled, value } => {
+            State::LengthRest {
+                tag,
+                is_composite,
+                num_bytes,
+                filled,
+                value,
+            } => {
                 let value = (value << 8) | u64::from(b);
                 if filled + 1 == num_bytes {
                     self.enter_len(tag, is_composite, value as usize)?;
                 } else {
-                    self.state = State::LengthRest { tag, is_composite, num_bytes, filled: filled + 1, value };
+                    self.state = State::LengthRest {
+                        tag,
+                        is_composite,
+                        num_bytes,
+                        filled: filled + 1,
+                        value,
+                    };
                 }
                 Ok(())
             }
@@ -237,7 +289,10 @@ impl<'s, S: StreamSink + ?Sized> StreamDecoder<'s, S> {
                 self.sink.blob_end()?;
                 self.end_element()?;
             } else {
-                self.state = State::Blob { total: len, remaining: len };
+                self.state = State::Blob {
+                    total: len,
+                    remaining: len,
+                };
             }
         }
         Ok(())
@@ -270,7 +325,6 @@ impl<'s, S: StreamSink + ?Sized> StreamDecoder<'s, S> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -424,4 +478,3 @@ mod tests {
         assert!(dec.finish().is_err());
     }
 }
-

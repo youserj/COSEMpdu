@@ -6,8 +6,7 @@ use cosempdu::stream::StreamSink;
 
 use crate::error::{Error, Result};
 use crate::ic::{
-    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier,
-    InterfaceClass, Validator, V0,
+    AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, InterfaceClass, Validator, V0,
 };
 use crate::obis::ObisCode;
 
@@ -19,9 +18,7 @@ pub const ATTR_VALUE: u8 = 2;
 pub const ATTR_SCALER_UNIT: u8 = 3;
 
 /// Tags of the `simple-data-type` CHOICE (the `value` of Register / Extended register).
-pub const SIMPLE_DATA_TAGS: &[u8] =
-    &[0, 4, 5, 6, 9, 10, 12, 15, 16, 17, 18, 20, 21, 22, 23, 24];
-
+pub const SIMPLE_DATA_TAGS: &[u8] = &[0, 4, 5, 6, 9, 10, 12, 15, 16, 17, 18, 20, 21, 22, 23, 24];
 
 /// `scal_unit_type ::= structure { scaler: integer, unit: enum }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +44,9 @@ impl ScalUnit {
 impl<'a> FromStructure<'a> for ScalUnit {
     fn from_structure(fields: &'a [Data<'a>]) -> cosempdu::Result<Self> {
         if fields.len() != 2 {
-            return Err(cosempdu::Error::Message("expected structure { integer, enum }"));
+            return Err(cosempdu::Error::Message(
+                "expected structure { integer, enum }",
+            ));
         }
         let scaler = fields[0]
             .as_integer()
@@ -92,7 +91,9 @@ impl StreamSink for ScalUnit {
 
     fn composite_begin(&mut self, tag: u8, count: usize) -> cosempdu::Result<()> {
         if tag != 2 || count != 2 {
-            return Err(cosempdu::Error::Message("ScalUnit expects a structure of two fields"));
+            return Err(cosempdu::Error::Message(
+                "ScalUnit expects a structure of two fields",
+            ));
         }
         Ok(())
     }

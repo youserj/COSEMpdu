@@ -2,11 +2,11 @@
 
 use cosempdu::data::Data;
 
+use crate::ic::register::{register_value_keys, SIMPLE_DATA_TAGS};
 use crate::ic::{
     AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, CommonDataType,
     InterfaceClass, SCAL_UNIT_VALIDATOR, V0,
 };
-use crate::ic::register::{register_value_keys, SIMPLE_DATA_TAGS};
 use crate::obis::ObisCode;
 
 /// Attribute 1 — `logical_name` (octet-string).

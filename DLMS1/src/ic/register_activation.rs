@@ -131,9 +131,11 @@ pub struct RegisterAssignmentValidator;
 
 impl Validator for RegisterAssignmentValidator {
     fn validate(&self, data: &Data<'_>) -> Result<()> {
-        let items = data.as_array().ok_or(Error::Codec(cosempdu::Error::Message(
-            "register_assignment must be an array",
-        )))?;
+        let items = data
+            .as_array()
+            .ok_or(Error::Codec(cosempdu::Error::Message(
+                "register_assignment must be an array",
+            )))?;
         for item in items {
             item.recast::<ObjectDefinition>().map_err(Error::from)?;
         }
@@ -150,9 +152,11 @@ pub struct MaskListValidator;
 
 impl Validator for MaskListValidator {
     fn validate(&self, data: &Data<'_>) -> Result<()> {
-        let items = data.as_array().ok_or(Error::Codec(cosempdu::Error::Message(
-            "mask_list must be an array",
-        )))?;
+        let items = data
+            .as_array()
+            .ok_or(Error::Codec(cosempdu::Error::Message(
+                "mask_list must be an array",
+            )))?;
         for item in items {
             item.recast::<RegisterActMask<'_>>().map_err(Error::from)?;
         }
@@ -254,9 +258,7 @@ impl<const N: usize> Codec for RegisterAssignmentValue<N> {
     }
 
     fn assign(&mut self, d: &Data<'_>) -> cosempdu::Result<()> {
-        let items = d
-            .as_array()
-            .ok_or(cosempdu::Error::UnexpectedTag { name: "array", actual: d.tag() })?;
+        let items = d.as_array().ok_or(cosempdu::Error::TagNumber { expected: 1, actual: d.tag() })?;
         if items.len() != N {
             return Err(cosempdu::Error::Message(
                 "register_assignment has wrong entry count",
@@ -298,13 +300,11 @@ impl<const N: usize> StreamSink for RegisterAssignmentValue<N> {
 
     fn scalar(&mut self, tag: u8, bytes: &[u8], index: usize) -> cosempdu::Result<()> {
         if tag != 18 || bytes.len() != 2 {
-            return Err(cosempdu::Error::Message(
-                "class_id must be a long-unsigned",
-            ));
+            return Err(cosempdu::Error::Message("class_id must be a long-unsigned"));
         }
         let raw = u16::from_be_bytes([bytes[0], bytes[1]]);
-        let class_id = ClassId::from_u16(raw)
-            .ok_or(cosempdu::Error::Message("unknown class_id"))?;
+        let class_id =
+            ClassId::from_u16(raw).ok_or(cosempdu::Error::Message("unknown class_id"))?;
         self.0[index].class_id = class_id;
         Ok(())
     }
@@ -321,7 +321,9 @@ impl<const N: usize> StreamSink for RegisterAssignmentValue<N> {
     fn blob_write(&mut self, bytes: &[u8], index: usize, offset: usize) -> cosempdu::Result<()> {
         let end = offset + bytes.len();
         if end > 6 {
-            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: 6 }));
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge { len: end, max: 6 },
+            ));
         }
         self.0[index].logical_name.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
@@ -339,7 +341,9 @@ mod tests {
             Data::LongUnsigned(ClassId::Register.as_u16()),
             Data::OctetString(&ln.bytes),
         ];
-        let od = Data::Structure(&fields).recast::<ObjectDefinition>().unwrap();
+        let od = Data::Structure(&fields)
+            .recast::<ObjectDefinition>()
+            .unwrap();
         assert_eq!(od.class_id, ClassId::Register);
         assert_eq!(od.logical_name, ln);
     }
@@ -351,10 +355,7 @@ mod tests {
         assert!(bad.recast::<ObjectDefinition>().is_err());
 
         // logical_name must be exactly 6 bytes.
-        let bad_ln = Data::Structure(&[
-            Data::LongUnsigned(3),
-            Data::OctetString(&[1, 2, 3]),
-        ]);
+        let bad_ln = Data::Structure(&[Data::LongUnsigned(3), Data::OctetString(&[1, 2, 3])]);
         assert!(bad_ln.recast::<ObjectDefinition>().is_err());
 
         // class_id must be a known interface class.
@@ -369,7 +370,9 @@ mod tests {
     fn register_act_mask_from_structure() {
         let entries = [Data::Unsigned(1), Data::Unsigned(3), Data::Unsigned(4)];
         let fields = [Data::OctetString(b"day"), Data::Array(&entries)];
-        let mask = Data::Structure(&fields).recast::<RegisterActMask<'_>>().unwrap();
+        let mask = Data::Structure(&fields)
+            .recast::<RegisterActMask<'_>>()
+            .unwrap();
         assert_eq!(mask.mask_name, b"day");
         assert_eq!(mask.index_list.len(), 3);
         assert_eq!(mask.index_list[0].as_unsigned(), Some(1));
@@ -393,9 +396,7 @@ mod tests {
         let mask_fields = [Data::OctetString(b"day"), Data::Array(&entries)];
         let mask = Data::Structure(&mask_fields);
         let masks = [mask];
-        assert!(MASK_LIST_VALIDATOR
-            .validate(&Data::Array(&masks))
-            .is_ok());
+        assert!(MASK_LIST_VALIDATOR.validate(&Data::Array(&masks)).is_ok());
 
         // Top level must be an array, not a structure.
         let not_array = [od];
@@ -428,4 +429,3 @@ mod tests {
         assert_eq!(ra.attr_key(5), None);
     }
 }
-

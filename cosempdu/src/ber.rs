@@ -11,10 +11,10 @@
 //! * [`put_signed`] / [`decode_signed`] — minimal two's-complement INTEGER
 //!   content.
 
-use bytebuffer::ByteBuffer;
 use crate::error::{Error, Result};
 use crate::x680::Tag;
-use crate::x690::{Length};
+use crate::x690::Length;
+use bytebuffer::ByteBuffer;
 
 // ---------------------------------------------------------------------------
 // Low-level byte helpers (tag/length encoding into plain vectors)
@@ -101,4 +101,3 @@ pub fn with_content(
     }
     Ok(buf.pos() - start)
 }
-

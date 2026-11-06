@@ -125,14 +125,20 @@ macro_rules! string_type {
 
         impl<const N: usize> Default for $name<N> {
             fn default() -> Self {
-                $name { buf: [0; N], len: 0 }
+                $name {
+                    buf: [0; N],
+                    len: 0,
+                }
             }
         }
 
         impl<const N: usize> Codec for $name<N> {
             fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
-                let s = core::str::from_utf8(&self.buf[..self.len])
-                    .map_err(|e| cosempdu::Error::InvalidUtf8 { valid_up_to: e.valid_up_to() })?;
+                let s = core::str::from_utf8(&self.buf[..self.len]).map_err(|e| {
+                    cosempdu::Error::InvalidUtf8 {
+                        valid_up_to: e.valid_up_to(),
+                    }
+                })?;
                 Data::$variant(s).put(buf)
             }
 
@@ -141,7 +147,12 @@ macro_rules! string_type {
                     Data::$variant(s) => {
                         let b = s.as_bytes();
                         if b.len() > N {
-                            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: b.len(), max: N }));
+                            return Err(cosempdu::Error::ByteBufferError(
+                                cosempdu::buffer::Error::InputTooLarge {
+                                    len: b.len(),
+                                    max: N,
+                                },
+                            ));
                         }
                         self.buf[..b.len()].copy_from_slice(b);
                         self.len = b.len();
@@ -162,16 +173,25 @@ macro_rules! string_type {
         impl<const N: usize> StreamSink for $name<N> {
             fn blob_begin(&mut self, _tag: u8, len: usize) -> cosempdu::Result<()> {
                 if len > N {
-                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len, max: N }));
+                    return Err(cosempdu::Error::ByteBufferError(
+                        cosempdu::buffer::Error::InputTooLarge { len, max: N },
+                    ));
                 }
                 self.len = len;
                 Ok(())
             }
 
-            fn blob_write(&mut self, bytes: &[u8], _index: usize, offset: usize) -> cosempdu::Result<()> {
+            fn blob_write(
+                &mut self,
+                bytes: &[u8],
+                _index: usize,
+                offset: usize,
+            ) -> cosempdu::Result<()> {
                 let end = offset + bytes.len();
                 if end > N {
-                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: N }));
+                    return Err(cosempdu::Error::ByteBufferError(
+                        cosempdu::buffer::Error::InputTooLarge { len: end, max: N },
+                    ));
                 }
                 self.buf[offset..end].copy_from_slice(bytes);
                 Ok(())
@@ -179,8 +199,6 @@ macro_rules! string_type {
         }
     };
 }
-
-
 
 /// `double-long-unsigned` (Unsigned32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -197,10 +215,7 @@ impl Codec for DoubleLongUnsigned {
                 self.0 = *v;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "double-long-unsigned",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 6, actual: data.tag()}),
         }
     }
 
@@ -236,10 +251,7 @@ impl Codec for DateTime {
                 self.0 = *v;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "date-time",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 25, actual: data.tag() })
         }
     }
 
@@ -266,25 +278,31 @@ pub struct OctetString<const N: usize> {
 }
 impl<const N: usize> OctetString<N> {
     pub const fn new(data: &[u8]) -> Self {
-        assert!(data.len() <= N);   // compile-time проверка при использовании в static
+        assert!(data.len() <= N); // compile-time проверка при использовании в static
         let mut buf = [0u8; N];
         let mut i = 0;
         while i < data.len() {
             buf[i] = data[i];
             i += 1;
         }
-        Self { buf, len: data.len() }
+        Self {
+            buf,
+            len: data.len(),
+        }
     }
     pub fn try_new(data: &[u8]) -> cosempdu::Result<Self> {
         if data.len() > N {
-            return Err(cosempdu::Error::Message("overload octet-string"));  // TODO: make other separate Error
+            return Err(cosempdu::Error::Message("overload octet-string")); // TODO: make other separate Error
         }
-        Ok(Self::new(data))   // new уже безопасен после проверки
+        Ok(Self::new(data)) // new уже безопасен после проверки
     }
 }
 impl<const N: usize> Default for OctetString<N> {
     fn default() -> Self {
-        OctetString { buf: [0; N], len: 0 }
+        OctetString {
+            buf: [0; N],
+            len: 0,
+        }
     }
 }
 
@@ -313,16 +331,18 @@ impl<const N: usize> Codec for OctetString<N> {
         match data {
             Data::OctetString(b) => {
                 if b.len() > N {
-                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: b.len(), max: N }));
+                    return Err(cosempdu::Error::ByteBufferError(
+                        cosempdu::buffer::Error::InputTooLarge {
+                            len: b.len(),
+                            max: N,
+                        },
+                    ));
                 }
                 self.buf[..b.len()].copy_from_slice(b);
                 self.len = b.len();
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "octet-string",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 9, actual: data.tag() })
         }
     }
 
@@ -334,7 +354,9 @@ impl<const N: usize> Codec for OctetString<N> {
 impl<const N: usize> StreamSink for OctetString<N> {
     fn blob_begin(&mut self, _tag: u8, len: usize) -> cosempdu::Result<()> {
         if len > N {
-            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len, max: N }));
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge { len, max: N },
+            ));
         }
         self.len = len;
         Ok(())
@@ -343,13 +365,14 @@ impl<const N: usize> StreamSink for OctetString<N> {
     fn blob_write(&mut self, bytes: &[u8], _index: usize, offset: usize) -> cosempdu::Result<()> {
         let end = offset + bytes.len();
         if end > N {
-            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: N }));
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge { len: end, max: N },
+            ));
         }
         self.buf[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 }
-
 
 /// Fixed-length `octet-string` (always exactly `N` bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,10 +398,7 @@ impl<const N: usize> Codec for OctetStringSized<N> {
                 self.0.copy_from_slice(b);
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "octet-string",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 9, actual: data.tag() })
         }
     }
 
@@ -398,7 +418,9 @@ impl<const N: usize> StreamSink for OctetStringSized<N> {
     fn blob_write(&mut self, bytes: &[u8], _index: usize, offset: usize) -> cosempdu::Result<()> {
         let end = offset + bytes.len();
         if end > N {
-            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: end, max: N }));
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge { len: end, max: N },
+            ));
         }
         self.0[offset..end].copy_from_slice(bytes);
         Ok(())
@@ -424,10 +446,7 @@ impl Codec for Boolean {
                 self.0 = *v;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "boolean",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 3, actual: data.tag() })
         }
     }
 
@@ -439,7 +458,9 @@ impl Codec for Boolean {
 impl StreamSink for Boolean {
     fn scalar(&mut self, tag: u8, bytes: &[u8], _index: usize) -> cosempdu::Result<()> {
         if tag != 3 || bytes.len() != 1 {
-            return Err(cosempdu::Error::Message("Boolean scalar has wrong tag/size"));
+            return Err(cosempdu::Error::Message(
+                "Boolean scalar has wrong tag/size",
+            ));
         }
         self.0 = bytes[0] != 0;
         Ok(())
@@ -458,10 +479,7 @@ impl Codec for NullData {
     fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
         match data {
             Data::NullData => Ok(()),
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "null-data",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 0, actual: data.tag() })
         }
     }
 
@@ -473,12 +491,13 @@ impl Codec for NullData {
 impl StreamSink for NullData {
     fn scalar(&mut self, tag: u8, bytes: &[u8], _index: usize) -> cosempdu::Result<()> {
         if tag != 0 || !bytes.is_empty() {
-            return Err(cosempdu::Error::Message("NullData scalar has wrong tag/size"));
+            return Err(cosempdu::Error::Message(
+                "NullData scalar has wrong tag/size",
+            ));
         }
         Ok(())
     }
 }
-
 
 // Numeric scalars (integers, floats) and fixed-size octet-strings.
 int_scalar!(DoubleLong, i32, DoubleLong, 5);
@@ -505,7 +524,6 @@ int_scalar!(DeltaDoubleLongUnsigned, u32, DeltaDoubleLongUnsigned, 33);
 string_type!(VisibleString, VisibleString);
 string_type!(Utf8String, Utf8String);
 
-
 // ---- non-streamable compound types (Codec only) ----
 
 /// `bit-string` (packed octets + significant bit count). Not streamable: the
@@ -518,7 +536,10 @@ pub struct BitString<const N: usize> {
 
 impl<const N: usize> Default for BitString<N> {
     fn default() -> Self {
-        BitString { bytes: [0; N], bit_len: 0 }
+        BitString {
+            bytes: [0; N],
+            bit_len: 0,
+        }
     }
 }
 
@@ -526,7 +547,12 @@ impl<const N: usize> Codec for BitString<N> {
     fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
         let num_octets = self.bit_len.div_ceil(8);
         if num_octets > N {
-            return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: num_octets, max: N }));
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge {
+                    len: num_octets,
+                    max: N,
+                },
+            ));
         }
         Data::BitString {
             bytes: &self.bytes[..num_octets],
@@ -539,16 +565,18 @@ impl<const N: usize> Codec for BitString<N> {
         match data {
             Data::BitString { bytes, bit_len } => {
                 if bytes.len() > N {
-                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge { len: bytes.len(), max: N }));
+                    return Err(cosempdu::Error::ByteBufferError(
+                        cosempdu::buffer::Error::InputTooLarge {
+                            len: bytes.len(),
+                            max: N,
+                        },
+                    ));
                 }
                 self.bytes[..bytes.len()].copy_from_slice(bytes);
                 self.bit_len = *bit_len;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "bit-string",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 4, actual: data.tag() })
         }
     }
 }
@@ -588,24 +616,22 @@ impl<const N: usize> Codec for CompactArray<N> {
                 array_contents,
             } => {
                 if array_contents.len() > N {
-                    return Err(cosempdu::Error::ByteBufferError(cosempdu::buffer::Error::InputTooLarge {
-                        len: array_contents.len(),
-                        max: N,
-                    }));
+                    return Err(cosempdu::Error::ByteBufferError(
+                        cosempdu::buffer::Error::InputTooLarge {
+                            len: array_contents.len(),
+                            max: N,
+                        },
+                    ));
                 }
                 self.contents_description = *contents_description;
                 self.array_contents[..array_contents.len()].copy_from_slice(array_contents);
                 self.len = array_contents.len();
                 Ok(())
             }
-            _ => Err(cosempdu::Error::UnexpectedTag {
-                name: "compact-array",
-                actual: data.tag(),
-            }),
+            _ => Err(cosempdu::Error::TagNumber { expected: 19, actual: data.tag() })
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -645,16 +671,25 @@ mod tests {
         roundtrip(&Data::Date([1, 2, 3, 4, 5]), Date([1, 2, 3, 4, 5]));
         roundtrip(&Data::Time([1, 2, 3, 4]), Time([1, 2, 3, 4]));
         roundtrip(&Data::DeltaInteger(-5), DeltaInteger(-5));
-        roundtrip(&Data::DeltaDoubleLongUnsigned(42), DeltaDoubleLongUnsigned(42));
+        roundtrip(
+            &Data::DeltaDoubleLongUnsigned(42),
+            DeltaDoubleLongUnsigned(42),
+        );
         roundtrip(&Data::NullData, NullData);
-        roundtrip(&Data::OctetString(&[1, 2, 3, 4]), OctetStringSized::<4>([1, 2, 3, 4]));
+        roundtrip(
+            &Data::OctetString(&[1, 2, 3, 4]),
+            OctetStringSized::<4>([1, 2, 3, 4]),
+        );
     }
 
     #[test]
     fn strings_roundtrip() {
         let data = Data::VisibleString("hello");
         let mut backing = [0u8; 64];
-        let n = { let mut buf = ByteBuffer::new(&mut backing); data.put(&mut buf).unwrap() };
+        let n = {
+            let mut buf = ByteBuffer::new(&mut backing);
+            data.put(&mut buf).unwrap()
+        };
         let mut arena_storage = [core::mem::MaybeUninit::uninit(); 8];
         let mut arena = Arena::new(&mut arena_storage);
         let mut reader = Reader::new(&backing[..n]);
@@ -666,9 +701,15 @@ mod tests {
     fn compound_roundtrip() {
         // BitString
         {
-            let data = Data::BitString { bytes: &[0b1010_0000], bit_len: 4 };
+            let data = Data::BitString {
+                bytes: &[0b1010_0000],
+                bit_len: 4,
+            };
             let mut backing = [0u8; 64];
-            let n = { let mut buf = ByteBuffer::new(&mut backing); data.put(&mut buf).unwrap() };
+            let n = {
+                let mut buf = ByteBuffer::new(&mut backing);
+                data.put(&mut buf).unwrap()
+            };
             let mut arena_storage = [core::mem::MaybeUninit::uninit(); 8];
             let mut arena = Arena::new(&mut arena_storage);
             let mut reader = Reader::new(&backing[..n]);
@@ -678,9 +719,15 @@ mod tests {
         }
         // CompactArray
         {
-            let data = Data::CompactArray { contents_description: 7, array_contents: &[1, 2, 3] };
+            let data = Data::CompactArray {
+                contents_description: 7,
+                array_contents: &[1, 2, 3],
+            };
             let mut backing = [0u8; 64];
-            let n = { let mut buf = ByteBuffer::new(&mut backing); data.put(&mut buf).unwrap() };
+            let n = {
+                let mut buf = ByteBuffer::new(&mut backing);
+                data.put(&mut buf).unwrap()
+            };
             let mut arena_storage = [core::mem::MaybeUninit::uninit(); 8];
             let mut arena = Arena::new(&mut arena_storage);
             let mut reader = Reader::new(&backing[..n]);
@@ -690,4 +737,3 @@ mod tests {
         }
     }
 }
-

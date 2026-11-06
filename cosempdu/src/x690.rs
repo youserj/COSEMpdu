@@ -4,9 +4,9 @@
 //! encoding/decoding, and the `ed2buf` / `ed2ed` / `recast` composition
 //! helpers built on the [`ED`] trait.
 
-use bytebuffer::{ByteBuffer, Reader};
 use crate::error::{Error, Result};
-use crate::x680::{Tag};
+use crate::x680::Tag;
+use bytebuffer::{ByteBuffer, Reader};
 
 // ---------------------------------------------------------------------------
 // Length component (X.690 §8.1.3)

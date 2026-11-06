@@ -29,8 +29,8 @@ pub use extended_register::ExtendedRegister;
 pub use register::{Register, ScalUnit, ScalUnitValidator, SCAL_UNIT_VALIDATOR};
 pub use register_activation::{
     MaskListValidator, ObjectDefinition, RegisterActMask, RegisterActivation,
-    RegisterAssignmentValidator, RegisterAssignmentValue,
-    MASK_LIST_VALIDATOR, REGISTER_ASSIGNMENT_VALIDATOR,
+    RegisterAssignmentValidator, RegisterAssignmentValue, MASK_LIST_VALIDATOR,
+    REGISTER_ASSIGNMENT_VALIDATOR,
 };
 
 /// COSEM interface class identifiers (clause 7).
@@ -343,7 +343,10 @@ pub struct AssociatedPartners {
 
 impl AssociatedPartners {
     pub const fn new(client_sap: i8, server_sap: u16) -> Self {
-        AssociatedPartners { client_sap, server_sap }
+        AssociatedPartners {
+            client_sap,
+            server_sap,
+        }
     }
 }
 
@@ -356,7 +359,9 @@ impl Default for AssociatedPartners {
 impl<'a> FromStructure<'a> for AssociatedPartners {
     fn from_structure(fields: &'a [Data<'a>]) -> cosempdu::Result<Self> {
         if fields.len() != 2 {
-            return Err(cosempdu::Error::Message("expected structure { integer, long-unsigned }"));
+            return Err(cosempdu::Error::Message(
+                "expected structure { integer, long-unsigned }",
+            ));
         }
         let client_sap = fields[0]
             .as_integer()
@@ -364,13 +369,20 @@ impl<'a> FromStructure<'a> for AssociatedPartners {
         let server_sap = fields[1]
             .as_long_unsigned()
             .ok_or(cosempdu::Error::Message("field 1 must be long-unsigned"))?;
-        Ok(AssociatedPartners { client_sap, server_sap })
+        Ok(AssociatedPartners {
+            client_sap,
+            server_sap,
+        })
     }
 }
 
 impl Codec for AssociatedPartners {
     fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
-        Data::Structure(&[Data::Integer(self.client_sap), Data::LongUnsigned(self.server_sap)]).put(buf)
+        Data::Structure(&[
+            Data::Integer(self.client_sap),
+            Data::LongUnsigned(self.server_sap),
+        ])
+        .put(buf)
     }
 
     fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
@@ -388,14 +400,20 @@ impl StreamSink for AssociatedPartners {
         match tag {
             15 => self.client_sap = bytes[0] as i8,
             18 => self.server_sap = u16::from_be_bytes([bytes[0], bytes[1]]),
-            _ => return Err(cosempdu::Error::Message("unexpected scalar in AssociatedPartners")),
+            _ => {
+                return Err(cosempdu::Error::Message(
+                    "unexpected scalar in AssociatedPartners",
+                ))
+            }
         }
         Ok(())
     }
 
     fn composite_begin(&mut self, tag: u8, count: usize) -> cosempdu::Result<()> {
         if tag != 2 || count != 2 {
-            return Err(cosempdu::Error::Message("AssociatedPartners expects a structure of two fields"));
+            return Err(cosempdu::Error::Message(
+                "AssociatedPartners expects a structure of two fields",
+            ));
         }
         Ok(())
     }
@@ -407,7 +425,9 @@ pub struct AssociatedPartnersValidator;
 
 impl Validator for AssociatedPartnersValidator {
     fn validate(&self, data: &Data<'_>) -> Result<()> {
-        data.recast::<AssociatedPartners>().map(|_| ()).map_err(Error::from)
+        data.recast::<AssociatedPartners>()
+            .map(|_| ())
+            .map_err(Error::from)
     }
 }
 
@@ -434,7 +454,10 @@ mod tests {
         assert_eq!((c.class_id(), c.version()), (ClassId::Clock, V0));
         assert_eq!((sn.class_id(), sn.version()), (ClassId::AssociationSn, V4));
         assert_eq!((ln.class_id(), ln.version()), (ClassId::AssociationLn, V1));
-        assert_eq!((ra.class_id(), ra.version()), (ClassId::RegisterActivation, V0));
+        assert_eq!(
+            (ra.class_id(), ra.version()),
+            (ClassId::RegisterActivation, V0)
+        );
 
         assert_eq!(d.obis().to_string(), "0.0.96.1.0.255");
         assert_eq!(r.obis().to_string(), "1.0.1.8.0.255");
@@ -470,10 +493,18 @@ mod tests {
         for obj in objects {
             for info in obj.attributes() {
                 if let Some(v) = info.min {
-                    assert!(info.data_type.validate(&v).is_ok(), "min invalid for {}", obj.obis());
+                    assert!(
+                        info.data_type.validate(&v).is_ok(),
+                        "min invalid for {}",
+                        obj.obis()
+                    );
                 }
                 if let Some(v) = info.max {
-                    assert!(info.data_type.validate(&v).is_ok(), "max invalid for {}", obj.obis());
+                    assert!(
+                        info.data_type.validate(&v).is_ok(),
+                        "max invalid for {}",
+                        obj.obis()
+                    );
                 }
                 if let Some(v) = info.default {
                     assert!(
@@ -531,5 +562,3 @@ mod tests {
         assert_eq!(streamed, ap);
     }
 }
-
-

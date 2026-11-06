@@ -68,24 +68,38 @@ pub struct Wrapper {
 #[cfg(any(feature = "tcp", feature = "ble"))]
 impl Wrapper {
     pub const fn new(source_port: u16, destination_port: u16) -> Self {
-        Self { source_port, destination_port, apdu_len: 0 }
+        Self {
+            source_port,
+            destination_port,
+            apdu_len: 0,
+        }
     }
 
     /// Собственный wPort сервера (фиксирован для всех подключений).
-    pub fn source_port(&self) -> u16 { self.source_port }
+    pub fn source_port(&self) -> u16 {
+        self.source_port
+    }
 
     /// wPort клиента (меняется на каждое подключение).
-    pub fn destination_port(&self) -> u16 { self.destination_port }
+    pub fn destination_port(&self) -> u16 {
+        self.destination_port
+    }
 
     /// Длина APDU из WPDU-заголовка (заполняется при `get`).
-    pub fn apdu_len(&self) -> u16 { self.apdu_len }
+    pub fn apdu_len(&self) -> u16 {
+        self.apdu_len
+    }
 
     /// Собрать WPDU целиком: заголовок + payload через `write_apdu`.
     ///
     /// Пишет version/порты с заглушкой длины, вызывает `write_apdu` для записи
     /// APDU (возвращает его длину), дописывает длину в заголовок и возвращает
     /// общий размер WPDU.
-    pub fn put<E, F>(&self, buf: &mut ByteBuffer<'_>, write_apdu: F) -> core::result::Result<usize, E>
+    pub fn put<E, F>(
+        &self,
+        buf: &mut ByteBuffer<'_>,
+        write_apdu: F,
+    ) -> core::result::Result<usize, E>
     where
         F: FnOnce(&mut ByteBuffer<'_>) -> core::result::Result<usize, E>,
         E: From<BufferError>,
@@ -111,7 +125,11 @@ impl Wrapper {
         let source_port = reader.get_u16()?;
         let destination_port = reader.get_u16()?;
         let apdu_len = reader.get_u16()?;
-        Ok(Self { source_port, destination_port, apdu_len })
+        Ok(Self {
+            source_port,
+            destination_port,
+            apdu_len,
+        })
     }
 }
 
@@ -130,7 +148,11 @@ pub struct HdlcState {
 #[cfg(feature = "optical")]
 impl HdlcState {
     pub const fn new() -> Self {
-        Self { send_seq: 0, recv_seq: 0, window: 1 }
+        Self {
+            send_seq: 0,
+            recv_seq: 0,
+            window: 1,
+        }
     }
 }
 
@@ -181,14 +203,21 @@ pub struct WrapperPool<const N: usize> {
 #[cfg(any(feature = "tcp", feature = "ble"))]
 impl<const N: usize> WrapperPool<N> {
     pub const fn new(source_port: u16) -> Self {
-        Self { source_port, used: 0 }
+        Self {
+            source_port,
+            used: 0,
+        }
     }
 
     /// Собственный wPort сервера (фиксирован для всех подключений канала).
-    pub fn source_port(&self) -> u16 { self.source_port }
+    pub fn source_port(&self) -> u16 {
+        self.source_port
+    }
 
     /// Переопределить собственный wPort сервера (до приёма соединений).
-    pub fn set_source_port(&mut self, port: u16) { self.source_port = port; }
+    pub fn set_source_port(&mut self, port: u16) {
+        self.source_port = port;
+    }
 
     /// Занять слот; `None`, если достигнут лимит `N`.
     pub fn alloc(&mut self) -> Option<()> {

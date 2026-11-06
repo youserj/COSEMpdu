@@ -8,17 +8,19 @@
 //! read/process/write идут без удержания мьютекса `Server` на сетевом I/O —
 //! мьютекс берётся только на короткую фазу разбора/кодирования.
 
-use std::sync::Arc;
-use std::time::Duration;
-use static_cell::StaticCell;
 use anyhow::{anyhow, Result};
-use cosempdu::apdu_sn::Conformance;
+use cosempdu::apdu::Conformance;
 use cosempdu::buffer::Reader;
 use cosempdu::error::Error as CosemError;
-use dlms1::common_data_types::{DoubleLongUnsigned, Unsigned, OctetString};
+use dlms1::common_data_types::{DoubleLongUnsigned, OctetString, Unsigned};
 use dlms1::ic::{Clock, DataObject, InterfaceClass, Register, ScalUnit};
 use dlms1::obis::ObisCode;
-use server::{Access, AccessMask, Channel, Listener, Media, Server, Session, Wrapper};
+use server::{
+    Access, AccessMask, AssociationState, Channel, Listener, Media, Server, Session, Wrapper,
+};
+use static_cell::StaticCell;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -56,7 +58,10 @@ pub struct TcpChannel {
 
 impl TcpChannel {
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream, read_timeout: Duration::from_secs(120) }
+        Self {
+            stream,
+            read_timeout: Duration::from_secs(120),
+        }
     }
 
     /// Переопределить таймаут чтения (по умолчанию 120 c).
@@ -80,7 +85,9 @@ impl Channel for TcpChannel {
     async fn read(&mut self, buf: &mut [u8]) -> Result<Wrapper, CosemError> {
         // Wrapper-заголовок (8 байт) — сразу в buf; затем APDU перезапишет его.
         if buf.len() < 8 {
-            return Err(CosemError::ByteBufferError(cosempdu::buffer::Error::NotEnoughSpace { needed: 8 }));
+            return Err(CosemError::ByteBufferError(
+                cosempdu::buffer::Error::NotEnoughSpace { needed: 8 },
+            ));
         }
         self.read_exact_timeout(&mut buf[..8]).await?;
 
@@ -88,7 +95,9 @@ impl Channel for TcpChannel {
         let setting = Wrapper::get(&mut Reader::new(&buf[..8]))?;
         let apdu_len = setting.apdu_len() as usize;
         if apdu_len > buf.len() {
-            return Err(CosemError::ByteBufferError(cosempdu::buffer::Error::NotEnoughSpace { needed: apdu_len }));
+            return Err(CosemError::ByteBufferError(
+                cosempdu::buffer::Error::NotEnoughSpace { needed: apdu_len },
+            ));
         }
 
         // APDU — в начало buf (перезаписываем заголовок).
@@ -130,23 +139,35 @@ async fn main() -> Result<()> {
     server.add_static(
         REG_OBJ.value(),
         &REG_VALUE,
-        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: AccessMask::PUBLIC,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
     server.add_static(
         REG_OBJ.scaler_unit(),
         &REG_SU,
-        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: AccessMask::PUBLIC,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
     let data_value = DATA_VALUE.init(Unsigned(1));
     server.add_persistent(
         DATA_OBJ.value(),
         data_value,
-        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: AccessMask::PUBLIC,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
     server.add_static(
         DATA_OBJ2.value(),
         &DATA_VALUE2,
-        Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: AccessMask::PUBLIC,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
     let server = Arc::new(Mutex::new(server));
 
@@ -156,7 +177,10 @@ async fn main() -> Result<()> {
     println!("tcp-pc-server: listening on {BIND_ADDR}");
 
     loop {
-        let channel = listener.accept().await.map_err(|e| anyhow!("accept: {e:?}"))?;
+        let channel = listener
+            .accept()
+            .await
+            .map_err(|e| anyhow!("accept: {e:?}"))?;
         let server = Arc::clone(&server);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(server, channel).await {
@@ -166,7 +190,8 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Обслуживание одного соединения: ассоциация → цикл GET-запросов, до закрытия/таймаута.
+/// Обслуживание одного соединения: цикл запросов (AARQ/AARE, GET/SET, RLRQ) до
+/// закрытия/таймаута.
 async fn handle_connection(
     server: Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
     mut channel: TcpChannel,
@@ -174,18 +199,14 @@ async fn handle_connection(
     // Сессия (с буферами rx/tx) принадлежит этой задаче соединения.
     let mut session = server.lock().await.on_connect(Media::Tcp)?;
 
-    // Ассоциация (разовый обмен AARQ → AARE).
-    if let Err(e) = associate_session(&server, &mut session, &mut channel).await {
-        server.lock().await.on_disconnect(session.media());
-        return Err(e);
-    }
-
-    // Цикл обслуживания xDLMS-запросов; выходим по RLRQ/таймауту/закрытию/ошибке.
+    // Цикл обслуживания xDLMS-запросов (AARQ/AARE, GET/SET, RLRQ); выходим по
+    // RLRQ (state = Disconnecting)/таймауту/закрытию/ошибке.
     let result = loop {
-        match request_session(&server, &mut session, &mut channel).await {
-            Ok(true) => {}
-            Ok(false) => break Ok(()),
-            Err(e) => break Err(e),
+        if let Err(e) = request_session(&server, &mut session, &mut channel).await {
+            break Err(e);
+        }
+        if session.state() == AssociationState::Disconnecting {
+            break Ok(());
         }
     };
 
@@ -194,77 +215,57 @@ async fn handle_connection(
     result
 }
 
-/// Ассоциация (AARQ → AARE): read в session.rx (без мьютекса) → accept (короткий
-/// мьютекс, без I/O) → write из session.tx (без мьютекса).
-async fn associate_session(
-    server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
-    session: &mut Session,
-    channel: &mut TcpChannel,
-) -> Result<()> {
-    let received = channel.read(session.rx_mut()).await.map_err(|e| anyhow!("read: {e:?}"))?;
-    session.set_rx_len(received.apdu_len() as usize);
-
-    {
-        let srv = server.lock().await;
-        srv.accept_association(session, received)
-            .map_err(|e| anyhow!("associate: {e:?}"))?;
-    }
-
-    channel.write(session.tx()).await.map_err(|e| anyhow!("write: {e:?}"))?;
-    session.clear_rx();
-    Ok(())
-}
-
-/// Обработка одного xDLMS-запроса (GET/RLRQ): read в session.rx (без мьютекса) →
-/// process (короткий мьютекс, без I/O) → write из session.tx (без мьютекса).
-/// Возвращает `Ok(false)`, если получен RLRQ (ассоциация освобождена).
+/// Обработка одного xDLMS-запроса (AARQ/GET/SET/RLRQ): read в session.rx (без
+/// мьютекса) → process (короткий мьютекс, без I/O) → write из session.tx (без
+/// мьютекса). Освобождение ассоциации отражается в `session.state()`.
 async fn request_session(
     server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
     session: &mut Session,
     channel: &mut TcpChannel,
-) -> Result<bool> {
-    let received = channel.read(session.rx_mut()).await.map_err(|e| anyhow!("read: {e:?}"))?;
+) -> Result<()> {
+    let received = channel
+        .read(session.rx_mut())
+        .await
+        .map_err(|e| anyhow!("read: {e:?}"))?;
     session.set_rx_len(received.apdu_len() as usize);
 
-    let keep = {
+    {
         let mut srv = server.lock().await;
         srv.process_request(session, received)
-            .map_err(|e| anyhow!("request: {e:?}"))?
-    };
+            .map_err(|e| anyhow!("request: {e:?}"))?;
+    }
 
-    channel.write(session.tx()).await.map_err(|e| anyhow!("write: {e:?}"))?;
+    channel
+        .write(session.tx())
+        .await
+        .map_err(|e| anyhow!("write: {e:?}"))?;
     session.clear_rx();
-    Ok(keep)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cosempdu::acse::{AARQapdu, ACSEApdu, ApplicationContextName, AssociationResult};
-    use cosempdu::apdu::{CosemAttributeDescriptor, GetDataResult, GetRequest, GetResponse, InvokeIdAndPriority};
-    use cosempdu::apdu_sn::InitiateRequest;
+    use cosempdu::apdu::{
+        CosemAttributeDescriptor, GetDataResult, GetRequest, GetResponse, GetResponseNormal,
+        ImplicitTagged, InvokeIdAndPriority,
+    };
+    use cosempdu::apdu::InitiateRequest;
     use cosempdu::buffer::ByteBuffer;
 
     /// Реальный AARQ WPDU от DLMS-клиента (LN без шифрования): версия 1, src=16,
     /// dst=1 (Wrapper-порт сервера), длина APDU 31. Хвост InitiateRequest
     /// `1E 5D FF FF` (vaa-name) проект игнорирует при разборе.
     const AARQ_WPDU: &[u8] = &[
-        0x00, 0x01, 0x00, 0x10, 0x00, 0x01, 0x00, 0x1F,
-        0x60, 0x1D, 0xA1, 0x09, 0x06, 0x07, 0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01,
-        0xBE, 0x10, 0x04, 0x0E,
-        0x01, 0x00, 0x00, 0x00, 0x06, 0x5F, 0x1F, 0x04, 0x00, 0x62, 0x1E, 0x5D, 0xFF, 0xFF,
+        0x00, 0x01, 0x00, 0x10, 0x00, 0x01, 0x00, 0x1F, 0x60, 0x1D, 0xA1, 0x09, 0x06, 0x07, 0x60,
+        0x85, 0x74, 0x05, 0x08, 0x01, 0x01, 0xBE, 0x10, 0x04, 0x0E, 0x01, 0x00, 0x00, 0x00, 0x06,
+        0x5F, 0x1F, 0x04, 0x00, 0x62, 0x1E, 0x5D, 0xFF, 0xFF,
     ];
 
     /// Формирует WPDU с AARQ (клиентский запрос ассоциации).
     fn make_aarq_wpdu() -> Vec<u8> {
-        let req = InitiateRequest {
-            dedicated_key: None,
-            response_allowed: true,
-            proposed_quality_of_service: None,
-            proposed_dlms_version_number: 6,
-            proposed_conformance: Conformance([0x00, 0x7E, 0x1F]),
-            client_max_receive_pdu_size: 1200,
-        };
+        let req = InitiateRequest::new(Conformance([0x00, 0x7E, 0x1F]), 1200);
         let mut ui = [0u8; 64];
         let n = req.put(&mut ByteBuffer::new(&mut ui)).unwrap();
 
@@ -277,7 +278,9 @@ mod tests {
         let setting = Wrapper::new(1, 1);
         let mut wpdu = vec![0u8; 8 + m];
         let mut buf = ByteBuffer::new(&mut wpdu);
-        setting.put(&mut buf, |b| b.write(&aarq_bytes[..m])).unwrap();
+        setting
+            .put(&mut buf, |b| b.write(&aarq_bytes[..m]))
+            .unwrap();
         wpdu
     }
 
@@ -345,7 +348,10 @@ mod tests {
             .add_static(
                 REG_OBJ.value(),
                 &REG_VALUE,
-                Access { read: AccessMask::PUBLIC, write: AccessMask::CONFIGURATOR },
+                Access {
+                    read: AccessMask::PUBLIC,
+                    write: AccessMask::CONFIGURATOR,
+                },
             )
             .unwrap();
         let server = Arc::new(Mutex::new(server));
@@ -390,7 +396,10 @@ mod tests {
             GetResponse::get(&mut r).unwrap()
         };
         match response {
-            GetResponse::Normal { invoke, result: GetDataResult::Data(r) } => {
+            GetResponse::Normal(GetResponseNormal {
+                invoke,
+                result: GetDataResult::Data(r),
+            }) => {
                 assert_eq!(invoke.invoke_id(), 1);
                 // DoubleLongUnsigned(100) = [0x06, 0x00, 0x00, 0x00, 0x64].
                 assert_eq!(r.as_bytes(), &[0x06, 0x00, 0x00, 0x00, 0x64]);

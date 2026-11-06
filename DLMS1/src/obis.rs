@@ -375,7 +375,10 @@ mod tests {
     fn logical_name_roundtrip() {
         let code = ObisCode::new(1, 0, 1, 8, 0, 255);
         assert_eq!(code.logical_name(), [1, 0, 1, 8, 0, 255]);
-        assert_eq!(ObisCode::from_logical_name(&[1, 0, 1, 8, 0, 255]).unwrap(), code);
+        assert_eq!(
+            ObisCode::from_logical_name(&[1, 0, 1, 8, 0, 255]).unwrap(),
+            code
+        );
         assert!(ObisCode::from_logical_name(&[1, 0, 1, 8, 0]).is_err());
     }
 

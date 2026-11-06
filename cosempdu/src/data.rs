@@ -5,12 +5,12 @@
 //! A-XDR (IEC 61334-6 §6.6).
 
 use crate::axdr::{
-    get_bit_string, get_length, get_octet_string, get_string, put_bit_string,
-    put_length, put_octet_string, put_string,
+    get_bit_string, get_length, get_octet_string, get_string, put_bit_string, put_length,
+    put_octet_string, put_string,
 };
-use bytebuffer::{ByteBuffer, Reader};
 use crate::error::{Error, Result};
 use crate::stream::StreamSink;
+use bytebuffer::{ByteBuffer, Reader};
 
 /// Advance `buf` past one A-XDR value (tag + content) without materializing it.
 pub fn skip_value(buf: &mut Reader<'_>) -> Result<()> {
@@ -51,7 +51,7 @@ fn skip_value_content(buf: &mut Reader<'_>, tag: u8) -> Result<()> {
             buf.read(len)?;
             Ok(())
         }
-        _ => Err(Error::UnknownTag { name: "skip_value", tag }),
+        _ => Err(Error::UnknownTag { tag }),
     }
 }
 
@@ -109,7 +109,6 @@ impl<'a, T> Arena<'a, T> {
         // handed out slice because `len` only ever advances.
         Ok(unsafe { core::slice::from_raw_parts_mut(ptr.add(start), n) })
     }
-
 }
 
 /// Decode `n` `Data` values from `buf` into `arena`, returning them as a
@@ -434,9 +433,7 @@ impl<'a> Data<'a> {
             Data::Unsigned(v) | Data::Enum(v) | Data::DeltaUnsigned(v) => {
                 Ok(buf.write(&v.to_be_bytes())?)
             }
-            Data::LongUnsigned(v) | Data::DeltaLongUnsigned(v) => {
-                Ok(buf.write(&v.to_be_bytes())?)
-            }
+            Data::LongUnsigned(v) | Data::DeltaLongUnsigned(v) => Ok(buf.write(&v.to_be_bytes())?),
             Data::CompactArray {
                 contents_description,
                 array_contents,
@@ -462,7 +459,11 @@ impl<'a> Data<'a> {
     }
 
     /// Decode content for a known tag.
-    pub fn get_lc(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>, tag: u8) -> Result<Data<'a>> {
+    pub fn get_lc(
+        buf: &mut Reader<'a>,
+        arena: &mut Arena<'a, Data<'a>>,
+        tag: u8,
+    ) -> Result<Data<'a>> {
         Ok(match tag {
             0 => Data::NullData,
             1 => Data::Array(read_items(buf, arena)?),
@@ -501,7 +502,7 @@ impl<'a> Data<'a> {
             32 => Data::DeltaLongUnsigned(u16::from_be_bytes(read_n::<2>(buf)?)),
             33 => Data::DeltaDoubleLongUnsigned(u32::from_be_bytes(read_n::<4>(buf)?)),
             255 => Data::DontCare,
-            _ => return Err(Error::UnknownTag { name: "Data", tag }),
+            _ => return Err(Error::UnknownTag { tag }),
         })
     }
 }
@@ -563,7 +564,10 @@ mod tests {
             Data::OctetString(b"\x01\x02\x03\x04\x05"),
             Data::VisibleString("hello"),
             Data::Utf8String("héllo"),
-            Data::BitString { bytes: b"\xAA\x40", bit_len: 10 },
+            Data::BitString {
+                bytes: b"\xAA\x40",
+                bit_len: 10,
+            },
             Data::Boolean(true),
             Data::NullData,
             Data::DontCare,
@@ -605,7 +609,10 @@ mod tests {
 
     #[test]
     fn bit_string_bit_accessor() {
-        let d = Data::BitString { bytes: b"\xAA\x40", bit_len: 10 };
+        let d = Data::BitString {
+            bytes: b"\xAA\x40",
+            bit_len: 10,
+        };
         assert_eq!(d.bit(0), Some(1));
         assert_eq!(d.bit(1), Some(0));
         assert_eq!(d.bit(8), Some(0));

@@ -58,10 +58,10 @@ pub type Result<T> = core::result::Result<T, Error>;
 ///
 /// Supports both sequential reading (advancing the cursor) and writing.
 #[derive(Debug)]
-    pub struct ByteBuffer<'a> {
-        data: &'a mut [u8],
-        pos: usize,
-    }
+pub struct ByteBuffer<'a> {
+    data: &'a mut [u8],
+    pos: usize,
+}
 
 impl<'a> ByteBuffer<'a> {
     /// Wrap a mutable byte slice for reading and writing.
@@ -382,6 +382,13 @@ impl<'a> Reader<'a> {
     pub fn peek(&self, length: usize) -> Result<&'a [u8]> {
         self.read_at(self.pos, length)
     }
+
+    /// Peek u8 at the current position without advancing.
+    pub fn peek_u8(&self) -> Result<u8> {
+        self.check_space(1, None)?;
+        Ok(self.data[self.pos])
+   }
+
 }
 
 /// Owned byte buffer: owns the backing array and tracks a cursor.
@@ -397,29 +404,48 @@ pub struct ArrayBuffer<const N: usize> {
 
 impl<const N: usize> ArrayBuffer<N> {
     pub const fn new() -> Self {
-        Self { data: [0; N], pos: 0 }
+        Self {
+            data: [0; N],
+            pos: 0,
+        }
     }
 
-    pub const fn len(&self) -> usize { N }
-    pub fn is_empty(&self) -> bool { self.pos == 0 }
+    pub const fn len(&self) -> usize {
+        N
+    }
+    pub fn is_empty(&self) -> bool {
+        self.pos == 0
+    }
 
     /// Current position (bytes written/read so far).
-    pub fn pos(&self) -> usize { self.pos }
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
 
     /// Full underlying slice.
-    pub fn as_bytes(&self) -> &[u8] { &self.data }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
 
     /// Full mutable slice (for direct I/O).
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] { &mut self.data }
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
 
     /// Bytes written so far (start..pos).
-    pub fn extract(&self) -> &[u8] { &self.data[..self.pos] }
+    pub fn extract(&self) -> &[u8] {
+        &self.data[..self.pos]
+    }
 
     /// Remaining space from the current position.
-    pub fn remaining(&self) -> usize { N - self.pos }
+    pub fn remaining(&self) -> usize {
+        N - self.pos
+    }
 
     /// Reset the cursor.
-    pub fn clear(&mut self) { self.pos = 0; }
+    pub fn clear(&mut self) {
+        self.pos = 0;
+    }
 
     /// Set position (bounds-checked). Returns the delta applied.
     pub fn set_pos(&mut self, index: usize) -> Result<isize> {
@@ -506,7 +532,9 @@ impl<const N: usize> ArrayBuffer<N> {
 pub trait ReadBuf {
     fn pos(&self) -> usize;
     fn len(&self) -> usize;
-    fn remaining(&self) -> usize { self.len() - self.pos() }
+    fn remaining(&self) -> usize {
+        self.len() - self.pos()
+    }
     fn get_u8(&mut self) -> Result<u8>;
     fn get_u16(&mut self) -> Result<u16>;
     fn get_uint(&mut self, length: usize) -> Result<u64>;
@@ -519,50 +547,98 @@ pub trait ReadBuf {
 pub trait WriteBuf {
     fn remaining(&self) -> usize;
     fn write(&mut self, value: &[u8]) -> Result<usize>;
-    fn put_u8(&mut self, value: u8) -> Result<usize> { self.write(&[value]) }
-    fn put_u16(&mut self, value: u16) -> Result<usize> { self.write(&value.to_be_bytes()) }
+    fn put_u8(&mut self, value: u8) -> Result<usize> {
+        self.write(&[value])
+    }
+    fn put_u16(&mut self, value: u16) -> Result<usize> {
+        self.write(&value.to_be_bytes())
+    }
 }
 
 impl ReadBuf for Reader<'_> {
-    fn pos(&self) -> usize { self.pos() }
-    fn len(&self) -> usize { self.len() }
-    fn get_u8(&mut self) -> Result<u8> { self.get_u8() }
-    fn get_u16(&mut self) -> Result<u16> { self.get_u16() }
-    fn get_uint(&mut self, length: usize) -> Result<u64> { self.get_uint(length) }
-    fn read(&mut self, length: usize) -> Result<&[u8]> { self.read(length) }
+    fn pos(&self) -> usize {
+        self.pos()
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn get_u8(&mut self) -> Result<u8> {
+        self.get_u8()
+    }
+    fn get_u16(&mut self) -> Result<u16> {
+        self.get_u16()
+    }
+    fn get_uint(&mut self, length: usize) -> Result<u64> {
+        self.get_uint(length)
+    }
+    fn read(&mut self, length: usize) -> Result<&[u8]> {
+        self.read(length)
+    }
 }
 
 impl ReadBuf for ByteBuffer<'_> {
-    fn pos(&self) -> usize { self.pos() }
-    fn len(&self) -> usize { self.len() }
-    fn get_u8(&mut self) -> Result<u8> { self.get_u8() }
-    fn get_u16(&mut self) -> Result<u16> { self.get_u16() }
-    fn get_uint(&mut self, length: usize) -> Result<u64> { self.get_uint(length) }
-    fn read(&mut self, length: usize) -> Result<&[u8]> { self.read(length) }
+    fn pos(&self) -> usize {
+        self.pos()
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn get_u8(&mut self) -> Result<u8> {
+        self.get_u8()
+    }
+    fn get_u16(&mut self) -> Result<u16> {
+        self.get_u16()
+    }
+    fn get_uint(&mut self, length: usize) -> Result<u64> {
+        self.get_uint(length)
+    }
+    fn read(&mut self, length: usize) -> Result<&[u8]> {
+        self.read(length)
+    }
 }
 
 impl WriteBuf for ByteBuffer<'_> {
-    fn remaining(&self) -> usize { self.remaining(None) }
-    fn write(&mut self, value: &[u8]) -> Result<usize> { self.write(value) }
+    fn remaining(&self) -> usize {
+        self.remaining(None)
+    }
+    fn write(&mut self, value: &[u8]) -> Result<usize> {
+        self.write(value)
+    }
 }
 
 impl<const N: usize> ReadBuf for ArrayBuffer<N> {
-    fn pos(&self) -> usize { self.pos() }
-    fn len(&self) -> usize { self.len() }
-    fn get_u8(&mut self) -> Result<u8> { self.get_u8() }
-    fn get_u16(&mut self) -> Result<u16> { self.get_u16() }
-    fn get_uint(&mut self, length: usize) -> Result<u64> { self.get_uint(length) }
-    fn read(&mut self, length: usize) -> Result<&[u8]> { self.read(length) }
+    fn pos(&self) -> usize {
+        self.pos()
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+    fn get_u8(&mut self) -> Result<u8> {
+        self.get_u8()
+    }
+    fn get_u16(&mut self) -> Result<u16> {
+        self.get_u16()
+    }
+    fn get_uint(&mut self, length: usize) -> Result<u64> {
+        self.get_uint(length)
+    }
+    fn read(&mut self, length: usize) -> Result<&[u8]> {
+        self.read(length)
+    }
 }
 
 impl<const N: usize> WriteBuf for ArrayBuffer<N> {
-    fn remaining(&self) -> usize { self.remaining() }
-    fn write(&mut self, value: &[u8]) -> Result<usize> { self.write(value) }
+    fn remaining(&self) -> usize {
+        self.remaining()
+    }
+    fn write(&mut self, value: &[u8]) -> Result<usize> {
+        self.write(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ArrayBuffer, ByteBuffer, Reader, ReadBuf, WriteBuf};
+    use super::{ArrayBuffer, ByteBuffer, ReadBuf, Reader, WriteBuf};
 
     #[test]
     fn write_then_read_roundtrip() {

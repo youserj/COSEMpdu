@@ -4,8 +4,8 @@
 //! types whose shape is already known from the schema; only variable-length
 //! aggregates carry a length prefix (encoded as a variable-length integer).
 
-use bytebuffer::{ByteBuffer, Reader};
 use crate::error::{Error, Result};
+use bytebuffer::{ByteBuffer, Reader};
 
 /// Decode a variable-length integer (IEC 61334-6 §6.1.2).
 ///
@@ -18,9 +18,7 @@ pub fn get_length(buf: &mut Reader<'_>) -> Result<usize> {
     }
     let num_bytes = usize::from(first & 0x7F);
     if num_bytes == 0 {
-        return Err(Error::Message(
-            "invalid variable-length integer encoding",
-        ));
+        return Err(Error::Message("invalid variable-length integer encoding"));
     }
     Ok(buf.get_uint(num_bytes)? as usize)
 }

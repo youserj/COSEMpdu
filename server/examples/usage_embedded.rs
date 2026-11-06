@@ -1,6 +1,6 @@
 //! Embedded-вариант: без кучи, значения в static, сервер — локальный.
 
-use cosempdu::apdu_sn::Conformance;
+use cosempdu::apdu::Conformance;
 use cosempdu::buffer::ByteBuffer;
 
 use dlms1::common_data_types::DoubleLongUnsigned;
@@ -24,12 +24,20 @@ fn main() -> Result<(), server::Error> {
     server.add_persistent(
         REG_OBJ.value(),
         register,
-        Access { read: read_all, write: AccessMask::CONFIGURATOR },
+        Access {
+            read: read_all,
+            write: AccessMask::CONFIGURATOR,
+        },
     )?;
 
     let mut backing = [0u8; 64];
     let mut buf = ByteBuffer::new(&mut backing);
-    server.put(ClassId::Register, REG_OBJ.value(), AccessMask::READER, &mut buf)?;
+    server.put(
+        ClassId::Register,
+        REG_OBJ.value(),
+        AccessMask::READER,
+        &mut buf,
+    )?;
     println!("decoded: {:?}", buf.extract());
 
     Ok(())

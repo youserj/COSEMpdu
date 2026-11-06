@@ -7,7 +7,6 @@
 
 pub mod acse;
 pub mod apdu;
-pub mod apdu_sn;
 pub mod axdr;
 pub mod ber;
 pub mod data;
