@@ -13,15 +13,22 @@ pub mod data;
 pub mod extended_register;
 pub mod register;
 pub mod register_activation;
+pub mod security_setup;
 
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::{Codec, Data, FromStructure};
 use cosempdu::stream::StreamSink;
 
+use crate::common_data_types::{BitString, LongUnsigned, OctetString, Unsigned};
 use crate::error::{Error, Result};
 use crate::obis::ObisCode;
 
-pub use association_ln::AssociationLn;
+pub use association_ln::{
+    client_sap, AccessRight, AccessSelectors, ArrayInteger, AssociationLn, AttributeAccessItem,
+    AttributeAccessMode, ContextName, ContextNameStructure, MechanismName, MechanismNameStructure,
+    MethodAccessItem, MethodAccessMode, ObjectList, ObjectListElement, CONTEXT_NAME_VALIDATOR,
+    MECHANISM_NAME_VALIDATOR, OBJECT_LIST_VALIDATOR,
+};
 pub use association_sn::AssociationSn;
 pub use clock::Clock;
 pub use data::DataObject;
@@ -31,6 +38,10 @@ pub use register_activation::{
     MaskListValidator, ObjectDefinition, RegisterActMask, RegisterActivation,
     RegisterAssignmentValidator, RegisterAssignmentValue, MASK_LIST_VALIDATOR,
     REGISTER_ASSIGNMENT_VALIDATOR,
+};
+pub use security_setup::{
+    CertificateEntity, CertificateInfo, CertificateType, CertificatesValidator, SecuritySetup,
+    SecuritySuite, CERTIFICATES_VALIDATOR,
 };
 
 /// COSEM interface class identifiers (clause 7).
@@ -275,9 +286,15 @@ pub struct AttributeInfo {
 /// ([`attributes`](Self::attributes)). The array starts at attribute 2 because
 /// `logical_name` (attribute 1) is universal. Attribute values live elsewhere
 /// and are stored per-attribute by the server.
-pub trait InterfaceClass: Send + Sync {
+pub trait InterfaceClass: Send + Sync + 'static {
     /// The interface class identifier.
     fn class_id(&self) -> ClassId;
+
+    /// Erase the concrete type (downcast helper).
+    ///
+    /// All descriptors are `Copy` values, so the server can return a concrete
+    /// type back from `&dyn InterfaceClass` via [`core::any::Any::downcast_ref`].
+    fn as_any(&self) -> &dyn core::any::Any;
 
     /// The interface class version.
     fn version(&self) -> u8;
@@ -306,14 +323,6 @@ pub trait InterfaceClass: Send + Sync {
     }
 }
 
-/// One entry of the LN association `object_list` attribute (attribute 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObjectListItem {
-    pub class_id: ClassId,
-    pub version: u8,
-    pub logical_name: ObisCode,
-}
-
 /// One entry of the SN association `object_list` attribute (attribute 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnObjectListItem {
@@ -323,12 +332,145 @@ pub struct SnObjectListItem {
     pub logical_name: ObisCode,
 }
 
-/// The `xDLMS context info` structure (association attribute 5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XdlmsContextInfo {
-    pub conformance: u32,
+/// `xDLMS_context_type ::= structure { conformance: bit-string, max_receive_pdu_size: long-unsigned, max_send_pdu_size: long-unsigned, dlms_version_number: unsigned, quality_of_service: integer, cyphering_info: octet-string }`
+/// (association attribute 5, shared by Association SN and LN).
+///
+/// The variable-length fields (`conformance` bit-string and `cyphering_info`)
+/// borrow from the decoded buffer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XdlmsContextInfo<'a> {
+    /// The `conformance` bit-string bytes.
+    pub conformance: &'a [u8],
+    /// The `conformance` bit-string significant bit count.
+    pub conformance_bit_len: usize,
+    /// The server max receive PDU size (bytes).
     pub max_receive_pdu_size: u16,
+    /// The server max send PDU size (bytes).
     pub max_send_pdu_size: u16,
+    /// The DLMS version number.
+    pub dlms_version_number: u8,
+    /// The quality-of-service (not used).
+    pub quality_of_service: i8,
+    /// The cyphering info (dedicated key), possibly empty.
+    pub cyphering_info: &'a [u8],
+}
+
+impl<'a> FromStructure<'a> for XdlmsContextInfo<'a> {
+    fn from_structure(fields: &'a [Data<'a>]) -> cosempdu::Result<Self> {
+        if fields.len() != 6 {
+            return Err(cosempdu::Error::Message(
+                "xDLMS_context_info must be a structure of six fields",
+            ));
+        }
+        let (conformance, conformance_bit_len) = fields[0]
+            .as_bit_string()
+            .ok_or(cosempdu::Error::Message("field 0 must be a bit-string"))?;
+        let max_receive_pdu_size = fields[1]
+            .as_long_unsigned()
+            .ok_or(cosempdu::Error::Message("field 1 must be a long-unsigned"))?;
+        let max_send_pdu_size = fields[2]
+            .as_long_unsigned()
+            .ok_or(cosempdu::Error::Message("field 2 must be a long-unsigned"))?;
+        let dlms_version_number = fields[3]
+            .as_unsigned()
+            .ok_or(cosempdu::Error::Message("field 3 must be an unsigned"))?;
+        let quality_of_service = fields[4]
+            .as_integer()
+            .ok_or(cosempdu::Error::Message("field 4 must be an integer"))?;
+        let cyphering_info = fields[5]
+            .as_octet_string()
+            .ok_or(cosempdu::Error::Message("field 5 must be an octet-string"))?;
+        Ok(XdlmsContextInfo {
+            conformance,
+            conformance_bit_len,
+            max_receive_pdu_size,
+            max_send_pdu_size,
+            dlms_version_number,
+            quality_of_service,
+            cyphering_info,
+        })
+    }
+}
+
+/// Validates an `xDLMS_context_type` value.
+#[derive(Debug)]
+pub struct XdlmsContextInfoValidator;
+
+impl Validator for XdlmsContextInfoValidator {
+    fn validate(&self, data: &Data<'_>) -> Result<()> {
+        data.recast::<XdlmsContextInfo<'_>>()
+            .map(|_| ())
+            .map_err(Error::from)
+    }
+}
+
+/// Static `xDLMS_context_type` validator (as a trait object).
+pub const XDLMS_CONTEXT_INFO_VALIDATOR: &dyn Validator = &XdlmsContextInfoValidator;
+
+/// Owned `xDLMS_context_type` value (association attribute 5). Encodes as a
+/// six-field A-XDR structure; `quality_of_service` is always encoded as `0`
+/// (not used by DLMS) and is therefore not stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdlmsContextInfoValue {
+    /// The `conformance` bit-string (24 bits).
+    pub conformance: BitString<3>,
+    /// The server max receive PDU size (bytes).
+    pub max_receive_pdu_size: LongUnsigned,
+    /// The server max send PDU size (bytes).
+    pub max_send_pdu_size: LongUnsigned,
+    /// The DLMS version number.
+    pub dlms_version_number: Unsigned,
+    /// The cyphering info (dedicated key), possibly empty.
+    pub cyphering_info: OctetString<32>,
+}
+
+impl Default for XdlmsContextInfoValue {
+    fn default() -> Self {
+        XdlmsContextInfoValue {
+            conformance: BitString::default(),
+            max_receive_pdu_size: LongUnsigned(0),
+            max_send_pdu_size: LongUnsigned(0),
+            dlms_version_number: Unsigned(0),
+            cyphering_info: OctetString::default(),
+        }
+    }
+}
+
+impl Codec for XdlmsContextInfoValue {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        let num_octets = self.conformance.bit_len.div_ceil(8);
+        Data::Structure(&[
+            Data::BitString {
+                bytes: &self.conformance.bytes[..num_octets],
+                bit_len: self.conformance.bit_len,
+            },
+            Data::LongUnsigned(self.max_receive_pdu_size.0),
+            Data::LongUnsigned(self.max_send_pdu_size.0),
+            Data::Unsigned(self.dlms_version_number.0),
+            Data::Integer(0), // quality_of_service — always 0
+            Data::OctetString(self.cyphering_info.octet_string().unwrap_or(&[])),
+        ])
+        .put(buf)
+    }
+
+    fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
+        let v = data.recast::<XdlmsContextInfo<'_>>()?;
+        if v.conformance.len() > 3 {
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge {
+                    len: v.conformance.len(),
+                    max: 3,
+                },
+            ));
+        }
+        self.conformance.bytes[..v.conformance.len()].copy_from_slice(v.conformance);
+        self.conformance.bit_len = v.conformance_bit_len;
+        self.max_receive_pdu_size = LongUnsigned(v.max_receive_pdu_size);
+        self.max_send_pdu_size = LongUnsigned(v.max_send_pdu_size);
+        self.dlms_version_number = Unsigned(v.dlms_version_number);
+        self.cyphering_info = OctetString::try_new(v.cyphering_info)?;
+        Ok(())
+    }
 }
 
 /// `associated_partners_type ::= structure { client_SAP: integer, server_SAP: long-unsigned }`
@@ -377,6 +519,10 @@ impl<'a> FromStructure<'a> for AssociatedPartners {
 }
 
 impl Codec for AssociatedPartners {
+    fn associated_partners(&self) -> Option<(u8, u16)> {
+        Some((self.client_sap as u8, self.server_sap))
+    }
+
     fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
         Data::Structure(&[
             Data::Integer(self.client_sap),
@@ -468,7 +614,7 @@ mod tests {
         assert_eq!(e.attributes().len(), 4);
         assert_eq!(c.attributes().len(), 7);
         assert_eq!(sn.attributes().len(), 8);
-        assert_eq!(ln.attributes().len(), 7);
+        assert_eq!(ln.attributes().len(), 8);
         assert_eq!(ra.attributes().len(), 3);
 
         // attr_key: logical_name + declared attributes only

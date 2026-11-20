@@ -6,7 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::x680::Tag;
-use bytebuffer::{ByteBuffer, Reader};
+use bytebuffer::{Reader, WriteBuf};
 
 // ---------------------------------------------------------------------------
 // Length component (X.690 §8.1.3)
@@ -61,7 +61,7 @@ impl Length {
     }
 
     /// Encode the length to the buffer (advancing it) per X.690 §8.1.3.
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         if self.value == -1 {
             return Ok(buf.put_u8(0x80)?);
         }
@@ -88,7 +88,7 @@ impl core::fmt::Display for Length {
 }
 
 /// Encode a raw length value per X.690 §8.1.3 (minimal octets required).
-pub fn put_length(buf: &mut ByteBuffer<'_>, value: i64) -> Result<usize> {
+pub fn put_length<B: WriteBuf>(buf: &mut B, value: i64) -> Result<usize> {
     Length::new(value)?.put(buf)
 }
 

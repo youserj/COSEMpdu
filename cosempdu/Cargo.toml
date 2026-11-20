@@ -10,6 +10,9 @@ bytebuffer = { path = "../bytebuffer" }
 [features]
 default = ["std"]
 std = ["bytebuffer/std"]
+ecdsa_p256 = []
+ecdsa_p384 = []
+association_ln_v2 = []
 
 [lib]
 name = "cosempdu"

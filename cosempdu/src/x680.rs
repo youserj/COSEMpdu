@@ -6,7 +6,7 @@
 //! here: the DLMS/COSEM PDUs are represented by their own concrete types.
 
 use crate::Result;
-use bytebuffer::{ByteBuffer, Reader};
+use bytebuffer::{Reader, WriteBuf};
 
 /// Universal tag class number (X.680 Table 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,7 +159,7 @@ impl Tag {
     }
 
     /// Encode a BER tag (advancing the buffer) per X.690 §8.1.2.
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         let mut initial = self.class.bits();
         if self.constructed {
             initial |= 0x20;
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn tag_peek_does_not_advance() {
-        // [APPLICATION 0] constructed, затем [1] context primitive.
+        // [APPLICATION 0] constructed, then [1] context primitive.
         let bytes = [0x60, 0x81];
         let mut r = Reader::new(&bytes);
 
@@ -217,10 +217,10 @@ mod tests {
                 constructed: true,
             }
         );
-        // Позиция не сдвинулась.
+        // Position did not advance.
         assert_eq!(r.pos(), 0);
 
-        // Повторное чтение даёт тот же тег и сдвигает буфер.
+        // Reading again yields the same tag and advances the buffer.
         let tag2 = Tag::get(&mut r).unwrap();
         assert_eq!(tag, tag2);
         assert_eq!(r.pos(), 1);
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn tag_peek_high_number_does_not_advance() {
-        // Context [31] в high-tag-number форме: 0x9F 0x1F.
+        // Context [31] in high-tag-number form: 0x9F 0x1F.
         let bytes = [0x9F, 0x1F, 0x00];
         let mut r = Reader::new(&bytes);
 
@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(tag.class, Class::Context);
         assert_eq!(tag.number, 31);
         assert!(!tag.constructed);
-        // Двухбайтовый тег тоже прочитан без сдвига.
+        // The two-byte tag is also read without advancing.
         assert_eq!(r.pos(), 0);
     }
 }

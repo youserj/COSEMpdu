@@ -20,7 +20,7 @@ pub mod ic;
 pub mod obis;
 
 pub use common_data_types::{
-    Bcd, BitString, Boolean, CompactArray, Date, DateTime, DeltaDoubleLong,
+    Array, ArrayOwned, Bcd, BitString, Boolean, CompactArray, Date, DateTime, DeltaDoubleLong,
     DeltaDoubleLongUnsigned, DeltaInteger, DeltaLong, DeltaLongUnsigned, DeltaUnsigned, DoubleLong,
     DoubleLongUnsigned, Enum, Float32, Float64, Integer, Long, Long64, Long64Unsigned,
     LongUnsigned, NullData, OctetString, OctetStringSized, Time, Unsigned, Utf8String,

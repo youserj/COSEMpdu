@@ -8,9 +8,7 @@
 use crate::axdr::{get_length, put_length};
 use crate::data::{data_value, Codec};
 use crate::error::{Error, Result};
-use bytebuffer::{ByteBuffer, Reader};
-
-
+use bytebuffer::{ByteBuffer, Reader, WriteBuf};
 
 pub trait ImplicitTagged<'a>: Sized {
     const TAG: u8;
@@ -18,7 +16,10 @@ pub trait ImplicitTagged<'a>: Sized {
     fn validate_tag(buf: &mut Reader<'a>) -> Result<()> {
         let tag = buf.get_u8()?;
         if tag != Self::TAG {
-            return Err(Error::TagNumber { expected: Self::TAG, actual: tag });
+            return Err(Error::TagNumber {
+                expected: Self::TAG,
+                actual: tag,
+            });
         }
         Ok(())
     }
@@ -32,7 +33,6 @@ pub trait ImplicitTagged<'a>: Sized {
     /// Decode the content that follows the tag byte.
     fn decode(buf: &mut Reader<'a>) -> Result<Self>;
 }
-
 
 /// Invoke-Id-And-Priority ::= Unsigned8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ impl InvokeIdAndPriority {
         self.0 & 1 != 0
     }
 
-    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         Ok(buf.put_u8(self.0)?)
     }
 
@@ -167,7 +167,7 @@ fn read_n<const N: usize>(buf: &mut Reader<'_>) -> Result<[u8; N]> {
 }
 
 /// Write an OPTIONAL presence flag (A-XDR §6.8): 0x00 absent, 0xFF present.
-fn put_presence(buf: &mut ByteBuffer<'_>, present: bool) -> Result<usize> {
+fn put_presence<B: WriteBuf>(buf: &mut B, present: bool) -> Result<usize> {
     Ok(buf.put_u8(if present { 0xFF } else { 0x00 })?)
 }
 
@@ -394,7 +394,6 @@ impl<'a> Iterator for ActionResponseWithOptionalDataList<'a> {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct GetRequestNormal<'a> {
     pub invoke: InvokeIdAndPriority,
@@ -482,9 +481,7 @@ impl<'a> ImplicitTagged<'a> for GetRequest<'a> {
     }
 }
 
-
 impl<'a> GetRequest<'a> {
-
     /// Encode the `normal` alternative from typed values.
     pub fn put_normal(
         invoke: InvokeIdAndPriority,
@@ -563,7 +560,7 @@ pub enum DataAccessResult {
 }
 
 impl DataAccessResult {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         Ok(buf.put_u8(*self as u8)?)
     }
 
@@ -632,7 +629,7 @@ impl<'a> GetDataResult<'a> {
         match buf.get_u8()? {
             0 => Ok(GetDataResult::Data(data_value(buf)?)),
             1 => Ok(GetDataResult::DataAccessError(DataAccessResult::get(buf)?)),
-            t => Err(Error::UnknownTag { tag: t })
+            t => Err(Error::UnknownTag { tag: t }),
         }
     }
 }
@@ -678,9 +675,13 @@ impl<'a> DataBlockGResult<'a> {
 
     fn get(buf: &mut Reader<'a>) -> Result<Self> {
         match buf.get_u8()? {
-            0 => Ok(DataBlockGResult::RawData(crate::axdr::get_octet_string(buf)?)),
-            1 => Ok(DataBlockGResult::DataAccessError(DataAccessResult::get(buf)?)),
-            t => Err(Error::UnknownTag { tag: t })
+            0 => Ok(DataBlockGResult::RawData(crate::axdr::get_octet_string(
+                buf,
+            )?)),
+            1 => Ok(DataBlockGResult::DataAccessError(DataAccessResult::get(
+                buf,
+            )?)),
+            t => Err(Error::UnknownTag { tag: t }),
         }
     }
 }
@@ -886,7 +887,6 @@ impl<'a> GetResponse<'a> {
         }
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for GetResponse<'a> {
@@ -1161,7 +1161,6 @@ impl<'a> SetRequest<'a> {
         written += datablock.put(buf)?;
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for SetRequest<'a> {
@@ -1173,7 +1172,9 @@ impl<'a> ImplicitTagged<'a> for SetRequest<'a> {
             2 => SetRequest::WithFirstDatablock(SetRequestWithFirstDatablock::get(buf)?),
             3 => SetRequest::WithDatablock(SetRequestWithDatablock::get(buf)?),
             4 => SetRequest::WithList(SetRequestWithList::get(buf)?),
-            5 => SetRequest::WithListAndFirstDatablock(SetRequestWithListAndFirstDatablock::get(buf)?),
+            5 => SetRequest::WithListAndFirstDatablock(SetRequestWithListAndFirstDatablock::get(
+                buf,
+            )?),
             other => return Err(Error::UnknownTag { tag: other }),
         })
     }
@@ -1328,10 +1329,10 @@ pub enum SetResponse<'a> {
 
 impl<'a> SetResponse<'a> {
     /// Encode the `normal` alternative.
-    pub fn put_normal(
+    pub fn put_normal<B: WriteBuf>(
         invoke: InvokeIdAndPriority,
         result: DataAccessResult,
-        buf: &mut ByteBuffer<'_>,
+        buf: &mut B,
     ) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
         written += buf.put_u8(1)?;
@@ -1396,7 +1397,6 @@ impl<'a> SetResponse<'a> {
         }
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for SetResponse<'a> {
@@ -1656,7 +1656,6 @@ impl<'a> ActionRequest<'a> {
         written += pblock.put(buf)?;
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for ActionRequest<'a> {
@@ -1668,7 +1667,9 @@ impl<'a> ImplicitTagged<'a> for ActionRequest<'a> {
             2 => ActionRequest::NextPblock(ActionRequestNextPblock::get(buf)?),
             3 => ActionRequest::WithList(ActionRequestWithList::get(buf)?),
             4 => ActionRequest::WithFirstPblock(ActionRequestWithFirstPblock::get(buf)?),
-            5 => ActionRequest::WithListAndFirstPblock(ActionRequestWithListAndFirstPblock::get(buf)?),
+            5 => ActionRequest::WithListAndFirstPblock(ActionRequestWithListAndFirstPblock::get(
+                buf,
+            )?),
             6 => ActionRequest::WithPblock(ActionRequestWithPblock::get(buf)?),
             other => return Err(Error::UnknownTag { tag: other }),
         })
@@ -1816,7 +1817,6 @@ impl<'a> ActionResponse<'a> {
         written += buf.write(&block_number.to_be_bytes())?;
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for ActionResponse<'a> {
@@ -1858,7 +1858,6 @@ impl<'a> EventNotificationRequest<'a> {
         written += attribute_value.put(buf)?;
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for EventNotificationRequest<'a> {
@@ -1889,7 +1888,7 @@ pub enum StateError {
 }
 
 impl StateError {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         Ok(buf.put_u8(*self as u8)?)
     }
 
@@ -1920,7 +1919,7 @@ pub enum ServiceError_ {
 }
 
 impl ServiceError_ {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         match *self {
             ServiceError_::OperationNotPossible => Ok(buf.put_u8(1)?),
             ServiceError_::ServiceNotSupported => Ok(buf.put_u8(2)?),
@@ -1945,7 +1944,7 @@ impl ServiceError_ {
             6 => Ok(Self::InvocationCounterError(u32::from_be_bytes(
                 read_n::<4>(buf)?,
             ))),
-            t => Err(Error::UnknownTag { tag:t })
+            t => Err(Error::UnknownTag { tag: t }),
         }
     }
 }
@@ -1958,13 +1957,12 @@ pub struct ExceptionResponse {
 }
 
 impl ExceptionResponse {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         let mut written = buf.put_u8(Self::TAG)?;
         written += self.state_error.put(buf)?;
         written += self.service_error.put(buf)?;
         Ok(written)
     }
-
 }
 
 impl<'a> ImplicitTagged<'a> for ExceptionResponse {
@@ -1980,6 +1978,71 @@ impl<'a> ImplicitTagged<'a> for ExceptionResponse {
     }
 }
 
+/// Bit indices of the 24-bit conformance block (bit 0 = MSB of the first byte).
+///
+/// The bit is set when the corresponding service/feature is available.
+pub mod conformance_bit {
+    pub const RESERVED_ZERO: u8 = 0;
+    pub const GENERAL_PROTECTION: u8 = 1;
+    pub const GENERAL_BLOCK_TRANSFER: u8 = 2;
+    pub const READ: u8 = 3;
+    pub const WRITE: u8 = 4;
+    pub const UNCONFIRMED_WRITE: u8 = 5;
+    pub const DELTA_VALUE_ENCODING: u8 = 6;
+    pub const RESERVED_SEVEN: u8 = 7;
+    pub const ATTRIBUTE0_SUPPORTED_WITH_SET: u8 = 8;
+    pub const PRIORITY_MGMT_SUPPORTED: u8 = 9;
+    pub const ATTRIBUTE0_SUPPORTED_WITH_GET: u8 = 10;
+    pub const BLOCK_TRANSFER_WITH_GET_OR_READ: u8 = 11;
+    pub const BLOCK_TRANSFER_WITH_SET_OR_WRITE: u8 = 12;
+    pub const BLOCK_TRANSFER_WITH_ACTION: u8 = 13;
+    pub const MULTIPLE_REFERENCES: u8 = 14;
+    pub const INFORMATION_REPORT: u8 = 15;
+    pub const DATA_NOTIFICATION: u8 = 16;
+    pub const ACCESS: u8 = 17;
+    pub const PARAMETERIZED_ACCESS: u8 = 18;
+    pub const GET: u8 = 19;
+    pub const SET: u8 = 20;
+    pub const SELECTIVE_ACCESS: u8 = 21;
+    pub const EVENT_NOTIFICATION: u8 = 22;
+    pub const ACTION: u8 = 23;
+}
+
+/// A set of conformance-block flags — for readable construction of [`Conformance`].
+///
+/// Reserved bits 0 and 7 are absent and always cleared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConformanceBits {
+    pub general_protection: bool,
+    pub general_block_transfer: bool,
+    pub read: bool,
+    pub write: bool,
+    pub unconfirmed_write: bool,
+    pub delta_value_encoding: bool,
+    pub attribute0_supported_with_set: bool,
+    pub priority_mgmt_supported: bool,
+    pub attribute0_supported_with_get: bool,
+    pub block_transfer_with_get_or_read: bool,
+    pub block_transfer_with_set_or_write: bool,
+    pub block_transfer_with_action: bool,
+    pub multiple_references: bool,
+    pub information_report: bool,
+    pub data_notification: bool,
+    pub access: bool,
+    pub parameterized_access: bool,
+    pub get: bool,
+    pub set: bool,
+    pub selective_access: bool,
+    pub event_notification: bool,
+    pub action: bool,
+}
+
+/// Set bit `index` (0..24) in the 24-bit conformance block.
+const fn set_conformance_bit(mut bytes: [u8; 3], index: u8) -> [u8; 3] {
+    bytes[(index / 8) as usize] |= 1 << (7 - index % 8);
+    bytes
+}
+
 /// `Conformance ::= [APPLICATION 31] IMPLICIT BIT STRING (SIZE(24))`.
 ///
 /// Encoded in BER: tag (`5F 1F`) + length (`04`) + unused-bits (`00`) + 3 value
@@ -1988,7 +2051,7 @@ impl<'a> ImplicitTagged<'a> for ExceptionResponse {
 pub struct Conformance(pub [u8; 3]);
 
 impl Conformance {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         let mut written = buf.write(&[0x5F, 0x1F, 0x04, 0x00])?;
         written += buf.write(&self.0)?;
         Ok(written)
@@ -2013,14 +2076,179 @@ impl Conformance {
         Ok(Conformance(value))
     }
 
-    /// Побитовое пересечение (поразрядное И) с другим набором conformance —
-    /// результат согласования «предложено ∩ поддерживается».
+    /// Bitwise intersection (AND) with another conformance set —
+    /// the negotiation result "proposed ∩ supported".
     pub fn intersection(self, other: Conformance) -> Conformance {
         Conformance([
             self.0[0] & other.0[0],
             self.0[1] & other.0[1],
             self.0[2] & other.0[2],
         ])
+    }
+
+    /// Build a conformance from a set of flags.
+    pub const fn from_bits(bits: ConformanceBits) -> Self {
+        let mut bytes = [0u8; 3];
+        if bits.general_protection {
+            bytes = set_conformance_bit(bytes, conformance_bit::GENERAL_PROTECTION);
+        }
+        if bits.general_block_transfer {
+            bytes = set_conformance_bit(bytes, conformance_bit::GENERAL_BLOCK_TRANSFER);
+        }
+        if bits.read {
+            bytes = set_conformance_bit(bytes, conformance_bit::READ);
+        }
+        if bits.write {
+            bytes = set_conformance_bit(bytes, conformance_bit::WRITE);
+        }
+        if bits.unconfirmed_write {
+            bytes = set_conformance_bit(bytes, conformance_bit::UNCONFIRMED_WRITE);
+        }
+        if bits.delta_value_encoding {
+            bytes = set_conformance_bit(bytes, conformance_bit::DELTA_VALUE_ENCODING);
+        }
+        if bits.attribute0_supported_with_set {
+            bytes = set_conformance_bit(bytes, conformance_bit::ATTRIBUTE0_SUPPORTED_WITH_SET);
+        }
+        if bits.priority_mgmt_supported {
+            bytes = set_conformance_bit(bytes, conformance_bit::PRIORITY_MGMT_SUPPORTED);
+        }
+        if bits.attribute0_supported_with_get {
+            bytes = set_conformance_bit(bytes, conformance_bit::ATTRIBUTE0_SUPPORTED_WITH_GET);
+        }
+        if bits.block_transfer_with_get_or_read {
+            bytes = set_conformance_bit(bytes, conformance_bit::BLOCK_TRANSFER_WITH_GET_OR_READ);
+        }
+        if bits.block_transfer_with_set_or_write {
+            bytes = set_conformance_bit(bytes, conformance_bit::BLOCK_TRANSFER_WITH_SET_OR_WRITE);
+        }
+        if bits.block_transfer_with_action {
+            bytes = set_conformance_bit(bytes, conformance_bit::BLOCK_TRANSFER_WITH_ACTION);
+        }
+        if bits.multiple_references {
+            bytes = set_conformance_bit(bytes, conformance_bit::MULTIPLE_REFERENCES);
+        }
+        if bits.information_report {
+            bytes = set_conformance_bit(bytes, conformance_bit::INFORMATION_REPORT);
+        }
+        if bits.data_notification {
+            bytes = set_conformance_bit(bytes, conformance_bit::DATA_NOTIFICATION);
+        }
+        if bits.access {
+            bytes = set_conformance_bit(bytes, conformance_bit::ACCESS);
+        }
+        if bits.parameterized_access {
+            bytes = set_conformance_bit(bytes, conformance_bit::PARAMETERIZED_ACCESS);
+        }
+        if bits.get {
+            bytes = set_conformance_bit(bytes, conformance_bit::GET);
+        }
+        if bits.set {
+            bytes = set_conformance_bit(bytes, conformance_bit::SET);
+        }
+        if bits.selective_access {
+            bytes = set_conformance_bit(bytes, conformance_bit::SELECTIVE_ACCESS);
+        }
+        if bits.event_notification {
+            bytes = set_conformance_bit(bytes, conformance_bit::EVENT_NOTIFICATION);
+        }
+        if bits.action {
+            bytes = set_conformance_bit(bytes, conformance_bit::ACTION);
+        }
+        Conformance(bytes)
+    }
+
+    /// Check bit `index` (0..24).
+    pub const fn bit(self, index: u8) -> bool {
+        (self.0[(index / 8) as usize] >> (7 - index % 8)) & 1 != 0
+    }
+
+    pub const fn is_general_protection(self) -> bool {
+        self.bit(conformance_bit::GENERAL_PROTECTION)
+    }
+
+    pub const fn is_general_block_transfer(self) -> bool {
+        self.bit(conformance_bit::GENERAL_BLOCK_TRANSFER)
+    }
+
+    pub const fn is_read(self) -> bool {
+        self.bit(conformance_bit::READ)
+    }
+
+    pub const fn is_write(self) -> bool {
+        self.bit(conformance_bit::WRITE)
+    }
+
+    pub const fn is_unconfirmed_write(self) -> bool {
+        self.bit(conformance_bit::UNCONFIRMED_WRITE)
+    }
+
+    pub const fn is_delta_value_encoding(self) -> bool {
+        self.bit(conformance_bit::DELTA_VALUE_ENCODING)
+    }
+
+    pub const fn is_attribute0_supported_with_set(self) -> bool {
+        self.bit(conformance_bit::ATTRIBUTE0_SUPPORTED_WITH_SET)
+    }
+
+    pub const fn is_priority_mgmt_supported(self) -> bool {
+        self.bit(conformance_bit::PRIORITY_MGMT_SUPPORTED)
+    }
+
+    pub const fn is_attribute0_supported_with_get(self) -> bool {
+        self.bit(conformance_bit::ATTRIBUTE0_SUPPORTED_WITH_GET)
+    }
+
+    pub const fn is_block_transfer_with_get_or_read(self) -> bool {
+        self.bit(conformance_bit::BLOCK_TRANSFER_WITH_GET_OR_READ)
+    }
+
+    pub const fn is_block_transfer_with_set_or_write(self) -> bool {
+        self.bit(conformance_bit::BLOCK_TRANSFER_WITH_SET_OR_WRITE)
+    }
+
+    pub const fn is_block_transfer_with_action(self) -> bool {
+        self.bit(conformance_bit::BLOCK_TRANSFER_WITH_ACTION)
+    }
+
+    pub const fn is_multiple_references(self) -> bool {
+        self.bit(conformance_bit::MULTIPLE_REFERENCES)
+    }
+
+    pub const fn is_information_report(self) -> bool {
+        self.bit(conformance_bit::INFORMATION_REPORT)
+    }
+
+    pub const fn is_data_notification(self) -> bool {
+        self.bit(conformance_bit::DATA_NOTIFICATION)
+    }
+
+    pub const fn is_access(self) -> bool {
+        self.bit(conformance_bit::ACCESS)
+    }
+
+    pub const fn is_parameterized_access(self) -> bool {
+        self.bit(conformance_bit::PARAMETERIZED_ACCESS)
+    }
+
+    pub const fn is_get(self) -> bool {
+        self.bit(conformance_bit::GET)
+    }
+
+    pub const fn is_set(self) -> bool {
+        self.bit(conformance_bit::SET)
+    }
+
+    pub const fn is_selective_access(self) -> bool {
+        self.bit(conformance_bit::SELECTIVE_ACCESS)
+    }
+
+    pub const fn is_event_notification(self) -> bool {
+        self.bit(conformance_bit::EVENT_NOTIFICATION)
+    }
+
+    pub const fn is_action(self) -> bool {
+        self.bit(conformance_bit::ACTION)
     }
 }
 
@@ -2029,7 +2257,7 @@ impl Conformance {
 pub struct ObjectName(pub u16);
 
 impl ObjectName {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         Ok(buf.write(&self.0.to_be_bytes())?)
     }
 
@@ -2239,7 +2467,7 @@ impl<'a> VariableAccessSpecification<'a> {
             7 => Ok(VariableAccessSpecification::WriteDataBlockAccess(
                 WriteDataBlockAccess::get(buf)?,
             )),
-            t => Err(Error::UnknownTag { tag: t })
+            t => Err(Error::UnknownTag { tag: t }),
         }
     }
 }
@@ -2327,7 +2555,7 @@ impl<'a> ReadResponseItem<'a> {
                 buf,
             )?)),
             3 => Ok(ReadResponseItem::BlockNumber(get_u16(buf)?)),
-            t => Err(Error::UnknownTag { tag: t })
+            t => Err(Error::UnknownTag { tag: t }),
         }
     }
 }
@@ -2402,7 +2630,7 @@ impl WriteResponseItem {
                 buf,
             )?)),
             2 => Ok(WriteResponseItem::BlockNumber(get_u16(buf)?)),
-            t => Err(Error::UnknownTag {tag: t})
+            t => Err(Error::UnknownTag { tag: t }),
         }
     }
 }
@@ -2445,7 +2673,7 @@ impl<'a> Iterator for WriteResponseItemList<'a> {
     }
 }
 
-/// Генерирует `IMPLICIT ENUMERATED` (1-байтовый код без тега) с `put`/`get`.
+/// Generates an `IMPLICIT ENUMERATED` (1-byte code without tag) with `put`/`get`.
 macro_rules! enumerated {
     ($(#[$meta:meta])* $name:ident { $($variant:ident = $code:expr),+ $(,)? }) => {
         $(#[$meta])*
@@ -2599,7 +2827,7 @@ pub enum SnServiceError {
 }
 
 impl SnServiceError {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         let (tag, value) = match *self {
             SnServiceError::ApplicationReference(v) => (0, v as u8),
             SnServiceError::HardwareResource(v) => (1, v as u8),
@@ -2627,7 +2855,7 @@ impl SnServiceError {
             6 => SnServiceError::Initiate(Initiate::get(buf)?),
             7 => SnServiceError::LoadDataSet(LoadDataSet::get(buf)?),
             9 => SnServiceError::Task(Task::get(buf)?),
-            t => return Err(Error::UnknownTag { tag: t})
+            t => return Err(Error::UnknownTag { tag: t }),
         })
     }
 }
@@ -2666,7 +2894,7 @@ pub mod confirmed_service_error_tag {
 }
 
 impl ConfirmedServiceError {
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         let mut w = buf.put_u8(Self::TAG)?;
         w += buf.put_u8(self.tag)?;
         w += self.service_error.put(buf)?;
@@ -2685,18 +2913,17 @@ impl<'a> ImplicitTagged<'a> for ConfirmedServiceError {
     }
 }
 
-
-/// Минимальная поддерживаемая версия DLMS (значение по умолчанию для
+/// Minimum supported DLMS version (the default value for
 /// `Initiate-Request` / `Initiate-Response`).
 pub const DLMS_VERSION_NUMBER: u8 = 6;
 
-/// VAA-name, сообщаемый в `Initiate-Response` (LN referencing, без шифрования).
+/// VAA-name reported in `Initiate-Response` (LN referencing, no ciphering).
 pub const VAA_NAME_LN: ObjectName = ObjectName(0x0007);
 
 /// `InitiateRequest ::= SEQUENCE` (`[1] IMPLICIT` in the xDLMS-APDU CHOICE).
 ///
-/// `proposed-quality-of-service` в DLMS не используется и поэтому не хранится
-/// в структуре; на проводе поле всё равно учитывается (см. `put`/`decode`).
+/// `proposed-quality-of-service` is unused in DLMS and therefore not stored
+/// in the struct; on the wire the field is still handled (see `put`/`decode`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InitiateRequest<'a> {
     pub dedicated_key: Option<&'a [u8]>,
@@ -2729,7 +2956,7 @@ impl<'a> InitiateRequest<'a> {
             w += buf.put_u8(0xFF)?;
             w += buf.put_u8(0x00)?;
         }
-        // proposed-quality-of-service: в DLMS не используется — всегда отсутствует.
+        // proposed-quality-of-service: unused in DLMS — always absent.
         w += put_presence(buf, false)?;
         w += buf.put_u8(self.proposed_dlms_version_number)?;
         w += self.proposed_conformance.put(buf)?;
@@ -2752,7 +2979,7 @@ impl<'a> ImplicitTagged<'a> for InitiateRequest<'a> {
         } else {
             true
         };
-        // proposed-quality-of-service: в DLMS не используется — читаем и отбрасываем.
+        // proposed-quality-of-service: unused in DLMS — read and discard.
         if get_presence(buf)? {
             let _ = buf.get_u8()?;
         }
@@ -2766,12 +2993,11 @@ impl<'a> ImplicitTagged<'a> for InitiateRequest<'a> {
     }
 }
 
-
 /// `InitiateResponse ::= SEQUENCE` (`[8] IMPLICIT` in the xDLMS-APDU CHOICE).
 ///
-/// `negotiated-quality-of-service` в DLMS не используется и поэтому не хранится
-/// в структуре; на проводе поле всё равно учитывается (см. `put`/`decode`).
-/// `vaa-name` тоже фиксирован ([`VAA_NAME_LN`]) и не хранится.
+/// `negotiated-quality-of-service` is unused in DLMS and therefore not stored
+/// in the struct; on the wire the field is still handled (see `put`/`decode`).
+/// `vaa-name` is also fixed ([`VAA_NAME_LN`]) and not stored.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InitiateResponse {
     pub negotiated_dlms_version_number: u8,
@@ -2780,10 +3006,7 @@ pub struct InitiateResponse {
 }
 
 impl InitiateResponse {
-    pub fn new(
-        negotiated_conformance: Conformance,
-        server_max_receive_pdu_size: u16,
-    ) -> Self {
+    pub fn new(negotiated_conformance: Conformance, server_max_receive_pdu_size: u16) -> Self {
         InitiateResponse {
             negotiated_dlms_version_number: DLMS_VERSION_NUMBER,
             negotiated_conformance,
@@ -2791,14 +3014,14 @@ impl InitiateResponse {
         }
     }
 
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         let mut w = buf.put_u8(Self::TAG)?;
-        // negotiated-quality-of-service: в DLMS не используется — всегда отсутствует.
+        // negotiated-quality-of-service: unused in DLMS — always absent.
         w += put_presence(buf, false)?;
         w += buf.put_u8(self.negotiated_dlms_version_number)?;
         w += self.negotiated_conformance.put(buf)?;
         w += buf.write(&self.server_max_receive_pdu_size.to_be_bytes())?;
-        // vaa-name: фиксирован (VAA_NAME_LN).
+        // vaa-name: fixed (VAA_NAME_LN).
         w += VAA_NAME_LN.put(buf)?;
         Ok(w)
     }
@@ -2808,14 +3031,14 @@ impl<'a> ImplicitTagged<'a> for InitiateResponse {
     const TAG: u8 = 8;
 
     fn decode(buf: &mut Reader<'a>) -> Result<Self> {
-        // negotiated-quality-of-service: в DLMS не используется — читаем и отбрасываем.
+        // negotiated-quality-of-service: unused in DLMS — read and discard.
         if get_presence(buf)? {
             let _ = buf.get_u8()?;
         }
         let negotiated_dlms_version_number = buf.get_u8()?;
         let negotiated_conformance = Conformance::get(buf)?;
         let server_max_receive_pdu_size = get_u16(buf)?;
-        // vaa-name: фиксирован (VAA_NAME_LN) — читаем и отбрасываем.
+        // vaa-name: fixed (VAA_NAME_LN) — read and discard.
         let _ = ObjectName::get(buf)?;
         Ok(InitiateResponse {
             negotiated_dlms_version_number,
@@ -2824,7 +3047,6 @@ impl<'a> ImplicitTagged<'a> for InitiateResponse {
         })
     }
 }
-
 
 /// `ReadRequest ::= SEQUENCE OF Variable-Access-Specification` (`[5] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2853,7 +3075,6 @@ impl<'a> ImplicitTagged<'a> for ReadRequest<'a> {
     }
 }
 
-
 /// `ReadResponse ::= SEQUENCE OF CHOICE` (`[12] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReadResponse<'a> {
@@ -2880,7 +3101,6 @@ impl<'a> ImplicitTagged<'a> for ReadResponse<'a> {
         })
     }
 }
-
 
 /// `WriteRequest ::= SEQUENCE` (`[6] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2915,7 +3135,6 @@ impl<'a> ImplicitTagged<'a> for WriteRequest<'a> {
     }
 }
 
-
 /// `WriteResponse ::= SEQUENCE OF CHOICE` (`[13] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WriteResponse<'a> {
@@ -2942,7 +3161,6 @@ impl<'a> ImplicitTagged<'a> for WriteResponse<'a> {
         })
     }
 }
-
 
 /// `Long-Invoke-Id-And-Priority ::= Unsigned32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3011,7 +3229,6 @@ impl<'a> ImplicitTagged<'a> for DataNotification<'a> {
     }
 }
 
-
 /// `Data-Notification-Confirm ::= SEQUENCE` (`[16] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DataNotificationConfirm<'a> {
@@ -3038,7 +3255,6 @@ impl<'a> ImplicitTagged<'a> for DataNotificationConfirm<'a> {
         })
     }
 }
-
 
 /// `UnconfirmedWriteRequest ::= SEQUENCE` (`[22] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3072,7 +3288,6 @@ impl<'a> ImplicitTagged<'a> for UnconfirmedWriteRequest<'a> {
         })
     }
 }
-
 
 /// `InformationReportRequest ::= SEQUENCE` (`[24] IMPLICIT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3185,9 +3400,7 @@ impl<'a> ImplicitTagged<'a> for XDLMSApdu<'a> {
             ActionRequest::TAG => XDLMSApdu::ActionRequest(ActionRequest::decode(buf)?),
             SetResponse::TAG => XDLMSApdu::SetResponse(SetResponse::decode(buf)?),
             ActionResponse::TAG => XDLMSApdu::ActionResponse(ActionResponse::decode(buf)?),
-            ExceptionResponse::TAG => {
-                XDLMSApdu::ExceptionResponse(ExceptionResponse::decode(buf)?)
-            }
+            ExceptionResponse::TAG => XDLMSApdu::ExceptionResponse(ExceptionResponse::decode(buf)?),
             other => return Err(Error::UnknownTag { tag: other }),
         })
     }
@@ -3418,7 +3631,10 @@ mod tests {
             ),
             SetRequest::get,
             |d| match d {
-                SetRequest::WithFirstDatablock(SetRequestWithFirstDatablock { datablock: db, .. }) => {
+                SetRequest::WithFirstDatablock(SetRequestWithFirstDatablock {
+                    datablock: db,
+                    ..
+                }) => {
                     assert_eq!(db.raw_data, b"\xDE\xAD");
                 }
                 _ => panic!("wrong variant"),
@@ -3601,7 +3817,9 @@ mod tests {
             ),
             XDLMSApdu::get,
             |d| match d {
-                XDLMSApdu::SetRequest(SetRequest::Normal(SetRequestNormal { value: v, .. })) => {
+                XDLMSApdu::SetRequest(SetRequest::Normal(SetRequestNormal {
+                    value: v, ..
+                })) => {
                     assert_eq!(v.as_bytes(), enc(&TestCodec(Data::Unsigned(9))).as_slice());
                 }
                 _ => panic!("wrong variant"),
@@ -3689,6 +3907,29 @@ mod sn_tests {
         let mut r = Reader::new(&bytes);
         let decoded = InitiateResponse::get(&mut r).unwrap();
         assert_eq!(decoded.server_max_receive_pdu_size, 500);
+    }
+
+    #[test]
+    fn conformance_bits_roundtrip() {
+        let conf = Conformance::from_bits(ConformanceBits {
+            read: true,
+            write: true,
+            unconfirmed_write: true,
+            multiple_references: true,
+            information_report: true,
+            parameterized_access: true,
+            ..ConformanceBits::default()
+        });
+        assert_eq!(conf, Conformance([0x1C, 0x03, 0x20]));
+        assert!(conf.is_read());
+        assert!(conf.is_write());
+        assert!(conf.is_unconfirmed_write());
+        assert!(conf.is_multiple_references());
+        assert!(conf.is_information_report());
+        assert!(conf.is_parameterized_access());
+        assert!(!conf.is_get());
+        assert!(!conf.is_action());
+        assert!(!conf.is_general_protection());
     }
 
     #[test]

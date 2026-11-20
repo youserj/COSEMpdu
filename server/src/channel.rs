@@ -1,35 +1,35 @@
-//! Асинхронные транспортные каналы (no_alloc).
+//! Asynchronous transport channels (no_alloc).
 //!
-//! Канал двигает полный WPDU между физическим носителем и буферами [`Session`].
-//! Используется нативный `async fn in trait` (без `async-trait`-крейта, без
-//! `alloc`) — статическая диспетчеризация через дженерики.
+//! A channel moves a complete WPDU between the physical medium and the [`Session`] buffers.
+//! Uses native `async fn in trait` (no `async-trait` crate, no
+//! `alloc`) — static dispatch via generics.
 
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use cosempdu::error::Error;
 
-/// Асинхронный канал связи: читает/пишет полный WPDU (с фреймингом).
+/// Asynchronous communication channel: reads/writes a full WPDU (with framing).
 ///
-/// `Frame` — метаданные принятого кадра (например, `Wrapper` для TCP/BLE;
-/// для будущего HDLC-канала — свой тип кадра). Это точка обобщения под HDLC.
+/// `Frame` — metadata of the received frame (e.g. `Wrapper` for TCP/BLE;
+/// for a future HDLC channel — its own frame type). This is the HDLC generalization point.
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 #[allow(async_fn_in_trait)]
 pub trait Channel {
-    /// Метаданные принятого кадра (заголовок, длина payload).
+    /// Metadata of the received frame (header, payload length).
     type Frame;
 
-    /// Прочитать один WPDU: заголовок — в метаданные кадра, APDU — в `buf`.
+    /// Read one WPDU: the header into frame metadata, the APDU into `buf`.
     async fn read(&mut self, buf: &mut [u8]) -> Result<Self::Frame, Error>;
 
-    /// Записать `data` (WPDU) в носитель.
+    /// Write `data` (WPDU) to the medium.
     async fn write(&mut self, data: &[u8]) -> Result<(), Error>;
 }
 
-/// Асинхронный приёмник соединений (например, TCP listener).
+/// Asynchronous connection acceptor (e.g. a TCP listener).
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 #[allow(async_fn_in_trait)]
 pub trait Listener {
     type Channel: Channel;
 
-    /// Принять одно входящее соединение и вернуть его канал.
+    /// Accept one incoming connection and return its channel.
     async fn accept(&mut self) -> Result<Self::Channel, Error>;
 }

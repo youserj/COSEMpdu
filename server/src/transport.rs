@@ -1,29 +1,33 @@
-//! Транспортные каналы DLMS/COSEM (no_alloc).
+//! DLMS/COSEM transport channels (no_alloc).
 //!
-//! Физические каналы подключаются фичами Cargo `optical`, `tcp`, `ble`.
-//! У каждого канала — собственный пул слотов с независимым состоянием.
+//! Physical channels are enabled by the Cargo features `optical`, `tcp`, `ble`.
+//! Each channel has its own slot pool with independent state.
 
 #[cfg(any(feature = "tcp", feature = "ble"))]
 use cosempdu::buffer::{ByteBuffer, Error as BufferError, Reader};
 #[cfg(any(feature = "tcp", feature = "ble"))]
 use cosempdu::error::{Error, Result};
 
-/// Максимальный размер xDLMS APDU (без транспортного заголовка).
+/// Maximum xDLMS APDU size (without the transport header).
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 pub const MAX_APDU: usize = 1024;
 
-/// Запас под транспортный заголовок поверх `MAX_APDU`.
+/// Headroom for the transport header on top of `MAX_APDU`.
 ///
 /// COSEM Wrapper: version(2) + source wPort(2) + destination wPort(2) +
-/// length(2) = 8 байт; HDLC добавляет address/control/FCS.
+/// length(2) = 8 bytes; HDLC adds address/control/FCS.
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 pub const TRANSPORT_OVERHEAD: usize = 8;
 
-/// Версия COSEM Wrapper-заголовка (всегда 1).
+/// COSEM Wrapper header version (always 1).
 #[cfg(any(feature = "tcp", feature = "ble"))]
 pub const WRAPPER_VERSION: u16 = 1;
 
-/// Физический носитель, по которому приходит соединение.
+/// COSEM Wrapper header size (version + source + destination + length).
+#[cfg(any(feature = "tcp", feature = "ble"))]
+pub const WPDU_HEADER_LEN: usize = 8;
+
+/// Physical medium the connection arrives on.
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Media {
@@ -35,11 +39,11 @@ pub enum Media {
     Ble,
 }
 
-/// Настройки текущего соединения (2 вида: HDLC и Wrapper).
+/// Settings of the current connection (2 kinds: HDLC and Wrapper).
 ///
-/// В отличие от простого индекса слота, хранит состояние/настройки канала
-/// прямо в сессии: для Wrapper — согласованный [`Wrapper`] (порты), для
-/// оптического порта — [`HdlcState`] (счётчики HDLC).
+/// Unlike a plain slot index, it stores the channel state/settings
+/// right in the session: for Wrapper — the agreed [`Wrapper`] (ports), for
+/// the optical port — [`HdlcState`] (HDLC counters).
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportRef {
@@ -50,19 +54,19 @@ pub enum TransportRef {
 }
 
 // ---------------------------------------------------------------------------
-// COSEM Wrapper (TCP/BLE): настройки подключения + кодек WPDU-заголовка
+// COSEM Wrapper (TCP/BLE): connection settings + WPDU header codec
 // ---------------------------------------------------------------------------
 
-/// COSEM Wrapper (TCP/BLE): настройки подключения + кодек WPDU-заголовка.
+/// COSEM Wrapper (TCP/BLE): connection settings + WPDU header codec.
 ///
-/// Хранит порты (свой → клиента) и длину APDU, прочитанную из заголовка при
-/// [`Wrapper::get`]. APDU передаётся отдельно как payload.
+/// Stores the ports (own → client) and the APDU length read from the header on
+/// [`Wrapper::get`]. The APDU is carried separately as the payload.
 #[cfg(any(feature = "tcp", feature = "ble"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wrapper {
-    source_port: u16,      // собственный wPort сервера (фиксирован)
-    destination_port: u16, // wPort клиента (меняется на каждое подключение)
-    apdu_len: u16,         // length из WPDU-заголовка (заполняется при `get`)
+    source_port: u16,      // server's own wPort (fixed)
+    destination_port: u16, // client wPort (changes per connection)
+    apdu_len: u16,         // length from the WPDU header (filled in `get`)
 }
 
 #[cfg(any(feature = "tcp", feature = "ble"))]
@@ -75,26 +79,36 @@ impl Wrapper {
         }
     }
 
-    /// Собственный wPort сервера (фиксирован для всех подключений).
+    /// The server's own wPort (fixed for all connections).
     pub fn source_port(&self) -> u16 {
         self.source_port
     }
 
-    /// wPort клиента (меняется на каждое подключение).
+    /// The client wPort (changes per connection).
     pub fn destination_port(&self) -> u16 {
         self.destination_port
     }
 
-    /// Длина APDU из WPDU-заголовка (заполняется при `get`).
+    /// APDU length from the WPDU header (filled in `get`).
     pub fn apdu_len(&self) -> u16 {
         self.apdu_len
     }
 
-    /// Собрать WPDU целиком: заголовок + payload через `write_apdu`.
+    /// 8-byte WPDU header (version + source + destination + APDU length).
+    pub fn header_bytes(&self, apdu_len: u16) -> [u8; 8] {
+        let mut h = [0u8; 8];
+        h[0..2].copy_from_slice(&WRAPPER_VERSION.to_be_bytes());
+        h[2..4].copy_from_slice(&self.source_port().to_be_bytes());
+        h[4..6].copy_from_slice(&self.destination_port().to_be_bytes());
+        h[6..8].copy_from_slice(&apdu_len.to_be_bytes());
+        h
+    }
+
+    /// Build the whole WPDU: header + payload via `write_apdu`.
     ///
-    /// Пишет version/порты с заглушкой длины, вызывает `write_apdu` для записи
-    /// APDU (возвращает его длину), дописывает длину в заголовок и возвращает
-    /// общий размер WPDU.
+    /// Writes version/ports with a length placeholder, calls `write_apdu` to write
+    /// the APDU (returns its length), patches the length into the header and returns
+    /// the total WPDU size.
     pub fn put<E, F>(
         &self,
         buf: &mut ByteBuffer<'_>,
@@ -117,7 +131,7 @@ impl Wrapper {
         Ok(buf.pos() - start)
     }
 
-    /// Декодировать WPDU-заголовок; длина APDU — в `Self::apdu_len`.
+    /// Decode the WPDU header; the APDU length lands in `Self::apdu_len`.
     pub fn get(reader: &mut Reader<'_>) -> Result<Self> {
         if reader.get_u16()? != WRAPPER_VERSION {
             return Err(Error::Message("unsupported Wrapper version"));
@@ -134,7 +148,7 @@ impl Wrapper {
 }
 
 // ---------------------------------------------------------------------------
-// HDLC (оптический порт)
+// HDLC (optical port)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "optical")]
@@ -157,12 +171,12 @@ impl HdlcState {
 }
 
 // ---------------------------------------------------------------------------
-// Пулы (только для включённых фич)
+// Pools (only for enabled features)
 // ---------------------------------------------------------------------------
 
-/// Счётчик занятых HDLC-слотов (состояние канала — в `TransportRef::Hdlc`).
+/// HDLC slots-in-use counter (channel state lives in `TransportRef::Hdlc`).
 ///
-/// `N` — лимит слотов (совпадает с числом сессий `Server::<N>`).
+/// `N` is the slot limit (matches the number of sessions `Server::<N>`).
 #[cfg(feature = "optical")]
 pub struct HdlcPool<const N: usize> {
     used: usize,
@@ -174,7 +188,7 @@ impl<const N: usize> HdlcPool<N> {
         Self { used: 0 }
     }
 
-    /// Занять слот; `None`, если достигнут лимит `N`.
+    /// Occupy a slot; `None` if the limit `N` is reached.
     pub fn alloc(&mut self) -> Option<()> {
         if self.used < N {
             self.used += 1;
@@ -184,7 +198,7 @@ impl<const N: usize> HdlcPool<N> {
         }
     }
 
-    /// Освободить слот.
+    /// Release a slot.
     pub fn free(&mut self) {
         if self.used > 0 {
             self.used -= 1;
@@ -192,8 +206,8 @@ impl<const N: usize> HdlcPool<N> {
     }
 }
 
-/// Счётчик занятых Wrapper-слотов (TCP/BLE). Настройки соединения хранятся в
-/// `TransportRef::Wrapper`; здесь — лимит и собственный wPort сервера.
+/// Wrapper slots-in-use counter (TCP/BLE). Connection settings are stored in
+/// `TransportRef::Wrapper`; here — the limit and the server's own wPort.
 #[cfg(any(feature = "tcp", feature = "ble"))]
 pub struct WrapperPool<const N: usize> {
     source_port: u16,
@@ -209,17 +223,17 @@ impl<const N: usize> WrapperPool<N> {
         }
     }
 
-    /// Собственный wPort сервера (фиксирован для всех подключений канала).
+    /// The server's own wPort (fixed for all channel connections).
     pub fn source_port(&self) -> u16 {
         self.source_port
     }
 
-    /// Переопределить собственный wPort сервера (до приёма соединений).
+    /// Override the server's own wPort (before accepting connections).
     pub fn set_source_port(&mut self, port: u16) {
         self.source_port = port;
     }
 
-    /// Занять слот; `None`, если достигнут лимит `N`.
+    /// Occupy a slot; `None` if the limit `N` is reached.
     pub fn alloc(&mut self) -> Option<()> {
         if self.used < N {
             self.used += 1;
@@ -229,7 +243,7 @@ impl<const N: usize> WrapperPool<N> {
         }
     }
 
-    /// Освободить слот.
+    /// Release a slot.
     pub fn free(&mut self) {
         if self.used > 0 {
             self.used -= 1;

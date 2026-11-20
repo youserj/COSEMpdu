@@ -7,10 +7,16 @@ license = "MIT"
 [dependencies]
 cosempdu = { path = "../cosempdu", default-features = false }
 dlms1 = { path = "../DLMS1", default-features = false }
+static_cell = "2.1"
 
 [features]
-default = ["std"]
+default = ["std", "aes128", "aes256"]
 std = ["cosempdu/std", "dlms1/std"]
 optical = []
 tcp = []
 ble = []
+aes128 = []
+aes256 = []
+ecdsa_p256 = ["cosempdu/ecdsa_p256"]
+ecdsa_p384 = ["cosempdu/ecdsa_p384"]
+association_ln_v2 = ["cosempdu/association_ln_v2"]

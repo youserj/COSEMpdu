@@ -371,6 +371,16 @@ impl<'a> Reader<'a> {
         Ok(&data[start..start + length])
     }
 
+    /// Read exactly `N` bytes as a fixed-size array and advance.
+    pub fn read_n<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.check_space(N, None)?;
+        let start = self.pos;
+        let mut out = [0u8; N];
+        out.copy_from_slice(&self.data[start..start + N]);
+        self.pos = start + N;
+        Ok(out)
+    }
+
     /// Read `length` bytes at absolute `pos` without advancing.
     pub fn read_at(&self, pos: usize, length: usize) -> Result<&'a [u8]> {
         self.check_space(length, Some(pos))?;
@@ -387,8 +397,7 @@ impl<'a> Reader<'a> {
     pub fn peek_u8(&self) -> Result<u8> {
         self.check_space(1, None)?;
         Ok(self.data[self.pos])
-   }
-
+    }
 }
 
 /// Owned byte buffer: owns the backing array and tracks a cursor.
@@ -485,6 +494,31 @@ impl<const N: usize> ArrayBuffer<N> {
         self.write(&value.to_be_bytes())
     }
 
+    /// Write bytes at absolute `pos` (no advance).
+    pub fn write_at(&mut self, value: &[u8], pos: usize) -> Result<usize> {
+        if pos > N || value.len() > N - pos {
+            return Err(Error::NotEnoughSpace {
+                needed: value.len(),
+            });
+        }
+        self.data[pos..pos + value.len()].copy_from_slice(value);
+        Ok(value.len())
+    }
+
+    /// Shift `len` bytes from `from` to `to` within the buffer (memmove).
+    ///
+    /// Overlapping ranges are handled correctly (like `memmove`). Used by the
+    /// BER encoder to make room for a long-form length prefix.
+    pub fn shift(&mut self, from: usize, to: usize, len: usize) -> Result<()> {
+        if from + len > N || to + len > N {
+            return Err(Error::NotEnoughSpace {
+                needed: from.max(to) + len,
+            });
+        }
+        self.data.copy_within(from..from + len, to);
+        Ok(())
+    }
+
     /// Read a single unsigned byte and advance.
     pub fn get_u8(&mut self) -> Result<u8> {
         self.check_space(1)?;
@@ -545,8 +579,12 @@ pub trait ReadBuf {
 ///
 /// Implemented by [`ByteBuffer`] and [`ArrayBuffer`].
 pub trait WriteBuf {
+    fn pos(&self) -> usize;
     fn remaining(&self) -> usize;
+    fn set_pos(&mut self, index: usize) -> Result<isize>;
     fn write(&mut self, value: &[u8]) -> Result<usize>;
+    fn write_at(&mut self, value: &[u8], pos: usize) -> Result<usize>;
+    fn shift(&mut self, from: usize, to: usize, len: usize) -> Result<()>;
     fn put_u8(&mut self, value: u8) -> Result<usize> {
         self.write(&[value])
     }
@@ -598,11 +636,23 @@ impl ReadBuf for ByteBuffer<'_> {
 }
 
 impl WriteBuf for ByteBuffer<'_> {
+    fn pos(&self) -> usize {
+        self.pos()
+    }
     fn remaining(&self) -> usize {
         self.remaining(None)
     }
+    fn set_pos(&mut self, index: usize) -> Result<isize> {
+        self.set_pos(index)
+    }
     fn write(&mut self, value: &[u8]) -> Result<usize> {
         self.write(value)
+    }
+    fn write_at(&mut self, value: &[u8], pos: usize) -> Result<usize> {
+        self.write_at(value, pos)
+    }
+    fn shift(&mut self, from: usize, to: usize, len: usize) -> Result<()> {
+        self.shift(from, to, len)
     }
 }
 
@@ -628,11 +678,23 @@ impl<const N: usize> ReadBuf for ArrayBuffer<N> {
 }
 
 impl<const N: usize> WriteBuf for ArrayBuffer<N> {
+    fn pos(&self) -> usize {
+        self.pos()
+    }
     fn remaining(&self) -> usize {
         self.remaining()
     }
+    fn set_pos(&mut self, index: usize) -> Result<isize> {
+        self.set_pos(index)
+    }
     fn write(&mut self, value: &[u8]) -> Result<usize> {
         self.write(value)
+    }
+    fn write_at(&mut self, value: &[u8], pos: usize) -> Result<usize> {
+        self.write_at(value, pos)
+    }
+    fn shift(&mut self, from: usize, to: usize, len: usize) -> Result<()> {
+        self.shift(from, to, len)
     }
 }
 
@@ -696,20 +758,20 @@ mod tests {
 
     #[test]
     fn readbuf_writebuf_traits() {
-        // ArrayBuffer: оба трейта.
+        // ArrayBuffer: both traits.
         let mut ab = ArrayBuffer::<16>::new();
         WriteBuf::put_u16(&mut ab, 0x1234).unwrap();
         assert_eq!(ab.extract(), &[0x12, 0x34]);
         ab.set_pos(0).unwrap();
         assert_eq!(ReadBuf::get_u16(&mut ab).unwrap(), 0x1234);
 
-        // Reader: только чтение.
+        // Reader: read only.
         let input = [0xAB, 0xCD, 0x01];
         let mut r = Reader::new(&input);
         assert_eq!(ReadBuf::get_u16(&mut r).unwrap(), 0xABCD);
         assert_eq!(ReadBuf::read(&mut r, 1).unwrap(), &[0x01]);
 
-        // ByteBuffer: оба трейта.
+        // ByteBuffer: both traits.
         let mut backing = [0u8; 8];
         let mut b = ByteBuffer::new(&mut backing);
         WriteBuf::write(&mut b, &[0xDE, 0xAD]).unwrap();

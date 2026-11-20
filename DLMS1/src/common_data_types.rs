@@ -3,8 +3,9 @@
 //! Concrete, fixed-shape value types that wrap a single [`Data`] variant and
 //! implement [`Codec`] (encode/decode) plus [`StreamSink`] (streaming decode).
 
+use cosempdu::axdr::put_length;
 use cosempdu::buffer::ByteBuffer;
-use cosempdu::data::{Codec, Data};
+use cosempdu::data::{Codec, Data, Encodable};
 use cosempdu::stream::StreamSink;
 
 /// Shared body for integer/float scalar types (from/to big-endian bytes).
@@ -58,6 +59,59 @@ macro_rules! int_scalar {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
         pub struct $name(pub $ty);
         num_scalar!($name, $ty, $variant, $tag);
+    };
+}
+
+/// Unsigned enum scalar (`u8`); additionally exposes its numeric value via
+/// [`Codec::enum_value`].
+macro_rules! enum_scalar {
+    ($name:ident, $ty:ty, $variant:ident, $tag:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        pub struct $name(pub $ty);
+
+        impl Codec for $name {
+            fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+                Data::$variant(self.0).put(buf)
+            }
+
+            fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
+                match data {
+                    Data::$variant(v) => {
+                        self.0 = *v;
+                        Ok(())
+                    }
+                    _ => Err(cosempdu::Error::UnexpectedTag {
+                        name: stringify!($variant),
+                        actual: data.tag(),
+                    }),
+                }
+            }
+
+            fn stream_sink(&mut self) -> Option<&mut (dyn StreamSink + '_)> {
+                Some(self)
+            }
+
+            fn enum_value(&self) -> Option<u8> {
+                Some(self.0 as u8)
+            }
+        }
+
+        impl StreamSink for $name {
+            fn scalar(&mut self, tag: u8, bytes: &[u8], _index: usize) -> cosempdu::Result<()> {
+                const N: usize = core::mem::size_of::<$ty>();
+                if tag != $tag || bytes.len() != N {
+                    return Err(cosempdu::Error::Message(concat!(
+                        stringify!($name),
+                        " scalar has wrong tag/size"
+                    )));
+                }
+                let arr: [u8; N] = bytes
+                    .try_into()
+                    .map_err(|_| cosempdu::Error::Message("scalar has wrong size"))?;
+                self.0 = <$ty>::from_be_bytes(arr);
+                Ok(())
+            }
+        }
     };
 }
 
@@ -215,7 +269,10 @@ impl Codec for DoubleLongUnsigned {
                 self.0 = *v;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 6, actual: data.tag()}),
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 6,
+                actual: data.tag(),
+            }),
         }
     }
 
@@ -251,7 +308,10 @@ impl Codec for DateTime {
                 self.0 = *v;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 25, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 25,
+                actual: data.tag(),
+            }),
         }
     }
 
@@ -278,7 +338,7 @@ pub struct OctetString<const N: usize> {
 }
 impl<const N: usize> OctetString<N> {
     pub const fn new(data: &[u8]) -> Self {
-        assert!(data.len() <= N); // compile-time проверка при использовании в static
+        assert!(data.len() <= N); // compile-time check when used in a static
         let mut buf = [0u8; N];
         let mut i = 0;
         while i < data.len() {
@@ -294,7 +354,7 @@ impl<const N: usize> OctetString<N> {
         if data.len() > N {
             return Err(cosempdu::Error::Message("overload octet-string")); // TODO: make other separate Error
         }
-        Ok(Self::new(data)) // new уже безопасен после проверки
+        Ok(Self::new(data)) // new is already safe after the check
     }
 }
 impl<const N: usize> Default for OctetString<N> {
@@ -327,6 +387,10 @@ impl<const N: usize> Codec for OctetString<N> {
         Data::OctetString(&self.buf[..self.len]).put(buf)
     }
 
+    fn octet_string(&self) -> Option<&[u8]> {
+        Some(&self.buf[..self.len])
+    }
+
     fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
         match data {
             Data::OctetString(b) => {
@@ -342,7 +406,10 @@ impl<const N: usize> Codec for OctetString<N> {
                 self.len = b.len();
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 9, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 9,
+                actual: data.tag(),
+            }),
         }
     }
 
@@ -378,6 +445,29 @@ impl<const N: usize> StreamSink for OctetString<N> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OctetStringSized<const N: usize>(pub [u8; N]);
 
+impl<const N: usize> OctetStringSized<N> {
+    /// Build from exactly `N` bytes. The `assert!` fires at compile time in a
+    /// `static` initializer when the slice length is wrong.
+    pub const fn new(data: &[u8]) -> Self {
+        assert!(data.len() == N);
+        let mut buf = [0u8; N];
+        let mut i = 0;
+        while i < N {
+            buf[i] = data[i];
+            i += 1;
+        }
+        OctetStringSized(buf)
+    }
+
+    /// Fallible build from a byte slice; errors unless it is exactly `N` bytes.
+    pub fn try_new(data: &[u8]) -> cosempdu::Result<Self> {
+        if data.len() != N {
+            return Err(cosempdu::Error::Message("octet-string has wrong length"));
+        }
+        Ok(Self::new(data))
+    }
+}
+
 impl<const N: usize> Default for OctetStringSized<N> {
     fn default() -> Self {
         OctetStringSized([0; N])
@@ -389,6 +479,10 @@ impl<const N: usize> Codec for OctetStringSized<N> {
         Data::OctetString(&self.0).put(buf)
     }
 
+    fn octet_string(&self) -> Option<&[u8]> {
+        Some(&self.0)
+    }
+
     fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
         match data {
             Data::OctetString(b) => {
@@ -398,7 +492,10 @@ impl<const N: usize> Codec for OctetStringSized<N> {
                 self.0.copy_from_slice(b);
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 9, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 9,
+                actual: data.tag(),
+            }),
         }
     }
 
@@ -446,7 +543,10 @@ impl Codec for Boolean {
                 self.0 = *v;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 3, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 3,
+                actual: data.tag(),
+            }),
         }
     }
 
@@ -479,7 +579,10 @@ impl Codec for NullData {
     fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
         match data {
             Data::NullData => Ok(()),
-            _ => Err(cosempdu::Error::TagNumber { expected: 0, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 0,
+                actual: data.tag(),
+            }),
         }
     }
 
@@ -508,7 +611,7 @@ int_scalar!(Unsigned, u8, Unsigned, 17);
 int_scalar!(LongUnsigned, u16, LongUnsigned, 18);
 int_scalar!(Long64, i64, Long64, 20);
 int_scalar!(Long64Unsigned, u64, Long64Unsigned, 21);
-int_scalar!(Enum, u8, Enum, 22);
+enum_scalar!(Enum, u8, Enum, 22);
 float_scalar!(Float32, f32, Float32, 23);
 float_scalar!(Float64, f64, Float64, 24);
 bytes_scalar!(Date, Date, 26, 5);
@@ -576,7 +679,10 @@ impl<const N: usize> Codec for BitString<N> {
                 self.bit_len = *bit_len;
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 4, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 4,
+                actual: data.tag(),
+            }),
         }
     }
 }
@@ -628,8 +734,169 @@ impl<const N: usize> Codec for CompactArray<N> {
                 self.len = array_contents.len();
                 Ok(())
             }
-            _ => Err(cosempdu::Error::TagNumber { expected: 19, actual: data.tag() })
+            _ => Err(cosempdu::Error::TagNumber {
+                expected: 19,
+                actual: data.tag(),
+            }),
         }
+    }
+}
+
+/// `array` of `T` — borrowed read-only view (A-XDR array encoding).
+///
+/// `T` only needs to be encodable ([`Encodable`]); a zero-copy view for static
+/// (read-only) arrays such as the Association LN `object_list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Array<'a, T> {
+    /// The elements.
+    pub items: &'a [T],
+}
+
+impl<'a, T: Encodable> Array<'a, T> {
+    /// Encode this array (tag 1 + length + each element).
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        let mut written = buf.put_u8(1)?; // array tag
+        written += put_length(buf, self.items.len())?;
+        for item in self.items {
+            written += item.put(buf)?;
+        }
+        Ok(written)
+    }
+}
+
+impl<T: Encodable + Sync> Codec for Array<'_, T> {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        Array::put(self, buf)
+    }
+
+    fn assign(&mut self, _data: &Data<'_>) -> cosempdu::Result<()> {
+        Err(cosempdu::Error::Message("array is read-only"))
+    }
+}
+
+/// `array` of `T` — owned, variable-length (up to `N` elements), full codec.
+#[derive(Clone)]
+pub struct ArrayOwned<T, const N: usize> {
+    /// Element storage; unused slots hold `T::default()`.
+    pub buf: [T; N],
+    len: usize,
+}
+
+impl<T: Copy, const N: usize> ArrayOwned<T, N> {
+    /// Const-empty array; `fill` initialises the unused slots.
+    pub const fn new_empty(fill: T) -> Self {
+        ArrayOwned {
+            buf: [fill; N],
+            len: 0,
+        }
+    }
+}
+
+impl<T, const N: usize> ArrayOwned<T, N> {
+    /// Current number of elements.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the array is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The valid elements.
+    pub fn as_slice(&self) -> &[T] {
+        &self.buf[..self.len]
+    }
+
+    /// The valid elements, mutably.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.buf[..self.len]
+    }
+
+    /// Drop all elements.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl<T: Clone + Default, const N: usize> ArrayOwned<T, N> {
+    /// Build from `data`; panics if `data.len() > N`.
+    pub fn new(data: &[T]) -> Self {
+        assert!(data.len() <= N);
+        let mut this = Self::default();
+        this.buf[..data.len()].clone_from_slice(data);
+        this.len = data.len();
+        this
+    }
+
+    /// Fallible build from `data`; errors if `data.len() > N`.
+    pub fn try_new(data: &[T]) -> cosempdu::Result<Self> {
+        if data.len() > N {
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge {
+                    len: data.len(),
+                    max: N,
+                },
+            ));
+        }
+        Ok(Self::new(data))
+    }
+}
+
+impl<T: Default, const N: usize> Default for ArrayOwned<T, N> {
+    fn default() -> Self {
+        ArrayOwned {
+            buf: core::array::from_fn(|_| T::default()),
+            len: 0,
+        }
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq for ArrayOwned<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.buf[..self.len] == other.buf[..other.len]
+    }
+}
+
+impl<T: Eq, const N: usize> Eq for ArrayOwned<T, N> {}
+
+impl<T: core::fmt::Debug, const N: usize> core::fmt::Debug for ArrayOwned<T, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ArrayOwned")
+            .field("items", &&self.buf[..self.len])
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl<T: Codec, const N: usize> Codec for ArrayOwned<T, N> {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        let mut written = buf.put_u8(1)?; // array tag
+        written += put_length(buf, self.len)?;
+        for item in &self.buf[..self.len] {
+            written += item.put(buf)?;
+        }
+        Ok(written)
+    }
+
+    fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
+        let items = data.as_array().ok_or(cosempdu::Error::TagNumber {
+            expected: 1,
+            actual: data.tag(),
+        })?;
+        if items.len() > N {
+            return Err(cosempdu::Error::ByteBufferError(
+                cosempdu::buffer::Error::InputTooLarge {
+                    len: items.len(),
+                    max: N,
+                },
+            ));
+        }
+        for (dst, src) in self.buf.iter_mut().zip(items.iter()) {
+            dst.assign(src)?;
+        }
+        self.len = items.len();
+        Ok(())
     }
 }
 
@@ -680,6 +947,17 @@ mod tests {
             &Data::OctetString(&[1, 2, 3, 4]),
             OctetStringSized::<4>([1, 2, 3, 4]),
         );
+    }
+
+    #[test]
+    fn octet_string_sized_new() {
+        // Exactly N bytes — ok.
+        let v = OctetStringSized::<4>::new(&[1, 2, 3, 4]);
+        assert_eq!(v.0, [1, 2, 3, 4]);
+
+        // Invalid length — `try_new` returns an error.
+        assert!(OctetStringSized::<4>::try_new(&[1, 2, 3]).is_err());
+        assert!(OctetStringSized::<4>::try_new(&[1, 2, 3, 4, 5]).is_err());
     }
 
     #[test]
@@ -735,5 +1013,32 @@ mod tests {
             assert_eq!(decoded.contents_description, 7);
             assert_eq!(&decoded.array_contents[..decoded.len], &[1, 2, 3]);
         }
+    }
+
+    #[test]
+    fn array_owned_variable_length() {
+        // try_new / len / as_slice
+        let a = ArrayOwned::<Unsigned, 4>::try_new(&[Unsigned(1), Unsigned(2)]).unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(!a.is_empty());
+        assert_eq!(a.as_slice(), &[Unsigned(1), Unsigned(2)][..]);
+
+        // Capacity overflow.
+        assert!(ArrayOwned::<Unsigned, 4>::try_new(&[Unsigned(0); 5]).is_err());
+
+        // put encodes only len elements.
+        let mut backing = [0u8; 64];
+        let n = {
+            let mut buf = ByteBuffer::new(&mut backing);
+            a.put(&mut buf).unwrap()
+        };
+        assert_eq!(&backing[..n], &[0x01, 0x02, 0x11, 0x01, 0x11, 0x02]);
+
+        // assign changes the length.
+        let mut b = ArrayOwned::<Unsigned, 4>::new_empty(Unsigned(0));
+        let data = Data::Array(&[Data::Unsigned(7), Data::Unsigned(8), Data::Unsigned(9)]);
+        b.assign(&data).unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!(b.as_slice(), &[Unsigned(7), Unsigned(8), Unsigned(9)][..]);
     }
 }

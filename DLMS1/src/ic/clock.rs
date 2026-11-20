@@ -73,6 +73,10 @@ impl Clock {
 }
 
 impl InterfaceClass for Clock {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn class_id(&self) -> ClassId {
         ClassId::Clock
     }

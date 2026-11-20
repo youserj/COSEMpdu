@@ -8,7 +8,7 @@ use crate::ber::{decode_signed, decode_u8, put_signed, put_tlv, put_u8, with_con
 use crate::error::{Error, Result};
 use crate::x680::{Class, Tag, UniversalTag};
 use crate::x690::Length;
-use bytebuffer::{ByteBuffer, Reader};
+use bytebuffer::{ByteBuffer, Reader, WriteBuf};
 
 const fn ctx(number: u8, constructed: bool) -> Tag {
     Tag {
@@ -23,6 +23,14 @@ const fn app(number: u8) -> Tag {
         class: Class::Application,
         number,
         constructed: true,
+    }
+}
+
+const fn universal(number: u8) -> Tag {
+    Tag {
+        class: Class::Universal,
+        number,
+        constructed: false,
     }
 }
 
@@ -107,7 +115,7 @@ fn put_explicit_oid(
     })
 }
 
-fn put_explicit_octet_string(buf: &mut ByteBuffer<'_>, number: u8, bytes: &[u8]) -> Result<usize> {
+fn put_explicit_octet_string<B: WriteBuf>(buf: &mut B, number: u8, bytes: &[u8]) -> Result<usize> {
     with_content(buf, &ctx(number, true), |b| {
         put_tlv(b, &Tag::universal(UniversalTag::OctetString), bytes)
     })
@@ -121,7 +129,7 @@ fn put_explicit_integer(buf: &mut ByteBuffer<'_>, number: u8, value: i64) -> Res
     })
 }
 
-fn put_explicit_u8(buf: &mut ByteBuffer<'_>, number: u8, value: u8) -> Result<usize> {
+fn put_explicit_u8<B: WriteBuf>(buf: &mut B, number: u8, value: u8) -> Result<usize> {
     with_content(buf, &ctx(number, true), |b| {
         with_content(b, &Tag::universal(UniversalTag::Integer), |ib| {
             Ok(ib.put_u8(value)?)
@@ -140,6 +148,16 @@ fn put_implicit_bit_string(buf: &mut ByteBuffer<'_>, number: u8, content: &[u8])
 /// `protocol-version [0] IMPLICIT BIT STRING { version1 (0) }` content:
 /// 7 unused bits + bit 0 (version1) set.
 const PROTOCOL_VERSION_V1: &[u8] = &[0x07, 0x80];
+
+/// `sender-acse-requirements [10]` BIT STRING content with bit 0 (authentication)
+/// set: 7 unused bits + data `0x80`.
+const AUTHENTICATION_REQUIREMENTS: &[u8] = &[0x07, 0x80];
+
+/// Bit 0 (authentication) in the `sender-acse-requirements` BIT STRING content:
+/// `[unused-bits, data...]`; bit 0 = the most significant bit of the first data byte.
+fn authentication_selected(content: &[u8]) -> bool {
+    content.len() > 1 && (content[1] & 0x80) != 0
+}
 
 /// Encode an EXPLICIT `Authentication-value` (CHOICE): `<ctx(n,true)><len>` +
 /// `charstring [0] IMPLICIT GraphicString` (`80 <len> <bytes>`) or
@@ -194,6 +212,64 @@ fn put_implicit_oid(buf: &mut ByteBuffer<'_>, number: u8, value: &MechanismName)
     with_content(buf, &ctx(number, false), |b| value.put_content(b))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SystemTitle([u8; 8]);
+
+impl SystemTitle {
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let len = bytes.len();
+        if len != 8 {
+            return Err(Error::InvalidLength { value: len as i64 });
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(bytes);
+        Ok(Self(arr))
+    }
+
+    /// Returns the Manufacturer ID (first 3 bytes).
+    /// Usually these are ASCII characters, but DLMS allows any octets.
+    pub const fn get_man_id(&self) -> [u8; 3] {
+        [self.0[0], self.0[1], self.0[2]]
+    }
+
+    /// Returns the unique ID (last 5 bytes).
+    pub const fn get_unique_id(&self) -> [u8; 5] {
+        [self.0[3], self.0[4], self.0[5], self.0[6], self.0[7]]
+    }
+
+    /// Convenience constructor if you build a SystemTitle from parts.
+    pub const fn new(man_id: [u8; 3], unique_id: [u8; 5]) -> Self {
+        Self([
+            man_id[0],
+            man_id[1],
+            man_id[2],
+            unique_id[0],
+            unique_id[1],
+            unique_id[2],
+            unique_id[3],
+            unique_id[4],
+        ])
+    }
+
+    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+        let mut written = Self::TAG.put(buf)?;
+        written += Length { value: 8 }.put(buf)?;
+        written += buf.write(&self.0)?;
+        Ok(written)
+    }
+}
+
+impl<'a> BerTagged<'a> for SystemTitle {
+    const TAG: Tag = universal(4);
+
+    fn decode_content(buf: &mut Reader<'_>, len: usize) -> Result<Self> {
+        if len != 8 {
+            return Err(Error::InvalidLength { value: len as i64 });
+        }
+        Ok(Self(buf.read_n::<8>()?))
+    }
+}
+
 /// DLMS/COSEM `application-context-name` (`{ 2 16 756 5 8 1 X }`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -245,7 +321,7 @@ impl ApplicationContextName {
     /// The content is always exactly seven octets: the fixed prefix
     /// `{ 2 16 756 5 8 }`, the context discriminator `1`, and the trailing arc
     /// `X` (a single octet since `X <= 127`).
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         buf.write(&ACSE_OID_PREFIX_CONTENT)?;
         buf.put_u8(CONTEXT_DISCRIMINATOR)?;
         buf.put_u8(*self as u8)?;
@@ -364,7 +440,7 @@ pub enum AssociationResult {
 
 impl AssociationResult {
     /// Encode as `result [2] Association-result` (EXPLICIT INTEGER).
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         put_explicit_u8(buf, 2, *self as u8)
     }
 
@@ -471,7 +547,7 @@ pub enum AssociateSourceDiagnostic {
 
 impl AssociateSourceDiagnostic {
     /// Encode as `result-source-diagnostic [3] EXPLICIT` CHOICE.
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         with_content(buf, &ctx(3, true), |b| match self {
             AssociateSourceDiagnostic::ServiceUser(v) => put_explicit_u8(b, 1, *v as u8),
             AssociateSourceDiagnostic::ServiceProvider(v) => put_explicit_u8(b, 2, *v as u8),
@@ -502,7 +578,7 @@ impl AssociateSourceDiagnostic {
 pub enum AuthenticationValue<'a> {
     /// `charstring [0] IMPLICIT GraphicString`.
     CharString(&'a [u8]),
-    /// `bitstring [1] IMPLICIT BIT STRING` (содержимое: unused-bits + данные).
+    /// `bitstring [1] IMPLICIT BIT STRING` (content: unused-bits + data).
     BitString(&'a [u8]),
 }
 
@@ -518,56 +594,54 @@ impl<'a> AuthenticationValue<'a> {
     }
 }
 
-/// AARQ-apdu ::= [APPLICATION 0] IMPLICIT SEQUENCE.
+/// AARQ-apdu ::= [APPLICATION 0] IMPLICIT SEQUENCE./n
+/// not used:
+/// `called-AE-qualifier [3]` (OCTET STRING).
+/// `called-AP-invocation-id [4]` (INTEGER).
+/// `called-AE-invocation-id [5]` (INTEGER).
+/// `calling-AP-invocation-id [8]` (INTEGER).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AARQapdu<'a> {
     /// `application-context-name [1]` (OBJECT IDENTIFIER).
     pub application_context_name: ApplicationContextName,
-    /// `called-AP-title [2]` (OCTET STRING).
+    /// `calling-AP-title [2]` (OCTET STRING).
     pub called_ap_title: Option<&'a [u8]>,
-    /// `called-AE-qualifier [3]` (OCTET STRING).
-    pub called_ae_qualifier: Option<&'a [u8]>,
-    /// `called-AP-invocation-id [4]` (INTEGER).
-    pub called_ap_invocation_id: Option<i64>,
-    /// `called-AE-invocation-id [5]` (INTEGER).
-    pub called_ae_invocation_id: Option<i64>,
     /// `calling-AP-title [6]` (OCTET STRING).
     pub calling_ap_title: Option<&'a [u8]>,
-    /// `calling-AE-qualifier [7]` (OCTET STRING).
+    /// `calling-AE-qualifier [7]` (OCTET STRING) — client certificate (ECDSA/HLS).
+    #[cfg(any(feature = "ecdsa_p256", feature = "ecdsa_p384"))]
     pub calling_ae_qualifier: Option<&'a [u8]>,
-    /// `calling-AP-invocation-id [8]` (INTEGER).
-    pub calling_ap_invocation_id: Option<i64>,
-    /// `calling-AE-invocation-id [9]` (INTEGER).
-    pub calling_ae_invocation_id: Option<i64>,
-    /// `sender-acse-requirements [10] IMPLICIT BIT STRING`.
-    pub sender_acse_requirements: Option<&'a [u8]>,
+    /// `calling-AE-invocation-id [9]` (INTEGER) — HLS (Association LN v2+).
+    #[cfg(feature = "association_ln_v2")]
+    pub calling_ae_invocation_id: Option<u8>,
+    /// `sender-acse-requirements [10] IMPLICIT BIT STRING` — the
+    /// "authentication functional unit selected" flag (bit 0).
+    ///
+    /// `true` if the field is present and bit 0 = 1; `false` if the field
+    /// is absent or bit 0 = 0 (subsequent authentication functional
+    /// unit fields can be ignored).
+    pub sender_acse_requirements: bool,
     /// `mechanism-name [11] IMPLICIT` (OBJECT IDENTIFIER).
     pub mechanism_name: Option<MechanismName>,
     /// `calling-authentication-value [12] EXPLICIT Authentication-value`.
     pub calling_authentication_value: Option<AuthenticationValue<'a>>,
-    /// `implementation-information [29] IMPLICIT`.
-    pub implementation_information: Option<&'a [u8]>,
     /// `user-information [30] EXPLICIT` (OCTET STRING).
     pub user_information: Option<&'a [u8]>,
 }
 
 impl<'a> AARQapdu<'a> {
-
     pub fn new(application_context_name: ApplicationContextName) -> Self {
         AARQapdu {
             application_context_name,
             called_ap_title: None,
-            called_ae_qualifier: None,
-            called_ap_invocation_id: None,
-            called_ae_invocation_id: None,
             calling_ap_title: None,
+            #[cfg(any(feature = "ecdsa_p256", feature = "ecdsa_p384"))]
             calling_ae_qualifier: None,
-            calling_ap_invocation_id: None,
+            #[cfg(feature = "association_ln_v2")]
             calling_ae_invocation_id: None,
-            sender_acse_requirements: None,
+            sender_acse_requirements: false,
             mechanism_name: None,
             calling_authentication_value: None,
-            implementation_information: None,
             user_information: None,
         }
     }
@@ -575,44 +649,31 @@ impl<'a> AARQapdu<'a> {
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
-            // `protocol-version [0]` не пишем: единственное значение — `{ version1 (0) }`
-            // (DEFAULT), поэтому поле всегда опускается.
+            // We don't write `protocol-version [0]`: its only value is `{ version1 (0) }`
+            // (DEFAULT), so the field is always omitted.
             written += put_explicit_oid(b, 1, &self.application_context_name)?;
             if let Some(v) = &self.called_ap_title {
                 written += put_explicit_octet_string(b, 2, v)?;
             }
-            if let Some(v) = &self.called_ae_qualifier {
-                written += put_explicit_octet_string(b, 3, v)?;
-            }
-            if let Some(v) = self.called_ap_invocation_id {
-                written += put_implicit_integer(b, 4, v)?;
-            }
-            if let Some(v) = self.called_ae_invocation_id {
-                written += put_implicit_integer(b, 5, v)?;
-            }
             if let Some(v) = &self.calling_ap_title {
                 written += put_explicit_octet_string(b, 6, v)?;
             }
+            #[cfg(any(feature = "ecdsa_p256", feature = "ecdsa_p384"))]
             if let Some(v) = &self.calling_ae_qualifier {
                 written += put_explicit_octet_string(b, 7, v)?;
             }
-            if let Some(v) = self.calling_ap_invocation_id {
-                written += put_implicit_integer(b, 8, v)?;
-            }
+            #[cfg(feature = "association_ln_v2")]
             if let Some(v) = self.calling_ae_invocation_id {
-                written += put_implicit_integer(b, 9, v)?;
+                written += put_implicit_integer(b, 9, i64::from(v))?;
             }
-            if let Some(v) = &self.sender_acse_requirements {
-                written += put_implicit_bit_string(b, 10, v)?;
+            if self.sender_acse_requirements {
+                written += put_implicit_bit_string(b, 10, AUTHENTICATION_REQUIREMENTS)?;
             }
             if let Some(mn) = self.mechanism_name {
                 written += put_implicit_oid(b, 11, &mn)?;
             }
             if let Some(v) = &self.calling_authentication_value {
                 written += put_explicit_authentication_value(b, 12, v)?;
-            }
-            if let Some(v) = &self.implementation_information {
-                written += put_tlv(b, &ctx(29, false), v)?;
             }
             if let Some(v) = &self.user_information {
                 written += put_explicit_octet_string(b, 30, v)?;
@@ -633,7 +694,7 @@ impl<'a> BerTagged<'a> for AARQapdu<'a> {
             let (ftag, flen) = read_tlv_bounded(buf, end)?;
             match ftag.number {
                 0 => {
-                    // Присутствующий `protocol-version` обязан быть `{ version1 (0) }`.
+                    // A present `protocol-version` must be `{ version1 (0) }`.
                     if buf.read(flen)? != PROTOCOL_VERSION_V1 {
                         return Err(Error::AssociateSourceDiagnostic(
                             AssociateSourceDiagnostic::ServiceProvider(
@@ -652,26 +713,47 @@ impl<'a> BerTagged<'a> for AARQapdu<'a> {
                 }
                 3 => {
                     let (_itag, olen) = unwrap_explicit(buf, flen)?;
-                    apdu.called_ae_qualifier = Some(buf.read(olen)?);
+                    buf.read(olen)?; // dummy read
                 }
-                4 => apdu.called_ap_invocation_id = Some(decode_signed(buf.read(flen)?)?),
-                5 => apdu.called_ae_invocation_id = Some(decode_signed(buf.read(flen)?)?),
+                4 => _ = decode_signed(buf.read(flen)?)?, // dummy read
+                5 => _ = decode_signed(buf.read(flen)?)?, // dummy read
                 6 => {
                     let (_itag, olen) = unwrap_explicit(buf, flen)?;
                     apdu.calling_ap_title = Some(buf.read(olen)?);
                 }
                 7 => {
+                    // Parsing is always mandatory: we read the field contents;
+                    // only the assignment into the struct is feature-gated.
                     let (_itag, olen) = unwrap_explicit(buf, flen)?;
-                    apdu.calling_ae_qualifier = Some(buf.read(olen)?);
+                    let _bytes = buf.read(olen)?;
+                    #[cfg(any(feature = "ecdsa_p256", feature = "ecdsa_p384"))]
+                    {
+                        apdu.calling_ae_qualifier = Some(_bytes);
+                    }
                 }
-                8 => apdu.calling_ap_invocation_id = Some(decode_signed(buf.read(flen)?)?),
-                9 => apdu.calling_ae_invocation_id = Some(decode_signed(buf.read(flen)?)?),
-                10 => apdu.sender_acse_requirements = Some(buf.read(flen)?),
+                8 => _ = decode_signed(buf.read(flen)?)?, // dummy read
+                9 => {
+                    let _value = decode_signed(buf.read(flen)?)?;
+                    #[cfg(feature = "association_ln_v2")]
+                    {
+                        match u8::try_from(_value) {
+                            Ok(value) => apdu.calling_ae_invocation_id = Some(value),
+                            Err(_) => {
+                                return Err(Error::AssociateSourceDiagnostic(
+                                    AssociateSourceDiagnostic::ServiceUser(
+                                        AcseServiceUser::CallingAeInvocationIdentifierNotRecognized,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                10 => apdu.sender_acse_requirements = authentication_selected(buf.read(flen)?),
                 11 => apdu.mechanism_name = Some(MechanismName::from_content(buf)?),
                 12 => {
                     apdu.calling_authentication_value = Some(AuthenticationValue::get(buf, flen)?);
                 }
-                29 => apdu.implementation_information = Some(buf.read(flen)?),
+                29 => _ = buf.read(flen)?,
                 30 => {
                     let (_itag, olen) = unwrap_explicit(buf, flen)?;
                     apdu.user_information = Some(buf.read(olen)?);
@@ -686,8 +768,6 @@ impl<'a> BerTagged<'a> for AARQapdu<'a> {
         Ok(apdu)
     }
 }
-
-
 
 /// AARE-apdu ::= [APPLICATION 1] IMPLICIT SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -711,34 +791,31 @@ pub struct AAREapdu<'a> {
     pub mechanism_name: Option<MechanismName>,
     /// `responding-authentication-value [10] EXPLICIT Authentication-value`.
     pub responding_authentication_value: Option<AuthenticationValue<'a>>,
-    /// `implementation-information [29] IMPLICIT`.
-    pub implementation_information: Option<&'a [u8]>,
     pub user_information: Option<&'a [u8]>,
 }
 
 impl<'a> AAREapdu<'a> {
-
     pub fn rejected_permanent() -> Self {
         Self {
-            application_context_name: ApplicationContextName::LogicalNameNoCiphering, 
-            result: AssociationResult::RejectedPermanent, 
-            result_source_diagnostic: AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null), 
-            responding_ap_title: None, 
-            responding_ae_qualifier: None, responding_ap_invocation_id: None, 
-            responding_ae_invocation_id: None, 
-            responder_acse_requirements: None, 
-            mechanism_name: None, 
-            responding_authentication_value: None, 
-            implementation_information: None, 
-            user_information: None
+            application_context_name: ApplicationContextName::LogicalNameNoCiphering,
+            result: AssociationResult::RejectedPermanent,
+            result_source_diagnostic: AssociateSourceDiagnostic::ServiceUser(AcseServiceUser::Null),
+            responding_ap_title: None,
+            responding_ae_qualifier: None,
+            responding_ap_invocation_id: None,
+            responding_ae_invocation_id: None,
+            responder_acse_requirements: None,
+            mechanism_name: None,
+            responding_authentication_value: None,
+            user_information: None,
         }
     }
 
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
-            // `protocol-version [0]` не пишем: единственное значение — `{ version1 (0) }`
-            // (DEFAULT), поэтому поле всегда опускается.
+            // We don't write `protocol-version [0]`: its only value is `{ version1 (0) }`
+            // (DEFAULT), so the field is always omitted.
             written += put_explicit_oid(b, 1, &self.application_context_name)?;
             written += self.result.put(b)?;
             // result-source-diagnostic [3] EXPLICIT Associate-source-diagnostic.
@@ -764,9 +841,6 @@ impl<'a> AAREapdu<'a> {
             if let Some(v) = &self.responding_authentication_value {
                 written += put_explicit_authentication_value(b, 10, v)?;
             }
-            if let Some(v) = &self.implementation_information {
-                written += put_tlv(b, &ctx(29, false), v)?;
-            }
             if let Some(v) = &self.user_information {
                 written += put_explicit_octet_string(b, 30, v)?;
             }
@@ -791,13 +865,12 @@ impl<'a> BerTagged<'a> for AAREapdu<'a> {
         let mut responder_acse_requirements = None;
         let mut mechanism_name = None;
         let mut responding_authentication_value = None;
-        let mut implementation_information = None;
         let mut user_information = None;
         while buf.pos() < end {
             let (ftag, flen) = read_tlv_bounded(buf, end)?;
             match ftag.number {
                 0 => {
-                    // Присутствующий `protocol-version` обязан быть `{ version1 (0) }`.
+                    // A present `protocol-version` must be `{ version1 (0) }`.
                     if buf.read(flen)? != PROTOCOL_VERSION_V1 {
                         return Err(Error::AssociateSourceDiagnostic(
                             AssociateSourceDiagnostic::ServiceProvider(
@@ -831,7 +904,7 @@ impl<'a> BerTagged<'a> for AAREapdu<'a> {
                 10 => {
                     responding_authentication_value = Some(AuthenticationValue::get(buf, flen)?);
                 }
-                29 => implementation_information = Some(buf.read(flen)?),
+                29 => _ = buf.read(flen)?,
                 30 => {
                     let (_itag, olen) = unwrap_explicit(buf, flen)?;
                     user_information = Some(buf.read(olen)?);
@@ -853,13 +926,10 @@ impl<'a> BerTagged<'a> for AAREapdu<'a> {
             responder_acse_requirements,
             mechanism_name,
             responding_authentication_value,
-            implementation_information,
             user_information,
         })
     }
 }
-
-
 
 /// `Release-request-reason ::= INTEGER { normal (0), urgent (1), user-defined (30) }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -874,12 +944,10 @@ pub enum ReleaseRequestReason {
 }
 
 impl ReleaseRequestReason {
-
     /// Encode as `reason [0] IMPLICIT Release-request-reason` (full TLV).
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         with_content(buf, &Self::TAG, |b| put_u8(b, *self as u8))
     }
-
 }
 
 impl<'a> BerTagged<'a> for ReleaseRequestReason {
@@ -900,8 +968,6 @@ impl<'a> BerTagged<'a> for ReleaseRequestReason {
     }
 }
 
-
-
 /// `Release-response-reason ::= INTEGER { normal(0), not-finished(1), user-defined(30) }`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -915,12 +981,10 @@ pub enum ReleaseResponseReason {
 }
 
 impl ReleaseResponseReason {
-
     /// Encode as `reason [0] IMPLICIT Release-response-reason` (full TLV).
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         with_content(buf, &Self::TAG, |b| put_u8(b, *self as u8))
     }
-
 }
 
 impl<'a> BerTagged<'a> for ReleaseResponseReason {
@@ -941,8 +1005,6 @@ impl<'a> BerTagged<'a> for ReleaseResponseReason {
     }
 }
 
-
-
 /// RLRQ-apdu ::= [APPLICATION 2] IMPLICIT SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RLRQapdu<'a> {
@@ -951,7 +1013,6 @@ pub struct RLRQapdu<'a> {
 }
 
 impl<'a> RLRQapdu<'a> {
-
     pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
         with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
@@ -994,8 +1055,6 @@ impl<'a> BerTagged<'a> for RLRQapdu<'a> {
     }
 }
 
-
-
 /// RLRE-apdu ::= [APPLICATION 3] IMPLICIT SEQUENCE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RLREapdu<'a> {
@@ -1004,8 +1063,7 @@ pub struct RLREapdu<'a> {
 }
 
 impl<'a> RLREapdu<'a> {
-
-    pub fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize> {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
         with_content(buf, &Self::TAG, |b| {
             let mut written = 0usize;
             if let Some(reason) = self.reason {
@@ -1046,8 +1104,6 @@ impl<'a> BerTagged<'a> for RLREapdu<'a> {
         })
     }
 }
-
-
 
 /// ACSE-APDU ::= CHOICE { aarq, aare, rlrq, rlre }.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1141,7 +1197,6 @@ mod tests {
             responder_acse_requirements: None,
             mechanism_name: None,
             responding_authentication_value: None,
-            implementation_information: None,
             user_information: Some(b"\x01\x02\x03"),
         };
         roundtrip!(aare, AAREapdu::get);
@@ -1254,7 +1309,7 @@ mod tests {
     ) -> AARQapdu<'a> {
         let mut aarq = AARQapdu::new(context);
         if let Some(m) = mechanism {
-            aarq.sender_acse_requirements = Some(ACSE_REQUIREMENTS);
+            aarq.sender_acse_requirements = true;
             aarq.mechanism_name = Some(m);
             aarq.calling_authentication_value = auth.map(AuthenticationValue::CharString);
         }
@@ -1305,7 +1360,6 @@ mod tests {
             responder_acse_requirements: None,
             mechanism_name: None,
             responding_authentication_value: None,
-            implementation_information: None,
             user_information: None,
         };
         if let Some(m) = mechanism {
@@ -1419,7 +1473,7 @@ mod tests {
         // ciphered user-information (50 octets).
         let mut aarq = AARQapdu::new(ApplicationContextName::LogicalNameCiphering);
         aarq.calling_ap_title = Some(&[0x4D, 0x4D, 0x4D, 0x00, 0x00, 0xBC, 0x61, 0x4E]);
-        aarq.sender_acse_requirements = Some(ACSE_REQUIREMENTS);
+        aarq.sender_acse_requirements = true;
         aarq.mechanism_name = Some(MechanismName::LowLevelSecurity);
         aarq.calling_authentication_value = Some(AuthenticationValue::CharString(LLS_PASSWORD));
         aarq.user_information = Some(&[
@@ -1457,7 +1511,6 @@ mod tests {
             responder_acse_requirements: None,
             mechanism_name: None,
             responding_authentication_value: None,
-            implementation_information: None,
             user_information: None,
         };
         let mut backing = [0u8; 128];

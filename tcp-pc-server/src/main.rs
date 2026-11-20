@@ -1,22 +1,27 @@
-//! Desktop DLMS/COSEM сервер поверх TCP (COSEM Wrapper + ACSE + xDLMS).
+//! Desktop DLMS/COSEM server over TCP (COSEM Wrapper + ACSE + xDLMS).
 //!
-//! Принимает TCP-соединения (по умолчанию `127.0.0.1:4059`), конкурентно
-//! обслуживает каждое через `tokio::spawn`: ассоциация (`AARQ` → `AARE`),
-//! затем цикл обработки xDLMS-запросов (GET) до закрытия/таймаута.
+//! Accepts TCP connections (default `127.0.0.1:4059`), concurrently
+//! serves each via `tokio::spawn`: association (`AARQ` → `AARE`),
+//! then a loop processing xDLMS requests (GET) until close/timeout.
 //!
-//! Каждое соединение владеет собственной `Session` (буферы `rx`/`tx`), поэтому
-//! read/process/write идут без удержания мьютекса `Server` на сетевом I/O —
-//! мьютекс берётся только на короткую фазу разбора/кодирования.
+//! Each connection owns its own `Session` (buffers `rx`/`tx`), so
+//! read/process/write proceed without holding the `Server` mutex over network I/O —
+//! the mutex is taken only for the short parse/encode phase.
 
 use anyhow::{anyhow, Result};
+#[cfg(test)]
 use cosempdu::apdu::Conformance;
 use cosempdu::buffer::Reader;
+use cosempdu::data::Codec;
 use cosempdu::error::Error as CosemError;
 use dlms1::common_data_types::{DoubleLongUnsigned, OctetString, Unsigned};
-use dlms1::ic::{Clock, DataObject, InterfaceClass, Register, ScalUnit};
+use dlms1::ic::{
+    AttributeAccessMode, AttributeKey, Clock, DataObject, InterfaceClass, Register, ScalUnit,
+};
 use dlms1::obis::ObisCode;
 use server::{
-    Access, AccessMask, AssociationState, Channel, Listener, Media, Server, Session, Wrapper,
+    Access, AssociationState, AttrDesc, AttrKind, AttrSpec, Channel, Listener, Media, Server,
+    Session, Wrapper,
 };
 use static_cell::StaticCell;
 use std::sync::Arc;
@@ -25,32 +30,88 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-/// Адрес/порт прослушивания (стандартный DLMS/COSEM-over-TCP порт 4059).
+/// Listen address/port (standard DLMS/COSEM-over-TCP port 4059).
 const BIND_ADDR: &str = "127.0.0.1:4059";
 
-/// Число одновременных DLMS-сессий (compile-time; пулы транспорта следуют этому `N`).
+/// Number of concurrent DLMS sessions (compile-time; transport pools follow this `N`).
 const MAX_SESSIONS: usize = 3;
 
-/// Предлагаемый сервером conformance (LN, без шифрования; базовый набор GET/SET/ACTION).
-const SERVER_CONFORMANCE: Conformance = Conformance([0x00, 0x7E, 0x1F]);
-
-/// Каталог COSEM-объектов, доступных серверу (Register + Clock).
+/// Application objects (on top of the default `server::OBJECTS` catalog).
 static DATA_OBJ: DataObject = DataObject::new(ObisCode::new(0, 0, 96, 1, 0, 255));
 static DATA_OBJ2: DataObject = DataObject::new(ObisCode::new(0, 0, 96, 1, 1, 255));
 static REG_OBJ: Register = Register::new(ObisCode::ACTIVE_ENERGY_IMPORT_TOTAL);
 static CLOCK_OBJ: Clock = Clock::new(ObisCode::CLOCK);
-static OBJECTS: &[&dyn InterfaceClass] = &[&DATA_OBJ, &DATA_OBJ2, &REG_OBJ, &CLOCK_OBJ];
 
-/// Значение атрибута `value` регистра (read-only, 100).
-static DATA_VALUE: StaticCell<Unsigned> = StaticCell::new();
+/// Application `(object, OBIS)` pairs — compile-time input for `server::merge_objects`.
+const APP_OBJECTS: [(&dyn InterfaceClass, ObisCode); 4] =
+    server::objects![DATA_OBJ, DATA_OBJ2, REG_OBJ, CLOCK_OBJ];
+
+/// Full catalog: default (`server::OBJECTS`) + application objects,
+/// sorted by OBIS (compile-time).
+static OBJECTS: &[&dyn InterfaceClass] =
+    &server::merge_objects::<10>(server::OBJECTS, &APP_OBJECTS);
+
+/// Register `value` attribute (read-only, 100).
 static DATA_VALUE2: OctetString<10> = OctetString::new(b"hello");
-static REG_VALUE: DoubleLongUnsigned = DoubleLongUnsigned(100);
+static DATA_VALUE: StaticCell<Unsigned> = StaticCell::new();
 static REG_SU: ScalUnit = ScalUnit::new(3, 10);
+static REG_VALUE: DoubleLongUnsigned = DoubleLongUnsigned(100);
 
-/// TCP-канал поверх tokio: читает/пишет полный WPDU (Wrapper-фрейминг).
+/// Application attributes (on top of the default `server::ATTRS`; any order —
+/// sorting is done in `server::merge_attrs`). OBIS is taken from the object.
+static APP_ATTRS: &[AttrSpec] = &[
+    AttrSpec {
+        key: AttributeKey::new(DATA_OBJ.obis, 2),
+        access: Access {
+            public: AttributeAccessMode::ReadOnly,
+            reader: AttributeAccessMode::NoAccess,
+            configurator: AttributeAccessMode::WriteOnly,
+        },
+        kind: AttrKind::Persistent(5),
+    },
+    AttrSpec {
+        key: AttributeKey::new(DATA_OBJ2.obis, 2),
+        access: Access {
+            public: AttributeAccessMode::ReadOnly,
+            reader: AttributeAccessMode::NoAccess,
+            configurator: AttributeAccessMode::WriteOnly,
+        },
+        kind: AttrKind::Static(&DATA_VALUE2),
+    },
+    AttrSpec {
+        key: AttributeKey::new(REG_OBJ.obis, 2),
+        access: Access {
+            public: AttributeAccessMode::ReadOnly,
+            reader: AttributeAccessMode::NoAccess,
+            configurator: AttributeAccessMode::WriteOnly,
+        },
+        kind: AttrKind::Static(&REG_VALUE),
+    },
+    AttrSpec {
+        key: AttributeKey::new(REG_OBJ.obis, 3),
+        access: Access {
+            public: AttributeAccessMode::ReadOnly,
+            reader: AttributeAccessMode::NoAccess,
+            configurator: AttributeAccessMode::WriteOnly,
+        },
+        kind: AttrKind::Static(&REG_SU),
+    },
+];
+
+/// Full registry: default (`server::ATTRS`) + application attributes; OBIS is resolved
+/// to the object index, sorted by key (compile-time).
+static ATTRS: &[AttrDesc] =
+    &server::merge_attrs::<18>(server::OBJECTS, &APP_OBJECTS, server::ATTRS, APP_ATTRS);
+
+/// ROM codec array for Static attributes (in `server::ATTRS` + `APP_ATTRS` order).
+static CODECS: &[&dyn Codec] = &server::merge_codecs::<8>(server::ATTRS, APP_ATTRS);
+
+static mut MUT: [Option<&'static mut dyn Codec>; 6] = [None, None, None, None, None, None];
+
+/// TCP channel over tokio: reads/writes a complete WPDU (Wrapper framing).
 ///
-/// Чтение обёрнуто в таймаут (`read_timeout`, по умолчанию 120 c): при простое
-/// канала чтение завершается ошибкой, и вызывающий сбрасывает сессию в Idle.
+/// Reads are wrapped in a timeout (`read_timeout`, default 120 s): while idle
+/// the read fails, and the caller resets the session to Idle.
 pub struct TcpChannel {
     stream: TcpStream,
     read_timeout: Duration,
@@ -64,12 +125,12 @@ impl TcpChannel {
         }
     }
 
-    /// Переопределить таймаут чтения (по умолчанию 120 c).
+    /// Override the read timeout (default 120 s).
     pub fn set_read_timeout(&mut self, timeout: Duration) {
         self.read_timeout = timeout;
     }
 
-    /// Прочитать ровно `buf.len()` байт с таймаутом чтения.
+    /// Read exactly `buf.len()` bytes with the read timeout.
     async fn read_exact_timeout(&mut self, buf: &mut [u8]) -> Result<(), CosemError> {
         tokio::time::timeout(self.read_timeout, self.stream.read_exact(buf))
             .await
@@ -83,7 +144,7 @@ impl Channel for TcpChannel {
     type Frame = Wrapper;
 
     async fn read(&mut self, buf: &mut [u8]) -> Result<Wrapper, CosemError> {
-        // Wrapper-заголовок (8 байт) — сразу в buf; затем APDU перезапишет его.
+        // Wrapper header (8 bytes) goes straight into buf; the APDU overwrites it afterwards.
         if buf.len() < 8 {
             return Err(CosemError::ByteBufferError(
                 cosempdu::buffer::Error::NotEnoughSpace { needed: 8 },
@@ -91,7 +152,7 @@ impl Channel for TcpChannel {
         }
         self.read_exact_timeout(&mut buf[..8]).await?;
 
-        // Разбираем заголовок, чтобы узнать длину APDU.
+        // Parse the header to learn the APDU length.
         let setting = Wrapper::get(&mut Reader::new(&buf[..8]))?;
         let apdu_len = setting.apdu_len() as usize;
         if apdu_len > buf.len() {
@@ -100,7 +161,7 @@ impl Channel for TcpChannel {
             ));
         }
 
-        // APDU — в начало buf (перезаписываем заголовок).
+        // APDU goes to the start of buf (overwriting the header).
         self.read_exact_timeout(&mut buf[..apdu_len]).await?;
         Ok(setting)
     }
@@ -113,7 +174,7 @@ impl Channel for TcpChannel {
     }
 }
 
-/// TCP-приёмник поверх tokio (реализует [`Listener`]).
+/// TCP acceptor over tokio (implements [`Listener`]).
 pub struct TcpListener {
     inner: tokio::net::TcpListener,
 }
@@ -133,42 +194,18 @@ impl Listener for TcpListener {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut server: Server<'static, MAX_SESSIONS> =
-        Server::<'static, MAX_SESSIONS>::with_capacity(OBJECTS, SERVER_CONFORMANCE);
-    server.set_wport(1);
-    server.add_static(
-        REG_OBJ.value(),
-        &REG_VALUE,
-        Access {
-            read: AccessMask::PUBLIC,
-            write: AccessMask::CONFIGURATOR,
-        },
-    )?;
-    server.add_static(
-        REG_OBJ.scaler_unit(),
-        &REG_SU,
-        Access {
-            read: AccessMask::PUBLIC,
-            write: AccessMask::CONFIGURATOR,
-        },
-    )?;
     let data_value = DATA_VALUE.init(Unsigned(1));
-    server.add_persistent(
-        DATA_OBJ.value(),
-        data_value,
-        Access {
-            read: AccessMask::PUBLIC,
-            write: AccessMask::CONFIGURATOR,
-        },
-    )?;
-    server.add_static(
-        DATA_OBJ2.value(),
-        &DATA_VALUE2,
-        Access {
-            read: AccessMask::PUBLIC,
-            write: AccessMask::CONFIGURATOR,
-        },
-    )?;
+    unsafe {
+        // Default slots (LDN + server-system-title + LLS secrets) are initialized by the server.
+        server::init_mutable_defaults(&mut *core::ptr::addr_of_mut!(MUT));
+        MUT[5] = Some(data_value);
+    }
+
+    let mut server: Server<MAX_SESSIONS> =
+        Server::<MAX_SESSIONS>::with_capacity(OBJECTS, ATTRS, CODECS, unsafe {
+            &mut *core::ptr::addr_of_mut!(MUT)
+        });
+    server.set_wport(1);
     let server = Arc::new(Mutex::new(server));
 
     let mut listener = TcpListener {
@@ -190,36 +227,36 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Обслуживание одного соединения: цикл запросов (AARQ/AARE, GET/SET, RLRQ) до
-/// закрытия/таймаута.
+/// Serve one connection: a request loop (AARQ/AARE, GET/SET, RLRQ) until
+/// close/timeout.
 async fn handle_connection(
-    server: Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
+    server: Arc<Mutex<Server<MAX_SESSIONS>>>,
     mut channel: TcpChannel,
 ) -> Result<()> {
-    // Сессия (с буферами rx/tx) принадлежит этой задаче соединения.
+    // The session (with rx/tx buffers) belongs to this connection task.
     let mut session = server.lock().await.on_connect(Media::Tcp)?;
 
-    // Цикл обслуживания xDLMS-запросов (AARQ/AARE, GET/SET, RLRQ); выходим по
-    // RLRQ (state = Disconnecting)/таймауту/закрытию/ошибке.
+    // xDLMS request loop (AARQ/AARE, GET/SET, RLRQ); exit on
+    // RLRQ (state = Disconnecting)/timeout/close/error.
     let result = loop {
         if let Err(e) = request_session(&server, &mut session, &mut channel).await {
             break Err(e);
         }
-        if session.state() == AssociationState::Disconnecting {
+        if session.settings.state == AssociationState::Disconnecting {
             break Ok(());
         }
     };
 
-    // Всегда освобождаем транспортный слот.
+    // Always release the transport slot.
     server.lock().await.on_disconnect(session.media());
     result
 }
 
-/// Обработка одного xDLMS-запроса (AARQ/GET/SET/RLRQ): read в session.rx (без
-/// мьютекса) → process (короткий мьютекс, без I/O) → write из session.tx (без
-/// мьютекса). Освобождение ассоциации отражается в `session.state()`.
+/// Handle one xDLMS request (AARQ/GET/SET/RLRQ): read into session.rx (without
+/// the mutex) → process (short mutex, no I/O) → write from session.tx (without
+/// the mutex). Association release is reflected in `session.settings.state`.
 async fn request_session(
-    server: &Arc<Mutex<Server<'static, MAX_SESSIONS>>>,
+    server: &Arc<Mutex<Server<MAX_SESSIONS>>>,
     session: &mut Session,
     channel: &mut TcpChannel,
 ) -> Result<()> {
@@ -229,16 +266,19 @@ async fn request_session(
         .map_err(|e| anyhow!("read: {e:?}"))?;
     session.set_rx_len(received.apdu_len() as usize);
 
-    {
+    let send = {
         let mut srv = server.lock().await;
-        srv.process_request(session, received)
-            .map_err(|e| anyhow!("request: {e:?}"))?;
-    }
+        let (settings, transport_ref, rx, tx) = session.parts();
+        srv.process_request(settings, transport_ref, rx, tx, received)
+            .map_err(|e| anyhow!("request: {e:?}"))?
+    };
 
-    channel
-        .write(session.tx())
-        .await
-        .map_err(|e| anyhow!("write: {e:?}"))?;
+    if send {
+        channel
+            .write(session.tx())
+            .await
+            .map_err(|e| anyhow!("write: {e:?}"))?;
+    }
     session.clear_rx();
     Ok(())
 }
@@ -247,23 +287,37 @@ async fn request_session(
 mod tests {
     use super::*;
     use cosempdu::acse::{AARQapdu, ACSEApdu, ApplicationContextName, AssociationResult};
+    use cosempdu::apdu::InitiateRequest;
     use cosempdu::apdu::{
         CosemAttributeDescriptor, GetDataResult, GetRequest, GetResponse, GetResponseNormal,
         ImplicitTagged, InvokeIdAndPriority,
     };
-    use cosempdu::apdu::InitiateRequest;
     use cosempdu::buffer::ByteBuffer;
 
-    /// Реальный AARQ WPDU от DLMS-клиента (LN без шифрования): версия 1, src=16,
-    /// dst=1 (Wrapper-порт сервера), длина APDU 31. Хвост InitiateRequest
-    /// `1E 5D FF FF` (vaa-name) проект игнорирует при разборе.
+    static mut NO_MUT: [Option<&'static mut dyn Codec>; 0] = [];
+    static REG_SPEC: &[AttrSpec] = &[AttrSpec {
+        key: AttributeKey::new(REG_OBJ.obis, 2),
+        access: Access {
+            public: AttributeAccessMode::ReadOnly,
+            reader: AttributeAccessMode::NoAccess,
+            configurator: AttributeAccessMode::WriteOnly,
+        },
+        kind: AttrKind::Static(&REG_VALUE),
+    }];
+    static REG_ATTRS: [AttrDesc; 15] =
+        server::merge_attrs::<15>(server::OBJECTS, &APP_OBJECTS, server::ATTRS, REG_SPEC);
+    static REG_CODECS: [&dyn Codec; 6] = server::merge_codecs::<6>(server::ATTRS, REG_SPEC);
+
+    /// Real AARQ WPDU from a DLMS client (LN without ciphering): version 1, src=16,
+    /// dst=1 (server Wrapper port), APDU length 31. The InitiateRequest tail
+    /// `1E 5D FF FF` (vaa-name) is ignored by the project when parsing.
     const AARQ_WPDU: &[u8] = &[
         0x00, 0x01, 0x00, 0x10, 0x00, 0x01, 0x00, 0x1F, 0x60, 0x1D, 0xA1, 0x09, 0x06, 0x07, 0x60,
         0x85, 0x74, 0x05, 0x08, 0x01, 0x01, 0xBE, 0x10, 0x04, 0x0E, 0x01, 0x00, 0x00, 0x00, 0x06,
         0x5F, 0x1F, 0x04, 0x00, 0x62, 0x1E, 0x5D, 0xFF, 0xFF,
     ];
 
-    /// Формирует WPDU с AARQ (клиентский запрос ассоциации).
+    /// Build a WPDU with an AARQ (client association request).
     fn make_aarq_wpdu() -> Vec<u8> {
         let req = InitiateRequest::new(Conformance([0x00, 0x7E, 0x1F]), 1200);
         let mut ui = [0u8; 64];
@@ -274,8 +328,8 @@ mod tests {
         let mut aarq_bytes = [0u8; 256];
         let m = aarq.put(&mut ByteBuffer::new(&mut aarq_bytes)).unwrap();
 
-        // Клиент: source_port = свой (1), destination_port = сервера (1).
-        let setting = Wrapper::new(1, 1);
+        // Client: source_port = 0x10 (public client_SAP), destination_port = server's (1).
+        let setting = Wrapper::new(0x10, 1);
         let mut wpdu = vec![0u8; 8 + m];
         let mut buf = ByteBuffer::new(&mut wpdu);
         setting
@@ -284,7 +338,7 @@ mod tests {
         wpdu
     }
 
-    /// Формирует WPDU с Get-Request (чтение `value` регистра `REG_OBJ`, attr 2).
+    /// Build a WPDU with a Get-Request (read register `REG_OBJ` `value`, attr 2).
     fn make_get_wpdu() -> Vec<u8> {
         let invoke = InvokeIdAndPriority::from_bits(1, true, false);
         let descriptor = CosemAttributeDescriptor {
@@ -296,7 +350,7 @@ mod tests {
         let n = GetRequest::put_normal(invoke, descriptor, None, &mut ByteBuffer::new(&mut apdu))
             .unwrap();
 
-        // Клиент: source_port = 16, destination_port = 1 (порт сервера).
+        // Client: source_port = 16, destination_port = 1 (server port).
         let setting = Wrapper::new(16, 1);
         let mut wpdu = vec![0u8; 8 + n];
         let mut buf = ByteBuffer::new(&mut wpdu);
@@ -306,8 +360,10 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_handshake_end_to_end() {
-        let mut server: Server<'static, MAX_SESSIONS> =
-            Server::<'static, MAX_SESSIONS>::with_capacity(OBJECTS, SERVER_CONFORMANCE);
+        let mut server: Server<MAX_SESSIONS> =
+            Server::<MAX_SESSIONS>::with_capacity(OBJECTS, &ATTRS, &CODECS, unsafe {
+                &mut *core::ptr::addr_of_mut!(NO_MUT)
+            });
         server.set_wport(1);
         let server = Arc::new(Mutex::new(server));
 
@@ -338,22 +394,14 @@ mod tests {
         }
     }
 
-    /// Полный цикл: AARQ → AARE, затем Get-Request → Get-Response.
+    /// Full cycle: AARQ → AARE, then Get-Request → Get-Response.
     #[tokio::test]
     async fn tcp_get_end_to_end() {
-        let mut server: Server<'static, MAX_SESSIONS> =
-            Server::<'static, MAX_SESSIONS>::with_capacity(OBJECTS, SERVER_CONFORMANCE);
+        let mut server: Server<MAX_SESSIONS> =
+            Server::<MAX_SESSIONS>::with_capacity(OBJECTS, &REG_ATTRS, &REG_CODECS, unsafe {
+                &mut *core::ptr::addr_of_mut!(NO_MUT)
+            });
         server.set_wport(1);
-        server
-            .add_static(
-                REG_OBJ.value(),
-                &REG_VALUE,
-                Access {
-                    read: AccessMask::PUBLIC,
-                    write: AccessMask::CONFIGURATOR,
-                },
-            )
-            .unwrap();
         let server = Arc::new(Mutex::new(server));
 
         let mut listener = TcpListener {
@@ -368,7 +416,7 @@ mod tests {
 
         let mut socket = TcpStream::connect(addr).await.unwrap();
 
-        // 1) Ассоциация: AARQ → AARE.
+        // 1) Association: AARQ → AARE.
         let wpdu = make_aarq_wpdu();
         socket.write_all(&wpdu).await.unwrap();
         let mut header = [0u8; 8];
@@ -408,7 +456,7 @@ mod tests {
         }
     }
 
-    /// Клиент: подключается, шлёт AARQ и проверяет, что получил AARE (accepted).
+    /// Client: connects, sends AARQ and checks it received AARE (accepted).
     async fn run_client(addr: std::net::SocketAddr) {
         let mut socket = TcpStream::connect(addr).await.unwrap();
         socket.write_all(AARQ_WPDU).await.unwrap();
@@ -426,11 +474,13 @@ mod tests {
         }
     }
 
-    /// Два клиента одновременно ассоциируются с сервером (2 сессии из MAX_SESSIONS).
+    /// Two clients associate with the server concurrently (2 of MAX_SESSIONS sessions).
     #[tokio::test]
     async fn two_concurrent_clients() {
-        let mut server: Server<'static, MAX_SESSIONS> =
-            Server::<'static, MAX_SESSIONS>::with_capacity(OBJECTS, SERVER_CONFORMANCE);
+        let mut server: Server<MAX_SESSIONS> =
+            Server::<MAX_SESSIONS>::with_capacity(OBJECTS, &ATTRS, &CODECS, unsafe {
+                &mut *core::ptr::addr_of_mut!(NO_MUT)
+            });
         server.set_wport(1);
         let server = Arc::new(Mutex::new(server));
 
@@ -439,7 +489,7 @@ mod tests {
         };
         let addr = listener.inner.local_addr().unwrap();
 
-        // accept-цикл на 2 соединения.
+        // accept loop for 2 connections.
         let srv = Arc::clone(&server);
         tokio::spawn(async move {
             for _ in 0..2 {
@@ -449,7 +499,7 @@ mod tests {
             }
         });
 
-        // Два клиента одновременно шлют AARQ и ждут AARE.
+        // Two clients send AARQ concurrently and wait for AARE.
         tokio::join!(run_client(addr), run_client(addr));
     }
 }

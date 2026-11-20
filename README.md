@@ -116,6 +116,11 @@ assert_eq!(decoded, ACSEApdu::Aarq(aarq));
 | `server` | Minimal DLMS/COSEM server (per-attribute typed registry) |
 | `dlms1` | COSEM Interface Classes and OBIS (DLMS UA 1000-1 Ed. 14) — see [DLMS1](doc/DLMS1.md) |
 
+## Code conventions
+
+- All source comments in `*.rs` files (`//`, `///`, `//!`, `/* ... */`) are written in English.
+- Only the Markdown documentation under `doc/` is written in Russian.
+
 ## Project Links
 
 - **Source code:** [GitHub](https://github.com/youserj/COSEMpdu_project)

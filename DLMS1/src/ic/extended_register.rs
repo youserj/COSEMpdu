@@ -45,6 +45,10 @@ impl ExtendedRegister {
 }
 
 impl InterfaceClass for ExtendedRegister {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn class_id(&self) -> ClassId {
         ClassId::ExtendedRegister
     }

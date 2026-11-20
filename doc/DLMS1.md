@@ -65,18 +65,18 @@ assert_eq!(reg.class_id(), ClassId::Register);
 | `RegisterActivation` | 6 | 0 | 1 logical_name, 2 register_assignment, 3 mask_list, 4 active_mask | 1 add_register, 2 add_mask, 3 delete_mask (deferred) |
 | `Clock` | 8 | 0 | 1..8 (time, time_zone, status, begin, end, deviation, clock_base) | 1..6 |
 | `AssociationSn` | 12 | 4 | 1..9 (object_list, partners_id, …, security_ref) | 1..4 |
-| `AssociationLn` | 15 | 1 | 1..8 (as SN, LN object_list entries) | 1..4 |
+| `AssociationLn` | 15 | 1 | 1..9 (object_list with access_rights, partners_id, …, security_ref) | 1..4 |
 
 `ClassId` enumerates the full Blue Book class-id table; only the seven classes
 above have concrete implementations.
 
 ## Scope / simplifications
 
-- The association `object_list` stores identifying fields only
-  (`class_id`/`version`/`logical_name`, plus `base_name` for SN); the Blue Book
-  `access_rights` entry is deferred.
-- `XdlmsContextInfo.conformance` is stored as a 32-bit value of the conformance
-  bit-string.
+- The LN association `object_list` models the full Blue Book shape, including
+  `access_rights` (attribute/method access descriptors with selectors).
+- `XdlmsContextInfo` carries the full six-field `xDLMS_context_type`; the
+  variable-length `conformance` bit-string and `cyphering_info` octet-string
+  borrow from the decoded buffer.
 - Association methods `add_object`/`remove_object` are reported as unsupported
   (the object list is a borrowed slice); `reply_to_HLS_secret` /
   `change_HLS_secret` are accepted no-ops (HLS secret handling is

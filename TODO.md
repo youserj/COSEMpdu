@@ -25,7 +25,7 @@
       `ObisCode` + attribute_id) и валидирует входящие `class_id` + OBIS по
       статическому каталогу `OBJECTS`.
 - [x] **Обработка GET-запросов.** `Get-Request` (Normal) → `handle_get` →
-      `Get-Response`; декодирование в owned-поля, `get_codec` + проверка `read`.
+      `Get-Response`; декодирование в owned-поля, `lookup_value` + проверка `read`.
 - [x] **Поточный SET в `Persistent`.** `stream_set` → `StreamDecoder` → `StreamSink`.
 - [x] **`#![no_std]` для крейта `server`.** `#![cfg_attr(not(feature = "std"), no_std)]`.
 - [x] **Модель конкурентности.** `Session` (с буферами `rx`/`tx`) принадлежит

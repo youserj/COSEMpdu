@@ -195,6 +195,10 @@ impl RegisterActivation {
 }
 
 impl InterfaceClass for RegisterActivation {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn class_id(&self) -> ClassId {
         ClassId::RegisterActivation
     }
@@ -258,7 +262,10 @@ impl<const N: usize> Codec for RegisterAssignmentValue<N> {
     }
 
     fn assign(&mut self, d: &Data<'_>) -> cosempdu::Result<()> {
-        let items = d.as_array().ok_or(cosempdu::Error::TagNumber { expected: 1, actual: d.tag() })?;
+        let items = d.as_array().ok_or(cosempdu::Error::TagNumber {
+            expected: 1,
+            actual: d.tag(),
+        })?;
         if items.len() != N {
             return Err(cosempdu::Error::Message(
                 "register_assignment has wrong entry count",

@@ -14,14 +14,14 @@
 use crate::error::{Error, Result};
 use crate::x680::Tag;
 use crate::x690::Length;
-use bytebuffer::ByteBuffer;
+use bytebuffer::{ByteBuffer, WriteBuf};
 
 // ---------------------------------------------------------------------------
 // Low-level byte helpers (tag/length encoding into plain vectors)
 // ---------------------------------------------------------------------------
 
 /// Build a full TLV encoding (tag + length + content) directly into the buffer.
-pub fn put_tlv(buf: &mut ByteBuffer<'_>, tag: &Tag, content: &[u8]) -> Result<usize> {
+pub fn put_tlv<B: WriteBuf>(buf: &mut B, tag: &Tag, content: &[u8]) -> Result<usize> {
     let mut written = tag.put(buf)?;
     written += Length::new(content.len() as i64)?.put(buf)?;
     written += buf.write(content)?;
@@ -45,7 +45,7 @@ pub fn put_signed(buf: &mut ByteBuffer<'_>, value: i64) -> Result<usize> {
     Ok(buf.write(&be[16 - num_bytes..])?)
 }
 
-pub fn put_u8(buf: &mut ByteBuffer<'_>, value: u8) -> Result<usize> {
+pub fn put_u8<B: WriteBuf>(buf: &mut B, value: u8) -> Result<usize> {
     Ok(buf.put_u8(value)?)
 }
 
@@ -79,10 +79,10 @@ pub fn decode_u8(content: &[u8]) -> Result<u8> {
 ///
 /// A single length octet is reserved up front; if the content exceeds 127
 /// bytes, the content is shifted right and a long-form length is backfilled.
-pub fn with_content(
-    buf: &mut ByteBuffer<'_>,
+pub fn with_content<B: WriteBuf>(
+    buf: &mut B,
     tag: &Tag,
-    f: impl FnOnce(&mut ByteBuffer<'_>) -> Result<usize>,
+    f: impl FnOnce(&mut B) -> Result<usize>,
 ) -> Result<usize> {
     let start = buf.pos();
     let tag_len = tag.put(buf)?;
@@ -100,4 +100,47 @@ pub fn with_content(
         buf.set_pos(content_start + content_len + n)?;
     }
     Ok(buf.pos() - start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x680::{Class, UniversalTag};
+    use bytebuffer::ArrayBuffer;
+
+    #[test]
+    fn with_content_arraybuffer_long_form() {
+        // Content longer than 127 bytes → long-form length + shift via `shift`.
+        let tag = Tag {
+            class: Class::Application,
+            number: 1,
+            constructed: true,
+        };
+        let content = [0xABu8; 200];
+        let mut buf = ArrayBuffer::<256>::new();
+
+        let n = with_content(&mut buf, &tag, |b| Ok(b.write(&content)?)).unwrap();
+        assert_eq!(n, 203); // tag(1) + length(2) + content(200)
+
+        let bytes = buf.extract();
+        assert_eq!(bytes[0], 0x61); // [APPLICATION 1] constructed
+        assert_eq!(bytes[1], 0x81); // long-form, 1 length octet
+        assert_eq!(bytes[2], 200);
+        assert_eq!(&bytes[3..], &content[..]);
+    }
+
+    #[test]
+    fn with_content_arraybuffer_short_form() {
+        let tag = Tag::universal(UniversalTag::Sequence);
+        let content = [0x11u8; 5];
+        let mut buf = ArrayBuffer::<16>::new();
+
+        let n = with_content(&mut buf, &tag, |b| Ok(b.write(&content)?)).unwrap();
+        assert_eq!(n, 7); // tag(1) + length(1) + content(5)
+
+        let bytes = buf.extract();
+        assert_eq!(bytes[0], 0x10); // [UNIVERSAL 16] primitive (Tag::universal)
+        assert_eq!(bytes[1], 5);
+        assert_eq!(&bytes[2..], &content[..]);
+    }
 }

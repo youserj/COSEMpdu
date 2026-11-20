@@ -227,6 +227,24 @@ pub trait Codec: Send + Sync {
         None
     }
 
+    /// If the value is an octet-string, return its raw bytes (for comparison,
+    /// e.g. against `called-AP-title`); `None` otherwise.
+    fn octet_string(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// If the value is an `associated_partners_type` structure, return its
+    /// `(client_SAP, server_SAP)`; `None` otherwise.
+    fn associated_partners(&self) -> Option<(u8, u16)> {
+        None
+    }
+
+    /// If the value is an enum, return its numeric value (e.g. `security_suite`);
+    /// `None` otherwise.
+    fn enum_value(&self) -> Option<u8> {
+        None
+    }
+
     /// Decode a whole value from bytes into an owned `Self` (`Sized` types only).
     fn get<'a>(buf: &mut Reader<'a>, arena: &mut Arena<'a, Data<'a>>) -> Result<Self>
     where
@@ -237,6 +255,15 @@ pub trait Codec: Send + Sync {
         value.assign(&data)?;
         Ok(value)
     }
+}
+
+/// Minimal encode-only trait: a value that can encode itself to A-XDR.
+///
+/// Unlike [`Codec`], it does not require decode (`assign`/`stream_sink`); useful
+/// for read-only borrowed views (e.g. the Association LN `object_list`).
+pub trait Encodable {
+    /// Encode into `buf`, returning the number of bytes written.
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> Result<usize>;
 }
 
 /// Generate an `as_*` accessor that extracts a `Copy`-carrying variant.

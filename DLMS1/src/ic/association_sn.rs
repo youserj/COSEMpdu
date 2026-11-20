@@ -80,6 +80,10 @@ impl AssociationSn {
 }
 
 impl InterfaceClass for AssociationSn {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
     fn class_id(&self) -> ClassId {
         ClassId::AssociationSn
     }
