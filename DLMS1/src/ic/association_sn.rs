@@ -9,23 +9,23 @@ use crate::ic::{
 use crate::obis::ObisCode;
 
 /// Attribute 1 — `logical_name` (octet-string).
-pub const ATTR_LOGICAL_NAME: u8 = 1;
+pub const ATTR_LOGICAL_NAME: i8 = 1;
 /// Attribute 2 — `object_list`.
-pub const ATTR_OBJECT_LIST: u8 = 2;
+pub const ATTR_OBJECT_LIST: i8 = 2;
 /// Attribute 3 — `associated_partners_id` (associated_partners_type).
-pub const ATTR_ASSOCIATED_PARTNERS_ID: u8 = 3;
+pub const ATTR_ASSOCIATED_PARTNERS_ID: i8 = 3;
 /// Attribute 4 — `application_context_name` (octet-string).
-pub const ATTR_APPLICATION_CONTEXT_NAME: u8 = 4;
+pub const ATTR_APPLICATION_CONTEXT_NAME: i8 = 4;
 /// Attribute 5 — `xDLMS_context_info`.
-pub const ATTR_XDLMS_CONTEXT_INFO: u8 = 5;
+pub const ATTR_XDLMS_CONTEXT_INFO: i8 = 5;
 /// Attribute 6 — `authentication_mechanism_name` (enum).
-pub const ATTR_AUTHENTICATION_MECHANISM_NAME: u8 = 6;
+pub const ATTR_AUTHENTICATION_MECHANISM_NAME: i8 = 6;
 /// Attribute 7 — `LLS_secret` (octet-string).
-pub const ATTR_LLS_SECRET: u8 = 7;
+pub const ATTR_LLS_SECRET: i8 = 7;
 /// Attribute 8 — `association_status` (enum).
-pub const ATTR_ASSOCIATION_STATUS: u8 = 8;
+pub const ATTR_ASSOCIATION_STATUS: i8 = 8;
 /// Attribute 9 — `security_setup_reference` (octet-string).
-pub const ATTR_SECURITY_SETUP_REFERENCE: u8 = 9;
+pub const ATTR_SECURITY_SETUP_REFERENCE: i8 = 9;
 
 /// COSEM interface class "Association SN" (class_id 12): a static object descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,42 +39,42 @@ impl AssociationSn {
     }
 
     /// Key of the `object_list` attribute.
-    pub fn object_list(&self) -> AttributeKey {
+    pub const fn object_list(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_OBJECT_LIST)
     }
 
     /// Key of the `associated_partners_id` attribute.
-    pub fn associated_partners_id(&self) -> AttributeKey {
+    pub const fn associated_partners_id(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_ASSOCIATED_PARTNERS_ID)
     }
 
     /// Key of the `application_context_name` attribute.
-    pub fn application_context_name(&self) -> AttributeKey {
+    pub const fn application_context_name(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_APPLICATION_CONTEXT_NAME)
     }
 
     /// Key of the `xDLMS_context_info` attribute.
-    pub fn xdlms_context_info(&self) -> AttributeKey {
+    pub const fn xdlms_context_info(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_XDLMS_CONTEXT_INFO)
     }
 
     /// Key of the `authentication_mechanism_name` attribute.
-    pub fn authentication_mechanism_name(&self) -> AttributeKey {
+    pub const fn authentication_mechanism_name(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_AUTHENTICATION_MECHANISM_NAME)
     }
 
     /// Key of the `LLS_secret` attribute.
-    pub fn lls_secret(&self) -> AttributeKey {
+    pub const fn lls_secret(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_LLS_SECRET)
     }
 
     /// Key of the `association_status` attribute.
-    pub fn association_status(&self) -> AttributeKey {
+    pub const fn association_status(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_ASSOCIATION_STATUS)
     }
 
     /// Key of the `security_setup_reference` attribute.
-    pub fn security_setup_reference(&self) -> AttributeKey {
+    pub const fn security_setup_reference(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_SECURITY_SETUP_REFERENCE)
     }
 }

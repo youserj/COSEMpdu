@@ -1,5 +1,6 @@
 //! COSEM interface class "Association LN" (class_id 15, version 1).
 
+use cosempdu::acse::ApplicationContextName;
 use cosempdu::axdr::put_length;
 use cosempdu::buffer::ByteBuffer;
 use cosempdu::data::{Codec, Data, Encodable, FromStructure};
@@ -8,7 +9,8 @@ use crate::common_data_types::Array;
 use crate::error::{Error, Result};
 use crate::ic::{
     AttributeInfo, AttributeKey, AttributeType, ClassId, Classifier, CommonDataType,
-    InterfaceClass, Validator, ASSOCIATED_PARTNERS_VALIDATOR, V1, XDLMS_CONTEXT_INFO_VALIDATOR,
+    InterfaceClass, MethodKey, Validator, ASSOCIATED_PARTNERS_VALIDATOR, V1,
+    XDLMS_CONTEXT_INFO_VALIDATOR,
 };
 use crate::obis::ObisCode;
 
@@ -26,32 +28,77 @@ pub mod client_sap {
 }
 
 /// Attribute 1 — `logical_name` (octet-string).
-pub const ATTR_LOGICAL_NAME: u8 = 1;
+pub const ATTR_LOGICAL_NAME: i8 = 1;
 /// Attribute 2 — `object_list` (`object_list_type`).
-pub const ATTR_OBJECT_LIST: u8 = 2;
+pub const ATTR_OBJECT_LIST: i8 = 2;
 /// Attribute 3 — `associated_partners_id` (`associated_partners_type`).
-pub const ATTR_ASSOCIATED_PARTNERS_ID: u8 = 3;
+pub const ATTR_ASSOCIATED_PARTNERS_ID: i8 = 3;
 /// Attribute 4 — `application_context_name` (`context_name_type`).
-pub const ATTR_APPLICATION_CONTEXT_NAME: u8 = 4;
+pub const ATTR_APPLICATION_CONTEXT_NAME: i8 = 4;
 /// Attribute 5 — `xDLMS_context_info` (`xDLMS_context_type`).
-pub const ATTR_XDLMS_CONTEXT_INFO: u8 = 5;
+pub const ATTR_XDLMS_CONTEXT_INFO: i8 = 5;
 /// Attribute 6 — `authentication_mechanism_name` (`mechanism_name_type`).
-pub const ATTR_AUTHENTICATION_MECHANISM_NAME: u8 = 6;
+pub const ATTR_AUTHENTICATION_MECHANISM_NAME: i8 = 6;
 /// Attribute 7 — `secret` (octet-string).
-pub const ATTR_SECRET: u8 = 7;
+pub const ATTR_SECRET: i8 = 7;
 /// Attribute 8 — `association_status` (enum).
-pub const ATTR_ASSOCIATION_STATUS: u8 = 8;
+pub const ATTR_ASSOCIATION_STATUS: i8 = 8;
 /// Attribute 9 — `security_setup_reference` (octet-string).
-pub const ATTR_SECURITY_SETUP_REFERENCE: u8 = 9;
+pub const ATTR_SECURITY_SETUP_REFERENCE: i8 = 9;
 
 /// Method 1 — `reply_to_HLS_authentication` (data).
-pub const METHOD_REPLY_TO_HLS_AUTHENTICATION: u8 = 1;
+pub const METHOD_REPLY_TO_HLS_AUTHENTICATION: i8 = 1;
 /// Method 2 — `change_HLS_secret` (data).
-pub const METHOD_CHANGE_HLS_SECRET: u8 = 2;
+pub const METHOD_CHANGE_HLS_SECRET: i8 = 2;
 /// Method 3 — `add_object` (data).
-pub const METHOD_ADD_OBJECT: u8 = 3;
+pub const METHOD_ADD_OBJECT: i8 = 3;
 /// Method 4 — `remove_object` (data).
-pub const METHOD_REMOVE_OBJECT: u8 = 4;
+pub const METHOD_REMOVE_OBJECT: i8 = 4;
+
+/// `association_status` (attribute 8): current status of the association
+/// modelled by the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AssociationStatus {
+    /// (0) non-associated.
+    NonAssociated = 0,
+    /// (1) association-pending.
+    AssociationPending = 1,
+    /// (2) associated.
+    Associated = 2,
+}
+
+impl AssociationStatus {
+    /// Raw enum value as encoded in the PDU.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Decode from the raw enum value; `None` for unknown values.
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::NonAssociated),
+            1 => Some(Self::AssociationPending),
+            2 => Some(Self::Associated),
+            _ => None,
+        }
+    }
+}
+
+impl Codec for AssociationStatus {
+    fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
+        Data::Enum(self.as_u8()).put(buf)
+    }
+
+    fn assign(&mut self, data: &Data<'_>) -> cosempdu::Result<()> {
+        let value = data
+            .as_enum()
+            .ok_or(cosempdu::Error::Message("association-status must be enum"))?;
+        *self = AssociationStatus::from_u8(value)
+            .ok_or(cosempdu::Error::Message("unknown association-status value"))?;
+        Ok(())
+    }
+}
 
 /// `access_mode` of an attribute entry in `object_list` (0..6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +433,120 @@ fn validate_method_access_item(data: &Data<'_>) -> cosempdu::Result<()> {
 /// Static `object_list` validator (as a trait object).
 pub const OBJECT_LIST_VALIDATOR: &dyn Validator = &ObjectListValidator;
 
+// ---------------------------------------------------------------------------
+// Streaming `object_list` encoder (Association LN v1)
+// ---------------------------------------------------------------------------
+
+/// Byte sink for the streaming `object_list` encoder.
+pub trait ObjectListSink {
+    fn write(&mut self, bytes: &[u8]) -> cosempdu::Result<()>;
+}
+
+/// Object metadata for one `object_list_element`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectListElementInfo {
+    pub class_id: ClassId,
+    pub version: u8,
+    pub logical_name: ObisCode,
+}
+
+/// Source of `object_list` content for Association LN v1.
+///
+/// The encoder below owns the A-XDR layout (tags, field order, array counts);
+/// the source only supplies object metadata and the access entries.
+pub trait ObjectListSource {
+    fn object_count(&self) -> usize;
+    fn element(&self, index: usize) -> ObjectListElementInfo;
+    fn attribute_count(&self, index: usize) -> usize;
+    fn attribute(&self, index: usize, item: usize) -> (i8, AttributeAccessMode);
+    fn method_count(&self, index: usize) -> usize;
+    fn method(&self, index: usize, item: usize) -> (i8, MethodAccessMode);
+}
+
+/// Methods advertised in `object_list` (Association LN v1).
+pub const OBJECT_LIST_METHODS: [(i8, MethodAccessMode); 2] = [
+    (METHOD_REPLY_TO_HLS_AUTHENTICATION, MethodAccessMode::Access),
+    (
+        METHOD_CHANGE_HLS_SECRET,
+        MethodAccessMode::AuthenticatedAccess,
+    ),
+];
+
+fn put_sink_length<S: ObjectListSink>(sink: &mut S, value: usize) -> cosempdu::Result<()> {
+    if value <= 0x7F {
+        return sink.write(&[value as u8]);
+    }
+    let bits = 64 - (value as u64).leading_zeros();
+    let num_bytes = ((bits + 7) / 8) as usize;
+    sink.write(&[0x80 | num_bytes as u8])?;
+    let be = (value as u64).to_be_bytes();
+    sink.write(&be[be.len() - num_bytes..])
+}
+
+/// Stream `object_list ::= array object_list_element` (Association LN v1) into
+/// `sink`. The exact A-XDR tags/field order live here (version-dependent).
+pub fn write_object_list<S: ObjectListSink, P: ObjectListSource>(
+    sink: &mut S,
+    source: &P,
+) -> cosempdu::Result<()> {
+    // array object_list_element
+    sink.write(&[0x01])?;
+    put_sink_length(sink, source.object_count())?;
+
+    for i in 0..source.object_count() {
+        let info = source.element(i);
+        let attr_count = source.attribute_count(i);
+        let method_count = source.method_count(i);
+
+        // object_list_element ::= structure { class_id, version, logical_name, access_rights }
+        sink.write(&[0x02])?;
+        put_sink_length(sink, 4)?;
+        sink.write(&[0x12])?; // long-unsigned
+        sink.write(&info.class_id.as_u16().to_be_bytes())?;
+        sink.write(&[0x11, info.version])?; // unsigned
+        sink.write(&[0x09])?; // octet-string
+        put_sink_length(sink, info.logical_name.bytes.len())?;
+        sink.write(&info.logical_name.bytes)?;
+
+        // access_right ::= structure { attribute_access, method_access }
+        sink.write(&[0x02])?;
+        put_sink_length(sink, 2)?;
+
+        // attribute_access ::= array attribute_access_item
+        sink.write(&[0x01])?;
+        put_sink_length(sink, attr_count)?;
+        for j in 0..attr_count {
+            let (id, mode) = source.attribute(i, j);
+            // attribute_access_item ::= structure { attribute_id, access_mode, access_selectors }
+            sink.write(&[0x02])?;
+            put_sink_length(sink, 3)?;
+            sink.write(&[0x0F, id.to_be_bytes()[0]])?; // integer (Integer8)
+            sink.write(&[0x16, mode as u8])?; // enum
+            sink.write(&[0x00])?; // access_selectors: null-data
+        }
+
+        // method_access ::= array method_access_item
+        sink.write(&[0x01])?;
+        put_sink_length(sink, method_count)?;
+        for j in 0..method_count {
+            let (id, mode) = source.method(i, j);
+            // method_access_item ::= structure { method_id, access_mode }
+            sink.write(&[0x02])?;
+            put_sink_length(sink, 2)?;
+            sink.write(&[0x0F, id.to_be_bytes()[0]])?; // integer (Integer8)
+            sink.write(&[0x16, mode as u8])?; // enum
+        }
+    }
+    Ok(())
+}
+
+impl AssociationLn {
+    /// Methods advertised in `object_list` (Association LN v1).
+    pub const fn object_list_methods() -> &'static [(i8, MethodAccessMode)] {
+        &OBJECT_LIST_METHODS
+    }
+}
+
 /// `context_name_structure ::= structure { ... }` — the arc labels of the
 /// application-context OBJECT IDENTIFIER.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +558,23 @@ pub struct ContextNameStructure {
     pub dlms_ua_element: u8,
     pub application_context_element: u8,
     pub context_id_element: u8,
+}
+
+impl ContextNameStructure {
+    /// Build the `context_name_structure` from an ACSE application-context name
+    /// (`{ 2 16 756 5 8 1 X }`).
+    pub fn from_application_context(app: ApplicationContextName) -> Self {
+        let a = app.to_arcs();
+        ContextNameStructure {
+            joint_iso_ctt_element: a[0] as u8,
+            country_element: a[1] as u8,
+            country_name_element: a[2] as u16,
+            identified_organization_element: a[3] as u8,
+            dlms_ua_element: a[4] as u8,
+            application_context_element: a[5] as u8,
+            context_id_element: a[6] as u8,
+        }
+    }
 }
 
 impl<'a> FromStructure<'a> for ContextNameStructure {
@@ -489,16 +667,20 @@ impl Validator for ContextNameValidator {
 pub const CONTEXT_NAME_VALIDATOR: &dyn Validator = &ContextNameValidator;
 
 /// `mechanism_name_structure ::= structure { ... }` — the arc labels of the
-/// authentication-mechanism OBJECT IDENTIFIER.
+/// authentication-mechanism OBJECT IDENTIFIER. The first six arcs are fixed by
+/// DLMS/COSEM (`{ 2 16 756 5 8 2 }`); only the mechanism id varies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MechanismNameStructure {
-    pub joint_iso_ctt_element: u8,
-    pub country_element: u8,
-    pub country_name_element: u16,
-    pub identified_organization_element: u8,
-    pub dlms_ua_element: u8,
-    pub authentication_mechanism_name_element: u8,
-    pub mechanism_id_element: u8,
+    /// The mechanism id (the last OID arc): `0` — lowest level security,
+    /// `1` — LLS, `2`…`7` — HLS variants.
+    pub mechanism_id: u8,
+}
+
+impl MechanismNameStructure {
+    /// `{ 2 16 756 5 8 2 <mechanism_id> }` for an authentication mechanism id.
+    pub const fn new(mechanism_id: u8) -> Self {
+        Self { mechanism_id }
+    }
 }
 
 impl<'a> FromStructure<'a> for MechanismNameStructure {
@@ -508,42 +690,41 @@ impl<'a> FromStructure<'a> for MechanismNameStructure {
                 "mechanism_name_structure must be a structure of seven fields",
             ));
         }
-        Ok(MechanismNameStructure {
-            joint_iso_ctt_element: fields[0]
-                .as_unsigned()
-                .ok_or(cosempdu::Error::Message("field 0 must be an unsigned"))?,
-            country_element: fields[1]
-                .as_unsigned()
-                .ok_or(cosempdu::Error::Message("field 1 must be an unsigned"))?,
-            country_name_element: fields[2]
-                .as_long_unsigned()
-                .ok_or(cosempdu::Error::Message("field 2 must be a long-unsigned"))?,
-            identified_organization_element: fields[3]
-                .as_unsigned()
-                .ok_or(cosempdu::Error::Message("field 3 must be an unsigned"))?,
-            dlms_ua_element: fields[4]
-                .as_unsigned()
-                .ok_or(cosempdu::Error::Message("field 4 must be an unsigned"))?,
-            authentication_mechanism_name_element: fields[5]
-                .as_unsigned()
-                .ok_or(cosempdu::Error::Message("field 5 must be an unsigned"))?,
-            mechanism_id_element: fields[6]
-                .as_unsigned()
-                .ok_or(cosempdu::Error::Message("field 6 must be an unsigned"))?,
-        })
+        // `{ 2 16 756 5 8 2 <id> }`
+        let fixed = [
+            fields[0].as_unsigned(),
+            fields[1].as_unsigned(),
+            fields[3].as_unsigned(),
+            fields[4].as_unsigned(),
+            fields[5].as_unsigned(),
+        ];
+        if fixed != [Some(2), Some(16), Some(5), Some(8), Some(2)]
+            || fields[2].as_long_unsigned() != Some(756)
+        {
+            return Err(cosempdu::Error::Message(
+                "mechanism_name_structure is not a DLMS mechanism name",
+            ));
+        }
+        Ok(Self::new(fields[6].as_unsigned().ok_or(
+            cosempdu::Error::Message("field 6 must be an unsigned"),
+        )?))
     }
 }
 
 impl Codec for MechanismNameStructure {
+    fn authentication_mechanism(&self) -> Option<u8> {
+        Some(self.mechanism_id)
+    }
+
     fn put(&self, buf: &mut ByteBuffer<'_>) -> cosempdu::Result<usize> {
         Data::Structure(&[
-            Data::Unsigned(self.joint_iso_ctt_element),
-            Data::Unsigned(self.country_element),
-            Data::LongUnsigned(self.country_name_element),
-            Data::Unsigned(self.identified_organization_element),
-            Data::Unsigned(self.dlms_ua_element),
-            Data::Unsigned(self.authentication_mechanism_name_element),
-            Data::Unsigned(self.mechanism_id_element),
+            Data::Unsigned(2),
+            Data::Unsigned(16),
+            Data::LongUnsigned(756),
+            Data::Unsigned(5),
+            Data::Unsigned(8),
+            Data::Unsigned(2),
+            Data::Unsigned(self.mechanism_id),
         ])
         .put(buf)
     }
@@ -602,43 +783,63 @@ impl AssociationLn {
     }
 
     /// Key of the `object_list` attribute.
-    pub fn object_list(&self) -> AttributeKey {
+    pub const fn object_list(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_OBJECT_LIST)
     }
 
     /// Key of the `associated_partners_id` attribute.
-    pub fn associated_partners_id(&self) -> AttributeKey {
+    pub const fn associated_partners_id(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_ASSOCIATED_PARTNERS_ID)
     }
 
     /// Key of the `application_context_name` attribute.
-    pub fn application_context_name(&self) -> AttributeKey {
+    pub const fn application_context_name(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_APPLICATION_CONTEXT_NAME)
     }
 
     /// Key of the `xDLMS_context_info` attribute.
-    pub fn xdlms_context_info(&self) -> AttributeKey {
+    pub const fn xdlms_context_info(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_XDLMS_CONTEXT_INFO)
     }
 
     /// Key of the `authentication_mechanism_name` attribute.
-    pub fn authentication_mechanism_name(&self) -> AttributeKey {
+    pub const fn authentication_mechanism_name(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_AUTHENTICATION_MECHANISM_NAME)
     }
 
     /// Key of the `secret` attribute.
-    pub fn secret(&self) -> AttributeKey {
+    pub const fn secret(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_SECRET)
     }
 
     /// Key of the `association_status` attribute.
-    pub fn association_status(&self) -> AttributeKey {
+    pub const fn association_status(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_ASSOCIATION_STATUS)
     }
 
     /// Key of the `security_setup_reference` attribute.
-    pub fn security_setup_reference(&self) -> AttributeKey {
+    pub const fn security_setup_reference(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_SECURITY_SETUP_REFERENCE)
+    }
+
+    /// Key of the `reply_to_HLS_authentication` method.
+    pub const fn reply_to_hls_authentication(&self) -> MethodKey {
+        MethodKey::new(self.obis, METHOD_REPLY_TO_HLS_AUTHENTICATION)
+    }
+
+    /// Key of the `change_HLS_secret` method.
+    pub const fn change_hls_secret(&self) -> MethodKey {
+        MethodKey::new(self.obis, METHOD_CHANGE_HLS_SECRET)
+    }
+
+    /// Key of the `add_object` method.
+    pub const fn add_object(&self) -> MethodKey {
+        MethodKey::new(self.obis, METHOD_ADD_OBJECT)
+    }
+
+    /// Key of the `remove_object` method.
+    pub const fn remove_object(&self) -> MethodKey {
+        MethodKey::new(self.obis, METHOD_REMOVE_OBJECT)
     }
 }
 
@@ -737,6 +938,93 @@ mod tests {
     }
 
     #[test]
+    fn streaming_object_list_matches_encodable() {
+        struct Sink {
+            buf: [u8; 256],
+            len: usize,
+        }
+        impl ObjectListSink for Sink {
+            fn write(&mut self, bytes: &[u8]) -> cosempdu::Result<()> {
+                self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+                self.len += bytes.len();
+                Ok(())
+            }
+        }
+
+        struct Src;
+        impl ObjectListSource for Src {
+            fn object_count(&self) -> usize {
+                1
+            }
+            fn element(&self, _: usize) -> ObjectListElementInfo {
+                ObjectListElementInfo {
+                    class_id: ClassId::AssociationLn,
+                    version: V1,
+                    logical_name: ObisCode::new(0, 0, 40, 0, 0, 255),
+                }
+            }
+            fn attribute_count(&self, _: usize) -> usize {
+                2
+            }
+            fn attribute(&self, _: usize, item: usize) -> (i8, AttributeAccessMode) {
+                match item {
+                    0 => (1, AttributeAccessMode::ReadOnly),
+                    _ => (2, AttributeAccessMode::ReadAndWrite),
+                }
+            }
+            fn method_count(&self, _: usize) -> usize {
+                1
+            }
+            fn method(&self, _: usize, _: usize) -> (i8, MethodAccessMode) {
+                (METHOD_REPLY_TO_HLS_AUTHENTICATION, MethodAccessMode::Access)
+            }
+        }
+
+        let mut sink = Sink {
+            buf: [0u8; 256],
+            len: 0,
+        };
+        write_object_list(&mut sink, &Src).unwrap();
+
+        // Reference: `object_list` of one element via the canonical `Encodable`.
+        let attrs = [
+            AttributeAccessItem {
+                attribute_id: 1,
+                access_mode: AttributeAccessMode::ReadOnly,
+                access_selectors: AccessSelectors::Null,
+            },
+            AttributeAccessItem {
+                attribute_id: 2,
+                access_mode: AttributeAccessMode::ReadAndWrite,
+                access_selectors: AccessSelectors::Null,
+            },
+        ];
+        let methods = [MethodAccessItem {
+            method_id: METHOD_REPLY_TO_HLS_AUTHENTICATION,
+            access_mode: MethodAccessMode::Access,
+        }];
+        let element = ObjectListElement {
+            class_id: ClassId::AssociationLn,
+            version: V1,
+            logical_name: ObisCode::new(0, 0, 40, 0, 0, 255),
+            access_rights: AccessRight {
+                attribute_access: &attrs,
+                method_access: &methods,
+            },
+        };
+
+        let mut reference = [0u8; 256];
+        let n = {
+            let mut b = ByteBuffer::new(&mut reference);
+            b.put_u8(0x01).unwrap(); // array
+            put_length(&mut b, 1).unwrap();
+            element.put(&mut b).unwrap();
+            b.pos()
+        };
+        assert_eq!(&sink.buf[..sink.len], &reference[..n]);
+    }
+
+    #[test]
     fn object_list_validates_and_encodes() {
         let ln: ObisCode = "1.0.1.8.0.255".parse().unwrap();
 
@@ -812,6 +1100,17 @@ mod tests {
     }
 
     #[test]
+    fn attribute_keys_are_const() {
+        const OBIS: ObisCode = ObisCode::new(0, 0, 40, 0, 1, 255);
+        const LN: AssociationLn = AssociationLn::new(OBIS);
+        const KEY: AttributeKey = LN.object_list();
+        assert_eq!(KEY, AttributeKey::new(OBIS, ATTR_OBJECT_LIST));
+
+        const METHOD: MethodKey = LN.change_hls_secret();
+        assert_eq!(METHOD, MethodKey::new(OBIS, METHOD_CHANGE_HLS_SECRET));
+    }
+
+    #[test]
     fn context_name_and_mechanism_name() {
         let oct = [0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01];
         match ContextName::from_data(&Data::OctetString(&oct)).unwrap() {
@@ -843,6 +1142,44 @@ mod tests {
             Ok(MechanismName::OctetString(_))
         ));
         assert!(ContextName::from_data(&Data::NullData).is_err());
+    }
+
+    #[test]
+    fn mechanism_name_structure_from_mechanism_id() {
+        let mech = MechanismNameStructure::new(1); // LLS
+        assert_eq!(mech.mechanism_id, 1);
+
+        let mut bytes = [0u8; 32];
+        let n = {
+            let mut b = ByteBuffer::new(&mut bytes);
+            mech.put(&mut b).unwrap()
+        };
+        assert_eq!(
+            &bytes[..n],
+            &[
+                0x02, 0x07, // structure (7)
+                0x11, 0x02, // joint-iso-ctt (2)
+                0x11, 0x10, // country (16)
+                0x12, 0x02, 0xF4, // country-name (756)
+                0x11, 0x05, // identified-organization (5)
+                0x11, 0x08, // dlms-ua (8)
+                0x11, 0x02, // authentication-mechanism-name (2)
+                0x11, 0x01, // mechanism-id (1)
+            ]
+        );
+        assert_eq!(mech.authentication_mechanism(), Some(1));
+
+        // A structure with non-DLMS arcs is not a mechanism name.
+        let fields = [
+            Data::Unsigned(2),
+            Data::Unsigned(17),
+            Data::LongUnsigned(756),
+            Data::Unsigned(5),
+            Data::Unsigned(8),
+            Data::Unsigned(2),
+            Data::Unsigned(1),
+        ];
+        assert!(MechanismName::from_data(&Data::Structure(&fields)).is_err());
     }
 
     #[test]

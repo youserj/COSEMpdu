@@ -52,7 +52,7 @@ fn main() -> Result<(), server::Error> {
                 instance_id: REG_OBJ.value().obis.bytes,
                 attribute_id: 2,
             },
-            &Settings::reader(),
+            &mut Settings::reader(),
             &mut buf,
         )
         .unwrap();

@@ -6,9 +6,9 @@ use crate::ic::{
 use crate::obis::ObisCode;
 
 /// Attribute 1 — `logical_name` (octet-string).
-pub const ATTR_LOGICAL_NAME: u8 = 1;
+pub const ATTR_LOGICAL_NAME: i8 = 1;
 /// Attribute 2 — `value` (instance-specific).
-pub const ATTR_VALUE: u8 = 2;
+pub const ATTR_VALUE: i8 = 2;
 
 /// COSEM interface class "Data" (class_id 1): a static object descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ impl DataObject {
     }
 
     /// Key of the `value` attribute.
-    pub fn value(&self) -> AttributeKey {
+    pub const fn value(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_VALUE)
     }
 }

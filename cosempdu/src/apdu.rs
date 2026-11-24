@@ -736,10 +736,58 @@ impl<'a> DataBlockSA<'a> {
     }
 }
 
+/// Action-Result ::= ENUMERATED (single byte, no tag).
+///
+/// The numeric values coincide with [`DataAccessResult`] for the common codes;
+/// the ACTION-specific ones are `long-action-aborted (15)` /
+/// `no-long-action-in-progress (16)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ActionResult {
+    Success = 0,
+    HardwareFault = 1,
+    TemporaryFailure = 2,
+    ReadWriteDenied = 3,
+    ObjectUndefined = 4,
+    ObjectClassInconsistent = 9,
+    ObjectUnavailable = 11,
+    TypeUnmatched = 12,
+    ScopeOfAccessViolated = 13,
+    DataBlockUnavailable = 14,
+    LongActionAborted = 15,
+    NoLongActionInProgress = 16,
+    OtherReason = 250,
+}
+
+impl ActionResult {
+    pub fn put<B: WriteBuf>(&self, buf: &mut B) -> Result<usize> {
+        Ok(buf.put_u8(*self as u8)?)
+    }
+
+    pub fn get(buf: &mut Reader<'_>) -> Result<Self> {
+        Ok(match buf.get_u8()? {
+            0 => Self::Success,
+            1 => Self::HardwareFault,
+            2 => Self::TemporaryFailure,
+            3 => Self::ReadWriteDenied,
+            4 => Self::ObjectUndefined,
+            9 => Self::ObjectClassInconsistent,
+            11 => Self::ObjectUnavailable,
+            12 => Self::TypeUnmatched,
+            13 => Self::ScopeOfAccessViolated,
+            14 => Self::DataBlockUnavailable,
+            15 => Self::LongActionAborted,
+            16 => Self::NoLongActionInProgress,
+            250 => Self::OtherReason,
+            _ => return Err(Error::Message("unknown action-result")),
+        })
+    }
+}
+
 /// Action-Response-With-Optional-Data ::= SEQUENCE { result, return-parameters OPTIONAL }.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ActionResponseWithOptionalData<'a> {
-    pub result: u8,
+    pub result: ActionResult,
     pub return_parameters: Option<GetDataResult<'a>>,
 }
 
@@ -747,11 +795,11 @@ impl<'a> ActionResponseWithOptionalData<'a> {
     /// Encode from typed values: `return_parameters` is a `Get-Data-Result`
     /// (data or error), written via the asymmetric helper.
     pub fn put(
-        result: u8,
+        result: ActionResult,
         return_parameters: Option<GetDataResultWrite<'_>>,
         buf: &mut ByteBuffer<'_>,
     ) -> Result<usize> {
-        let mut written = buf.put_u8(result)?;
+        let mut written = result.put(buf)?;
         written += put_presence(buf, return_parameters.is_some())?;
         if let Some(rp) = return_parameters {
             written += rp.put(buf)?;
@@ -760,7 +808,7 @@ impl<'a> ActionResponseWithOptionalData<'a> {
     }
 
     fn get(buf: &mut Reader<'a>) -> Result<Self> {
-        let result = buf.get_u8()?;
+        let result = ActionResult::get(buf)?;
         let return_parameters = if get_presence(buf)? {
             Some(GetDataResult::get(buf)?)
         } else {
@@ -776,7 +824,7 @@ impl<'a> ActionResponseWithOptionalData<'a> {
 /// Write-side view of an [`ActionResponseWithOptionalData`] for encoding.
 #[derive(Clone, Copy)]
 pub struct ActionResponseWithOptionalDataWrite<'a> {
-    pub result: u8,
+    pub result: ActionResult,
     pub return_parameters: Option<GetDataResultWrite<'a>>,
 }
 
@@ -3762,7 +3810,7 @@ mod tests {
             |buf| ActionResponse::put_normal(
                 InvokeIdAndPriority::from_bits(1, true, false),
                 ActionResponseWithOptionalDataWrite {
-                    result: 0,
+                    result: ActionResult::Success,
                     return_parameters: None
                 },
                 buf,
@@ -3772,12 +3820,46 @@ mod tests {
                 ActionResponse::Normal(ActionResponseNormal {
                     single_response, ..
                 }) => {
-                    assert_eq!(single_response.result, 0);
+                    assert_eq!(single_response.result, ActionResult::Success);
                     assert!(single_response.return_parameters.is_none());
                 }
                 _ => panic!("wrong variant"),
             }
         );
+    }
+
+    #[test]
+    fn action_result_values() {
+        assert_eq!(ActionResult::Success as u8, 0);
+        assert_eq!(ActionResult::HardwareFault as u8, 1);
+        assert_eq!(ActionResult::TemporaryFailure as u8, 2);
+        assert_eq!(ActionResult::ReadWriteDenied as u8, 3);
+        assert_eq!(ActionResult::ObjectUndefined as u8, 4);
+        assert_eq!(ActionResult::ObjectClassInconsistent as u8, 9);
+        assert_eq!(ActionResult::ObjectUnavailable as u8, 11);
+        assert_eq!(ActionResult::TypeUnmatched as u8, 12);
+        assert_eq!(ActionResult::ScopeOfAccessViolated as u8, 13);
+        assert_eq!(ActionResult::DataBlockUnavailable as u8, 14);
+        assert_eq!(ActionResult::LongActionAborted as u8, 15);
+        assert_eq!(ActionResult::NoLongActionInProgress as u8, 16);
+        assert_eq!(ActionResult::OtherReason as u8, 250);
+
+        for value in [
+            ActionResult::Success,
+            ActionResult::ObjectUndefined,
+            ActionResult::LongActionAborted,
+            ActionResult::NoLongActionInProgress,
+            ActionResult::OtherReason,
+        ] {
+            let mut backing = [0u8; 1];
+            let n = value.put(&mut ByteBuffer::new(&mut backing)).unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(
+                ActionResult::get(&mut Reader::new(&backing[..n])).unwrap(),
+                value
+            );
+        }
+        assert!(ActionResult::get(&mut Reader::new(&[7u8][..])).is_err());
     }
 
     #[test]

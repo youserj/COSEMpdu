@@ -10,15 +10,15 @@ use crate::ic::{
 use crate::obis::ObisCode;
 
 /// Attribute 2 — `security_policy` (enum).
-pub const ATTR_SECURITY_POLICY: u8 = 2;
+pub const ATTR_SECURITY_POLICY: i8 = 2;
 /// Attribute 3 — `security_suite` (enum).
-pub const ATTR_SECURITY_SUITE: u8 = 3;
+pub const ATTR_SECURITY_SUITE: i8 = 3;
 /// Attribute 4 — `client_system_title` (octet-string).
-pub const ATTR_CLIENT_SYSTEM_TITLE: u8 = 4;
+pub const ATTR_CLIENT_SYSTEM_TITLE: i8 = 4;
 /// Attribute 5 — `server_system_title` (octet-string).
-pub const ATTR_SERVER_SYSTEM_TITLE: u8 = 5;
+pub const ATTR_SERVER_SYSTEM_TITLE: i8 = 5;
 /// Attribute 6 — `certificates` (array of `certificate_info`).
-pub const ATTR_CERTIFICATES: u8 = 6;
+pub const ATTR_CERTIFICATES: i8 = 6;
 
 /// Bits of the `security_policy` enum (interpreted as an unsigned bitmask).
 pub mod security_policy {
@@ -217,27 +217,27 @@ impl SecuritySetup {
     }
 
     /// Key of the `security_policy` attribute.
-    pub fn security_policy(&self) -> AttributeKey {
+    pub const fn security_policy(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_SECURITY_POLICY)
     }
 
     /// Key of the `security_suite` attribute.
-    pub fn security_suite(&self) -> AttributeKey {
+    pub const fn security_suite(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_SECURITY_SUITE)
     }
 
     /// Key of the `client_system_title` attribute.
-    pub fn client_system_title(&self) -> AttributeKey {
+    pub const fn client_system_title(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_CLIENT_SYSTEM_TITLE)
     }
 
     /// Key of the `server_system_title` attribute.
-    pub fn server_system_title(&self) -> AttributeKey {
+    pub const fn server_system_title(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_SERVER_SYSTEM_TITLE)
     }
 
     /// Key of the `certificates` attribute.
-    pub fn certificates(&self) -> AttributeKey {
+    pub const fn certificates(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_CERTIFICATES)
     }
 }

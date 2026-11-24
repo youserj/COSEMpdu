@@ -6,7 +6,7 @@ license = "MIT"
 description = "COSEM Interface Classes and OBIS Object Identification System (DLMS UA 1000-1 Ed. 14)"
 
 [dependencies]
-cosempdu = { path = "../cosempdu" }
+cosempdu = { path = "../cosempdu", default-features = false }
 
 [features]
 default = ["std"]

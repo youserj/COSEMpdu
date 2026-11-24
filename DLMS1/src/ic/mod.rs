@@ -24,9 +24,10 @@ use crate::error::{Error, Result};
 use crate::obis::ObisCode;
 
 pub use association_ln::{
-    client_sap, AccessRight, AccessSelectors, ArrayInteger, AssociationLn, AttributeAccessItem,
-    AttributeAccessMode, ContextName, ContextNameStructure, MechanismName, MechanismNameStructure,
-    MethodAccessItem, MethodAccessMode, ObjectList, ObjectListElement, CONTEXT_NAME_VALIDATOR,
+    client_sap, AccessRight, AccessSelectors, ArrayInteger, AssociationLn, AssociationStatus,
+    AttributeAccessItem, AttributeAccessMode, ContextName, ContextNameStructure, MechanismName,
+    MechanismNameStructure, MethodAccessItem, MethodAccessMode, ObjectList, ObjectListElement,
+    ObjectListElementInfo, ObjectListSink, ObjectListSource, CONTEXT_NAME_VALIDATOR,
     MECHANISM_NAME_VALIDATOR, OBJECT_LIST_VALIDATOR,
 };
 pub use association_sn::AssociationSn;
@@ -158,15 +159,35 @@ pub const V4: u8 = 4;
 pub const V5: u8 = 5;
 
 /// Key of a single attribute: the object's OBIS code + attribute id.
+///
+/// The id is the ASN.1 `Integer8` of `Cosem-Attribute-Descriptor`, i.e. the same
+/// type as on the wire — so no conversion is needed between a request and the
+/// registry key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttributeKey {
     pub obis: ObisCode,
-    pub attribute_id: u8,
+    pub attribute_id: i8,
 }
 
 impl AttributeKey {
-    pub const fn new(obis: ObisCode, attribute_id: u8) -> Self {
+    pub const fn new(obis: ObisCode, attribute_id: i8) -> Self {
         AttributeKey { obis, attribute_id }
+    }
+}
+
+/// Reference to a single method: the object's OBIS code + method id.
+///
+/// The id is the ASN.1 `Integer8` of `Cosem-Method-Descriptor` (like
+/// [`AttributeKey`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MethodKey {
+    pub obis: ObisCode,
+    pub method_id: i8,
+}
+
+impl MethodKey {
+    pub const fn new(obis: ObisCode, method_id: i8) -> Self {
+        MethodKey { obis, method_id }
     }
 }
 
@@ -306,14 +327,18 @@ pub trait InterfaceClass: Send + Sync + 'static {
     fn attributes(&self) -> &'static [AttributeInfo];
 
     /// Key of attribute `attribute_id`, if this object exposes it.
-    fn attr_key(&self, attribute_id: u8) -> Option<AttributeKey> {
-        if attribute_id == 0 {
+    ///
+    /// Ids come from the wire as ASN.1 `Integer8`; a non-positive id or one
+    /// beyond [`attributes`](Self::attributes) is not exposed.
+    fn attr_key(&self, attribute_id: i8) -> Option<AttributeKey> {
+        let id = u8::try_from(attribute_id).ok()?;
+        if id == 0 {
             return None;
         }
-        if attribute_id == 1 {
+        if id == 1 {
             return Some(self.logical_name());
         }
-        let idx = attribute_id as usize - 2;
+        let idx = usize::from(id) - 2;
         (idx < self.attributes().len()).then(|| AttributeKey::new(self.obis(), attribute_id))
     }
 
@@ -410,7 +435,7 @@ pub const XDLMS_CONTEXT_INFO_VALIDATOR: &dyn Validator = &XdlmsContextInfoValida
 /// Owned `xDLMS_context_type` value (association attribute 5). Encodes as a
 /// six-field A-XDR structure; `quality_of_service` is always encoded as `0`
 /// (not used by DLMS) and is therefore not stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdlmsContextInfoValue {
     /// The `conformance` bit-string (24 bits).
     pub conformance: BitString<3>,
@@ -623,6 +648,11 @@ mod tests {
         assert_eq!(r.attr_key(3).map(|k| k.attribute_id), Some(3));
         assert_eq!(r.attr_key(4), None);
         assert_eq!(r.attr_key(0), None);
+        // `Integer8` from the wire: negative ids are not masked into a valid one.
+        assert_eq!(r.attr_key(-1), None);
+        assert_eq!(r.attr_key(i8::MIN), None);
+        // Still bounded by the declared attribute count after the conversion.
+        assert_eq!(r.attr_key(i8::MAX), None);
     }
 
     #[test]

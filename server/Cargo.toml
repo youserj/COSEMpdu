@@ -6,12 +6,12 @@ license = "MIT"
 
 [dependencies]
 cosempdu = { path = "../cosempdu", default-features = false }
+critical-section = "1.2"
 dlms1 = { path = "../DLMS1", default-features = false }
-static_cell = "2.1"
 
 [features]
 default = ["std", "aes128", "aes256"]
-std = ["cosempdu/std", "dlms1/std"]
+std = ["cosempdu/std", "dlms1/std", "critical-section/std"]
 optical = []
 tcp = []
 ble = []

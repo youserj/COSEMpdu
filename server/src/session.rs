@@ -13,7 +13,7 @@ use crate::transport::{Media, TransportRef, MAX_APDU, TRANSPORT_OVERHEAD};
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use crate::Error;
 use cosempdu::acse::{ApplicationContextName, SystemTitle};
-use cosempdu::apdu::Conformance;
+use cosempdu::apdu::{Conformance, CosemAttributeDescriptor};
 #[cfg(any(feature = "optical", feature = "tcp", feature = "ble"))]
 use cosempdu::buffer::{ArrayBuffer, ByteBuffer, Reader};
 use dlms1::ic::client_sap;
@@ -24,11 +24,20 @@ pub const RX_BUF: usize = MAX_APDU + TRANSPORT_OVERHEAD;
 
 /// DLMS/COSEM association states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssociationState {
+pub enum SessionState {
     Idle,
     Associating,
     Associated,
     Disconnecting,
+}
+
+/// State of an in-progress `get-response-with-datablock` transfer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GetBlock {
+    /// Descriptor of the attribute being read.
+    pub descriptor: CosemAttributeDescriptor,
+    /// Block number expected in the next `Get-Request-Next`.
+    pub next_block: u32,
 }
 
 /// Dedicated key (size encoded by the variant: 16 or 32 bytes).
@@ -126,8 +135,10 @@ pub struct Settings {
     /// Maximum PDU size that can be sent to the client
     /// (min(MAX_APDU, client_max_receive_pdu_size); for GBT slicing).
     pub tx_max: u16,
+    /// In-progress `get-response-with-datablock` transfer (`Get-Request-Next`).
+    pub get_block: Option<GetBlock>,
     /// Association state.
-    pub state: AssociationState,
+    pub state: SessionState,
 }
 
 impl Settings {
@@ -147,7 +158,8 @@ impl Settings {
             system_title_c: None,
             dedicated_key: DedicatedKey::None,
             tx_max: 0,
-            state: AssociationState::Idle,
+            get_block: None,
+            state: SessionState::Idle,
         }
     }
 

@@ -13,11 +13,11 @@ use crate::ic::{
 use crate::obis::ObisCode;
 
 /// Attribute 2 — `register_assignment` (array of `object_definition`).
-pub const ATTR_REGISTER_ASSIGNMENT: u8 = 2;
+pub const ATTR_REGISTER_ASSIGNMENT: i8 = 2;
 /// Attribute 3 — `mask_list` (array of `register_act_mask`).
-pub const ATTR_MASK_LIST: u8 = 3;
+pub const ATTR_MASK_LIST: i8 = 3;
 /// Attribute 4 — `active_mask` (octet-string: a `mask_name` from `mask_list`).
-pub const ATTR_ACTIVE_MASK: u8 = 4;
+pub const ATTR_ACTIVE_MASK: i8 = 4;
 
 /// `object_definition ::= structure { class_id: long-unsigned, logical_name: octet-string }`.
 ///
@@ -179,17 +179,17 @@ impl RegisterActivation {
     }
 
     /// Key of the `register_assignment` attribute.
-    pub fn register_assignment(&self) -> AttributeKey {
+    pub const fn register_assignment(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_REGISTER_ASSIGNMENT)
     }
 
     /// Key of the `mask_list` attribute.
-    pub fn mask_list(&self) -> AttributeKey {
+    pub const fn mask_list(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_MASK_LIST)
     }
 
     /// Key of the `active_mask` attribute.
-    pub fn active_mask(&self) -> AttributeKey {
+    pub const fn active_mask(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_ACTIVE_MASK)
     }
 }

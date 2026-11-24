@@ -11,11 +11,11 @@ use crate::ic::{
 use crate::obis::ObisCode;
 
 /// Attribute 1 — `logical_name` (octet-string).
-pub const ATTR_LOGICAL_NAME: u8 = 1;
+pub const ATTR_LOGICAL_NAME: i8 = 1;
 /// Attribute 2 — `value` (instance-specific).
-pub const ATTR_VALUE: u8 = 2;
+pub const ATTR_VALUE: i8 = 2;
 /// Attribute 3 — `scaler_unit`.
-pub const ATTR_SCALER_UNIT: u8 = 3;
+pub const ATTR_SCALER_UNIT: i8 = 3;
 
 /// Tags of the `simple-data-type` CHOICE (the `value` of Register / Extended register).
 pub const SIMPLE_DATA_TAGS: &[u8] = &[0, 4, 5, 6, 9, 10, 12, 15, 16, 17, 18, 20, 21, 22, 23, 24];
@@ -117,12 +117,12 @@ pub const SCAL_UNIT_VALIDATOR: &dyn Validator = &ScalUnitValidator;
 macro_rules! register_value_keys {
     () => {
         /// Key of the `value` attribute.
-        pub fn value(&self) -> AttributeKey {
+        pub const fn value(&self) -> AttributeKey {
             AttributeKey::new(self.obis, ATTR_VALUE)
         }
 
         /// Key of the `scaler_unit` attribute.
-        pub fn scaler_unit(&self) -> AttributeKey {
+        pub const fn scaler_unit(&self) -> AttributeKey {
             AttributeKey::new(self.obis, ATTR_SCALER_UNIT)
         }
     };

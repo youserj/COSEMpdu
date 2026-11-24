@@ -239,6 +239,12 @@ pub trait Codec: Send + Sync {
         None
     }
 
+    /// If the value is a `mechanism_name_type` structure, return its mechanism
+    /// id (the last OID arc, `0`…`7`); `None` otherwise.
+    fn authentication_mechanism(&self) -> Option<u8> {
+        None
+    }
+
     /// If the value is an enum, return its numeric value (e.g. `security_suite`);
     /// `None` otherwise.
     fn enum_value(&self) -> Option<u8> {

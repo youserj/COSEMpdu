@@ -66,7 +66,7 @@ fn main() -> Result<(), server::Error> {
                     instance_id: REG_OBJ.value().obis.bytes,
                     attribute_id: 2,
                 },
-                &Settings::reader(),
+                &mut Settings::reader(),
                 &mut buf,
             )
             .unwrap();
@@ -101,7 +101,7 @@ fn main() -> Result<(), server::Error> {
                     instance_id: REG_OBJ.value().obis.bytes,
                     attribute_id: 2,
                 },
-                &Settings::public(),
+                &mut Settings::public(),
                 &mut buf,
             )
             .unwrap();
@@ -120,7 +120,7 @@ fn main() -> Result<(), server::Error> {
                     instance_id: SERIAL_OBJ.value().obis.bytes,
                     attribute_id: 2,
                 },
-                &Settings::public(),
+                &mut Settings::public(),
                 &mut buf,
             )
             .unwrap();

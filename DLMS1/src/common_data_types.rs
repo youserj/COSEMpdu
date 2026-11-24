@@ -331,7 +331,7 @@ impl StreamSink for DateTime {
 }
 
 /// `octet-string` of up to `N` bytes (variable length).
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct OctetString<const N: usize> {
     pub buf: [u8; N],
     len: usize,

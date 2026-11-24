@@ -47,12 +47,12 @@ pub trait Codec { /* put / assign / stream_sink / get */ }
 
 pub struct AttributeKey {            // ключ = OBIS + attribute_id (провод/публичный API)
     pub obis: ObisCode,
-    pub attribute_id: u8,
+    pub attribute_id: i8,            // ASN.1 Integer8 — как на проводе
 }
 
 pub struct AttrKey {                 // ключ атрибута в ROM-реестре (без OBIS)
     pub object: u16,                 // индекс объекта в отсортированном каталоге
-    pub attribute_id: u8,
+    pub attribute_id: i8,            // тот же Integer8, без конверсий на границе
 }
 
 pub struct AttrSpec {                // спецификация для merge_attrs (compile-time вход)
@@ -347,8 +347,44 @@ pub trait Nvm {
 - Поточный SET в `Persistent`: `stream_set` → `StreamDecoder` → `StreamSink`.
 - `#![no_std]` на крейте `server` (`#![cfg_attr(not(feature = "std"), no_std)]`).
 - Модель конкурентности: `Session` (с буферами `rx`/`tx`) принадлежит вызывающему.
+- Диспетчеризация `process_request` работает с `Option<usize>`: `Some(n)` — в `tx`
+  лежит `n`-байтовый APDU ответа, `None` — APDU **отброшен** (`send = false`),
+  сессия продолжается. `Err` остаётся только для уровня WPDU/буфера
+  (`Tag::get`, `validate_wrapper`, `tx.set_pos`, `tx.write_at`): содержимое APDU
+  соединение больше не рвёт.
+  Для xDLMS-сервисов ошибка типизирована (`RequestError`):
+  `NotWellFormed` → `exception-response (service-unknown, operation-not-possible)`,
+  `NotSupported` (WithList/NextPblock/access_selection/неизвестный class_id) →
+  `exception-response (service-not-allowed, service-not-supported)` — обе строки из
+  Table 89; `Internal(Error)` (сбой кодирования/инварианта) — единственный случай,
+  который завершает сессию. Хелперы `build_exception_response` /
+  `build_association_not_established` возвращают `Option<usize>`.
 - Интеграция ACSE/BER: `process_request` (AARQ → AARE, RLRQ → RLRE); подавление
   AARE при `response_allowed=false` (`process_request` → `bool`).
+  AARQ (`process_aarq`): возвращает `(Option<usize>, bool)` (`Some(n)` — AARE в tx,
+  `None` — APDU отброшен, как в release). Неразбираемый AARQ **отбрасывается** —
+  по 9.3.2 `.indication` генерится только для корректного AARQ, а AARE должен
+  echo-ить `application-context-name`, который из битого APDU не достать.
+  Отсутствующий/битый `user-information` (нет xDLMS InitiateRequest) — это
+  «AARQ syntax is not acceptable» (9.4.4.1): `AARE(rejected-permanent,
+  acse-service-provider / no-reason-given)`. AARQ при уже существующей AA
+  разбирается выше по диспетчеру как `exception-response` — разрешённый 9.4.4.2
+  «optional» вариант. Инвариант состояния: **только принятая ассоциация оставляет
+  наговорённые параметры в `Settings`**; любой отказ или отброс сбрасывает их
+  через `Settings::new()` (`reject_aarq`), поэтому сессия остаётся чистой и
+  готова к повторному AARQ. Ошибок (`Err`) в AARQ-пути больше нет — сбой
+  кодирования AARE даёт `None` + `debug_assert!`. В HLS-ветке (`ecdsa_*`) AARE
+  кодируется **до** захвата скретча `HLS_HANDSHAKE`, чтобы сбой не залипил его для
+  следующих ассоциаций.
+  Release — без `Result`: `handle_release` возвращает `Option<usize>` (`Some` — RLRE
+  в tx и переход в `Disconnecting`; `None` — ответа нет, `send = false`,
+  состояние не меняется, т. е. APDU отброшен). Неразбираемый RLRQ (битый BER / не
+  RLRQ) молча отбрасывается и AA сохраняется (9.3.3: без `.indication` release не
+  начинается). Так же обрабатывается невозможность закодировать RLRE (при
+  `RX_BUF = 1032` и 5 байтах ответа это недостижимо — стоит `debug_assert!`):
+  состояние фиксируется только после успешного `put`, поэтому «полу-перехода» нет,
+  а release клиент подтверждает сам по таймауту (9.3.3 перечисляет этот вариант
+  `.confirm`).
 - Compile-time каталоги: `merge_objects`/`objects!` (сортировка объектов по OBIS,
   бинарный поиск в `find_object`) и `merge_attrs` (резолв OBIS→индекс объекта +
   сортировка атрибутов по [`AttrKey`]).
@@ -358,17 +394,72 @@ pub trait Nvm {
   (attr 3, Static) и `server_system_title` (attr 5, Dynamic).
 - `DedicatedKey` (`None`/`Aes128`/`Aes256` за фичами `aes128`/`aes256`) в `Settings`.
 - `init_mutable_defaults()`: слот 0 — базовый LDN, слот 1 — server-system-title,
-  слоты 2–4 — секреты LLS ассоциаций public/reader/configurator (attr 7,
-  `Persistent`, дефолт «ABCDEFGH»).
+  слоты 2–3 — секреты LLS ассоциаций reader/configurator (attr 7,
+  `Persistent`, дефолт «ABCDEFGH»). Public-ассоциация анонимная (attr 6 = 0),
+  секрета у неё нет.
+- `authentication_mechanism_name` (attr 6) задан статически: public — `0`
+  (без аутентификации), reader — `1` (LLS), configurator — `2` (HLS).
+  В `process_aarq` механизм из AARQ сверяется с attr 6 по уровню
+  (0 / 1 / 2…7); при отсутствии механизма для аутентифицирующей ассоциации →
+  `authentication-mechanism-name-required`, при несовпадении уровней →
+  `authentication-mechanism-name-not-recognised`.
 - LLS-аутентификация (AARQ): диспетчеризация по `mechanism-name` через `match`;
   для `LowLevelSecurity` пароль из `calling-authentication-value` сверяется с
   `secret` (attr 7) выбранной ассоциации (`Settings.assoc_idx` → `attr_codec`);
-  несовпадение → `RejectedPermanent` + `authentication-failure`. Секрет — `Persistent`,
-  чтение запрещено всем, запись — только configurator (`client_SAP == 0x30`).
+  несовпадение → `RejectedPermanent` + `authentication-failure`. Секрет — `Persistent`;
+  тип доступа — `AuthenticatedReadOnly` только для «своего» уровня
+  (`reader` — для reader-секрета, `configurator` — для configurator-секрета),
+  остальным — `NoAccess` (public — анонимный, секрета у него нет). Изменение
+  секрета — через ACTION-метод `change_HLS_secret` (method 2), не через SET.
+- Action-Request (`[195]`, только `normal`): доступ и состав методов — декларативные.
+  `METHODS` ([`MethodSpec`]: OBIS + method_id + `MethodAccess`) резолвится
+  `merge_methods` в ROM-таблицу `MethodDesc` (индекс объекта + method_id +
+  права); `Server::with_methods(&METHODS)` подключает её. `handle_action`
+  ищет запись бинарным поиском, проверяет `MethodAccess::can_call(settings)`
+  (per-SAP + authenticated) и затем `match` по `(class_id, method_id)`
+  вызывает отдельный обработчик (`server/src/methods.rs`). `object_list`
+  строится из этой же таблицы с фильтром по SAP (как атрибуты).
+  Для Association LN реализован метод 2 `change_HLS_secret` — параметры
+  `octet-string` (или `structure { octet-string }`) записываются прямо в `secret`
+  (attr 7). Результат — типизированный `cosempdu::apdu::ActionResult`
+  (ENUMERATED; номера совпадают с `DataAccessResult`, ACTION-специфичные —
+  `long-action-aborted (15)` / `no-long-action-in-progress (16)`). Ошибки
+  `find_object` возвращаются узким `FindObjectError` и конвертируются в
+  `ActionResult` через `From`.
+  Контракт обработчика — `ActionOutcome = Result<(), ActionResult>`:
+  `Ok(())` = `success (0)`, `Err(result)` = метод не выполнен, причина уходит
+  клиенту. Ошибок транспорта/кодека здесь нет (APDU разобран выше), а
+  `hardware-fault` зарезервирован за дефектами конфигурации сервера
+  (кодек без потока, отсутствующий слот), тогда как битые параметры клиента —
+  всегда `type-unmatched (12)`; сессия из-за них не рвётся. Этим же типом
+  возвращает и сам `handle_action` (ошибка `find_object` конвертируется `?` через
+  `From<FindObjectError> for ActionResult`); `action_result` превращает исход
+  в `ActionResult` для `Action-Response`. Согласованность реестра и
+  диспетчера закреплена: `has_handler(class_id, method_id)` перечисляет пары,
+  для которых есть обработчик, а тест `every_registry_method_has_handler`
+  ловит запись в `METHODS` без обработчика (тогда клиент получил бы метод в
+  `object_list`, но `hardware-fault` на вызов).
 - `security_suite` (для dedicated key при шифровании) теперь data-driven:
-  `Server::security_suite()` читает `security_setup_reference` (attr 9) ассоциации,
-  находит по OBIS объект Security setup (class_id 64) и читает его `security_suite`
-  (attr 3). Отсутствие ссылки (LLS, reader) → fallback `AesGcm128`.
+  `Server::security_suite()` читает `security_setup_reference` (attr 9) ассоциации
+  (через `Server::security_setup_reference(assoc_idx)`), находит по OBIS объект
+  Security setup (class_id 64) и читает его `security_suite` (attr 3).
+  Отсутствие ссылки (LLS, reader) → fallback `AesGcm128`.
+- Security setup — общий (shared) объект: он доступен только той ассоциации,
+  которая ссылается на него через `security_setup_reference` (attr 9).
+  Ограничение «одна ассоциация на уровень клиента» позволяет выразить это
+  обычным механизмом `Access`: у него используются константы `SHARED_READ` /
+  `SHARED_WRITE` (configurator — `ReadOnly`/`WriteOnly`, public и reader —
+  `NoAccess`). Отдельной рантайм-проверки на уровне объекта нет; GET/SET
+  проверяют права как обычно (`desc.access.can_read/can_write`).
+  `security_setup_reference` остаётся нужен только внутреннему пути
+  (`Server::security_suite()` при AARQ) и не участвует в проверке доступа.
+- Видимость объекта — единое правило (`Server::object_visible(index, sap)`):
+  объект виден уровню, если у него есть хотя бы один атрибут (кроме неявного
+  `logical_name`) или метод с не-`NoAccess`. Оно же решает состав `object_list`
+  (`ServerObjectList::visible`), и оно же закрывает чтение `logical_name` (attr 1)
+  у невидимых объектов — GET отвечает `scope-of-access-violated`.
+  Поэтому Security setup попадает только в список configurator (5 объектов
+  у reader/public, 6 — у configurator).
 - `xDLMS_context_info` (Association LN, attr 5) не хранится, а вычисляется при GET:
   `AttrKind::Computed`/`RomKind::Computed` — пустой маркер (без fn-указателя и
   RAM-слота); дескрипторы остаются в `ATTRS` только ради `Access` (для будущего
@@ -377,6 +468,11 @@ pub trait Nvm {
   OBIS и возвращает owned `GetValue::Computed`. Доступны базовый OBIS `0.0.40.0.0.255`
   (объект `ASSOC_LN_BASE` — alias текущей ассоциации) и OBIS текущей ассоциации
   (`Server::assoc_obis(assoc_idx)`); чужая ассоциация получает `ReadWriteDenied`.
+  Разрешение alias живёт в `Server::resolve_alias(class_id, obis, assoc_idx)` и
+  применяется единообразно в GET (`lookup_value`), SET (`stream_set`) и ACTION
+  (`handle_action`): подменяется только адрес поиска, а `logical_name` (attr 1)
+  по-прежнему возвращает запрошенный OBIS (alias остаётся alias-ом).
+  Без выбранной ассоциации (`assoc_idx == u8::MAX`) alias не разрешается.
   Значение — owned `XdlmsContextInfoValue` (`conformance: bit-string`,
   `max_receive_pdu_size`, `max_send_pdu_size`, `dlms_version_number`,
   `quality_of_service = 0`, `cyphering_info`). Conformance
@@ -404,6 +500,7 @@ pub trait Nvm {
 
 ## Связанные документы
 
+- [GBT и object_list](gbt_object_list.md) — блочная передача computed и формирование Association LN `object_list`
 - [Data](data.md) — COSEM Data types
 - [APDU](apdu.md) — COSEM APDU
 - [ACSE](acse.md) — ACSE APDU (транспорт)

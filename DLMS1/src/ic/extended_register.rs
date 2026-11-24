@@ -10,15 +10,15 @@ use crate::ic::{
 use crate::obis::ObisCode;
 
 /// Attribute 1 — `logical_name` (octet-string).
-pub const ATTR_LOGICAL_NAME: u8 = 1;
+pub const ATTR_LOGICAL_NAME: i8 = 1;
 /// Attribute 2 — `value` (instance-specific).
-pub const ATTR_VALUE: u8 = 2;
+pub const ATTR_VALUE: i8 = 2;
 /// Attribute 3 — `scaler_unit`.
-pub const ATTR_SCALER_UNIT: u8 = 3;
+pub const ATTR_SCALER_UNIT: i8 = 3;
 /// Attribute 4 — `status` (bit-string).
-pub const ATTR_STATUS: u8 = 4;
+pub const ATTR_STATUS: i8 = 4;
 /// Attribute 5 — `capture_time` (date-time).
-pub const ATTR_CAPTURE_TIME: u8 = 5;
+pub const ATTR_CAPTURE_TIME: i8 = 5;
 
 /// COSEM interface class "Extended register" (class_id 4): a static object descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,12 +34,12 @@ impl ExtendedRegister {
     register_value_keys!();
 
     /// Key of the `status` attribute.
-    pub fn status(&self) -> AttributeKey {
+    pub const fn status(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_STATUS)
     }
 
     /// Key of the `capture_time` attribute.
-    pub fn capture_time(&self) -> AttributeKey {
+    pub const fn capture_time(&self) -> AttributeKey {
         AttributeKey::new(self.obis, ATTR_CAPTURE_TIME)
     }
 }
